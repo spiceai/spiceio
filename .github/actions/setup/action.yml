@@ -88,7 +88,8 @@ runs:
         PID_FILE="${{ steps.install.outputs.pid_file }}"
 
         # Skip if spiceio is already listening on the requested address
-        if curl -sf -o /dev/null "$ENDPOINT/" 2>/dev/null; then
+        # Verify it's spiceio by checking for the "spiceio" server header
+        if curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
           echo "spiceio already running at $ENDPOINT — skipping start"
           echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
           echo "pid=" >> "$GITHUB_OUTPUT"
@@ -104,12 +105,20 @@ runs:
         HOSTPATH="${URL#*@}"
 
         SPICEIO_SMB_USER="${USERINFO%%:*}"
-        URL_PASS="${USERINFO#*:}"
-        # Use override password if provided, otherwise use URL password
+        # Extract password from URL only if user:pass@ format is used
+        if [[ "$USERINFO" == *:* ]]; then
+          URL_PASS="${USERINFO#*:}"
+        else
+          URL_PASS=""
+        fi
+        # smb-pass input takes priority, then URL password
         if [[ -n "$SMB_PASS_OVERRIDE" ]]; then
           SPICEIO_SMB_PASS="$SMB_PASS_OVERRIDE"
-        else
+        elif [[ -n "$URL_PASS" ]]; then
           SPICEIO_SMB_PASS="$URL_PASS"
+        else
+          echo "::error::No SMB password provided (use smb-pass input or include in smb-url)"
+          exit 1
         fi
 
         HOSTPORT="${HOSTPATH%%/*}"

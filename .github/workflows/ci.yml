@@ -61,6 +61,13 @@ jobs:
         env:
           SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
 
+      - name: Install AWS CLI
+        if: ${{ env.HAS_SMB_PASS == 'true' }}
+        run: |
+          if ! command -v aws &>/dev/null; then
+            brew install awscli
+          fi
+
       - name: Run sccache integration test
         # Skipped when UNAS_SMB_PASS secret is not configured (e.g. fork PRs)
         if: ${{ env.HAS_SMB_PASS == 'true' }}
