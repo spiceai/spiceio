@@ -29,7 +29,7 @@ test: build
 	./scripts/test-sccache.sh
 
 bench:
-	cargo bench
+	cargo bench --locked
 
 bench-live: release
 	./scripts/bench-live.sh

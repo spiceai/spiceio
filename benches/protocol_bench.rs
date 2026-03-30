@@ -5,12 +5,12 @@ use spiceio::smb::protocol::*;
 
 fn bench_header_encode(c: &mut Criterion) {
     let hdr = Header::new(Command::Create, 42);
+    let mut buf = BytesMut::with_capacity(64);
 
     c.bench_function("header/encode", |b| {
         b.iter(|| {
-            let mut buf = BytesMut::with_capacity(64);
+            buf.clear();
             black_box(&hdr).encode(&mut buf);
-            buf
         })
     });
 }
@@ -45,10 +45,10 @@ fn bench_build_request(c: &mut Criterion) {
                 encode_create_request(
                     buf,
                     black_box("test\\path\\file.txt"),
-                    0x40000000, // GenericWrite
-                    0x00000001, // ShareRead
-                    0x00000005, // OverwriteIf
-                    0x00000040, // NonDirectoryFile
+                    DesiredAccess::GenericWrite as u32,
+                    ShareAccess::Read as u32,
+                    CreateDisposition::OverwriteIf as u32,
+                    CreateOptions::NonDirectoryFile as u32,
                 );
             })
         })
@@ -87,7 +87,6 @@ fn bench_decode_responses(c: &mut Criterion) {
     // Build a minimal valid Create response (88 bytes)
     let mut create_resp = vec![0u8; 88];
     create_resp[0] = 89; // StructureSize low byte
-    // file_id at offset 64..80
     create_resp[64..80].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
 
     c.bench_function("decode/create_response", |b| {
@@ -97,7 +96,7 @@ fn bench_decode_responses(c: &mut Criterion) {
     // Build a minimal valid Write response (16 bytes)
     let mut write_resp = vec![0u8; 16];
     write_resp[0] = 17; // StructureSize
-    write_resp[4..8].copy_from_slice(&1024u32.to_le_bytes()); // bytes written
+    write_resp[4..8].copy_from_slice(&1024u32.to_le_bytes());
 
     c.bench_function("decode/write_response", |b| {
         b.iter(|| decode_write_response(black_box(&write_resp)))
@@ -125,10 +124,10 @@ fn bench_parse_directory_entries(c: &mut Criterion) {
 
         let mut entry = vec![0u8; padded];
         if i < 19 {
-            entry[0..4].copy_from_slice(&(padded as u32).to_le_bytes()); // NextEntryOffset
+            entry[0..4].copy_from_slice(&(padded as u32).to_le_bytes());
         }
-        entry[60..64].copy_from_slice(&(name_utf16.len() as u32).to_le_bytes()); // FileNameLength
-        entry[96..100].copy_from_slice(&1024u32.to_le_bytes()); // file size low
+        entry[60..64].copy_from_slice(&(name_utf16.len() as u32).to_le_bytes());
+        entry[96..100].copy_from_slice(&1024u32.to_le_bytes());
         entry[104..104 + name_utf16.len()].copy_from_slice(&name_utf16);
         data.extend_from_slice(&entry);
     }

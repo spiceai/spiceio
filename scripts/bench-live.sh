@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Usage: SPICEIO_SMB_USER=user SPICEIO_SMB_PASS=pass ./scripts/bench-live.sh
 #
-# Runs write and read throughput tests at various file sizes up to 10GB total
-# data volume. Requires: aws cli, dd, md5 (macOS).
+# Runs write and read throughput tests at various file sizes.
+# Requires: aws cli, dd, curl, bc, perl (Time::HiRes).
 
 SMB_SERVER="${SPICEIO_SMB_SERVER:-192.168.3.148}"
 SMB_SHARE="${SPICEIO_SMB_SHARE:-ai_platform_dev}"
@@ -27,7 +27,7 @@ PREFIX="bench-$$"
 # ── Build release if needed ─────────────────────────────────────────────
 if [[ ! -x "$SPICEIO_BIN" ]]; then
     echo "[bench] building release binary..."
-    cargo build --release --quiet
+    cargo build --release --locked --quiet
 fi
 
 # ── Cleanup ─────────────────────────────────────────────────────────────
@@ -68,23 +68,17 @@ done
 echo "[bench] spiceio ready"
 
 # ── Helpers ─────────────────────────────────────────────────────────────
-human_size() {
-    local bytes=$1
-    if (( bytes >= 1073741824 )); then
-        printf "%.1fG" "$(echo "$bytes / 1073741824" | bc -l)"
-    elif (( bytes >= 1048576 )); then
-        printf "%.1fM" "$(echo "$bytes / 1048576" | bc -l)"
-    elif (( bytes >= 1024 )); then
-        printf "%.0fK" "$(echo "$bytes / 1024" | bc -l)"
-    else
-        printf "%dB" "$bytes"
-    fi
+
+# Generate a test file with /dev/zero (avoids CPU-bound /dev/urandom for large files)
+gen_file() {
+    local file=$1 size_bytes=$2
+    dd if=/dev/zero of="$file" bs=1048576 count=$((size_bytes / 1048576)) 2>/dev/null
 }
 
 bench_write() {
     local size_bytes=$1 label=$2
     local file="/tmp/spiceio-bench-write-${label}"
-    dd if=/dev/urandom of="$file" bs=1048576 count=$((size_bytes / 1048576)) 2>/dev/null
+    gen_file "$file" "$size_bytes"
 
     local start end elapsed mbps
     start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
@@ -92,7 +86,7 @@ bench_write() {
     end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
     elapsed=$(echo "$end - $start" | bc -l)
     mbps=$(echo "$size_bytes / $elapsed / 1048576" | bc -l)
-    printf "  PUT %-8s  %6.2fs  %7.1f MB/s\n" "$label" "$elapsed" "$mbps"
+    printf "  PUT %-8s  %6.2fs  %7.1f MiB/s\n" "$label" "$elapsed" "$mbps"
     rm -f "$file"
 }
 
@@ -106,7 +100,7 @@ bench_read() {
     end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
     elapsed=$(echo "$end - $start" | bc -l)
     mbps=$(echo "$size_bytes / $elapsed / 1048576" | bc -l)
-    printf "  GET %-8s  %6.2fs  %7.1f MB/s\n" "$label" "$elapsed" "$mbps"
+    printf "  GET %-8s  %6.2fs  %7.1f MiB/s\n" "$label" "$elapsed" "$mbps"
     rm -f "$file"
 }
 
@@ -114,7 +108,7 @@ bench_multi_write() {
     local count=$1 size_bytes=$2 label=$3
     local total=$((count * size_bytes))
     local file="/tmp/spiceio-bench-multi"
-    dd if=/dev/urandom of="$file" bs=1048576 count=$((size_bytes / 1048576)) 2>/dev/null
+    gen_file "$file" "$size_bytes"
 
     local start end elapsed mbps
     start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
@@ -124,7 +118,7 @@ bench_multi_write() {
     end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
     elapsed=$(echo "$end - $start" | bc -l)
     mbps=$(echo "$total / $elapsed / 1048576" | bc -l)
-    printf "  PUT %dx%-5s  %6.2fs  %7.1f MB/s  (%.0f files/s)\n" "$count" "$label" "$elapsed" "$mbps" "$(echo "$count / $elapsed" | bc -l)"
+    printf "  PUT %dx%-5s  %6.2fs  %7.1f MiB/s  (%.0f files/s)\n" "$count" "$label" "$elapsed" "$mbps" "$(echo "$count / $elapsed" | bc -l)"
     rm -f "$file"
 }
 
@@ -135,6 +129,7 @@ echo " spiceio live throughput benchmarks"
 echo " target: smb://${SMB_SERVER}/${SMB_SHARE}  bucket: ${BUCKET}"
 echo "═══════════════════════════════════════════════════════════════"
 
+# Single-file write: 1 + 10 + 50 + 100 + 500 + 1024 = 1685 MiB
 echo ""
 echo "── Single-file write throughput ──"
 bench_write   1048576   "1M"
@@ -144,6 +139,7 @@ bench_write 104857600   "100M"
 bench_write 524288000   "500M"
 bench_write 1073741824  "1G"
 
+# Single-file read: 1685 MiB (same files)
 echo ""
 echo "── Single-file read throughput ──"
 bench_read   1048576   "1M"
@@ -153,17 +149,18 @@ bench_read 104857600   "100M"
 bench_read 524288000   "500M"
 bench_read 1073741824  "1G"
 
+# Multi-file write: 100 + 200 + 500 = 800 MiB
 echo ""
 echo "── Multi-file write throughput ──"
 bench_multi_write 100  1048576   "1M"
 bench_multi_write  20 10485760   "10M"
 bench_multi_write  10 52428800   "50M"
 
+# Total: 1685 (write) + 1685 (read) + 800 (multi-write) = 4170 MiB transferred
 echo ""
-echo "── Aggregate: ~10GB total written + read ──"
-TOTAL_WRITTEN=$((1+10+50+100+500+1024 + 100+200+500))  # MB
-TOTAL_READ=$((1+10+50+100+500+1024))                     # MB
-echo "  Total written: ~${TOTAL_WRITTEN}M"
-echo "  Total read:    ~${TOTAL_READ}M"
+echo "── Aggregate ──"
+echo "  Total written: 2485 MiB  (single-file + multi-file)"
+echo "  Total read:    1685 MiB"
+echo "  Total I/O:     4170 MiB"
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
