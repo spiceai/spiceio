@@ -259,6 +259,7 @@ CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
 echo ""
 echo "[test] === warm build (should hit cache) ==="
 rm -rf "$TEST_TARGET_DIR"
+sccache --zero-stats 2>/dev/null || true
 CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
 
 echo ""

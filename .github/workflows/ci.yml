@@ -54,8 +54,8 @@ jobs:
         run: cargo test --locked
 
       - name: Run sccache integration test
-        # Skipped on fork PRs where the secret is unavailable
-        if: ${{ secrets.UNAS_SMB_PASS != '' }}
+        # Skipped when UNAS_SMB_PASS secret is not configured (e.g. fork PRs)
+        if: env.SPICEIO_SMB_PASS != ''
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
