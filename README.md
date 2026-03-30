@@ -10,8 +10,6 @@ S3-compatible API proxy to SMB file shares. Translates S3 HTTP requests into SMB
 
 GetObject (range + conditional), PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, ListBuckets, multipart uploads (create/upload-part/complete/abort/list-parts/list-uploads), HeadBucket, GetBucketLocation, and stubs for ACL, tagging, and versioning.
 
-Auth: AWS Signature V4 (Authorization header and presigned URLs).
-
 ## Build
 
 Requires Rust (edition 2024) and macOS 26+.
@@ -20,7 +18,7 @@ Requires Rust (edition 2024) and macOS 26+.
 make                # fmt + lint + test + build
 make release        # optimized release build
 make test           # run tests
-make lint           # cargo fmt --check + cargo clippy
+make lint           # fmt-check + check + strict clippy + rustdoc warnings
 ```
 
 ## Configuration

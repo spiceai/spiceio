@@ -17,7 +17,7 @@ use std::io;
 use std::sync::Arc;
 
 use super::body::SpioBody;
-use super::headers::{self, *};
+use super::headers::*;
 use super::multipart::MultipartStore;
 use super::xml::{self, XmlWriter};
 use crate::smb::ops::ShareSession;
@@ -42,7 +42,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     let query = req.uri().query().unwrap_or("").to_owned();
     let method = req.method().clone();
     let hdrs = req.headers().clone();
-    let request_id = headers::generate_request_id();
+    let request_id = generate_request_id();
 
     // CORS preflight
     if method == Method::OPTIONS {
@@ -407,7 +407,7 @@ async fn handle_list_objects(
             w.close("ListBucketResult");
             xml_response(StatusCode::OK, w.finish())
         }
-        Err(e) => internal_error(&e),
+        Err(e) => io_to_s3_error(&e),
     }
 }
 
@@ -434,7 +434,7 @@ async fn handle_get_object(
                 "The specified key does not exist.",
             );
         }
-        Err(e) => return internal_error(&e),
+        Err(e) => return io_to_s3_error(&e),
     };
 
     let meta = &handle.meta;
@@ -466,7 +466,7 @@ async fn handle_get_object(
 
     // Conditional: If-Modified-Since → 304
     if let Some(ref ims) = if_modified_since
-        && let Some(since) = headers::parse_http_date(ims)
+        && let Some(since) = parse_http_date(ims)
         && meta.last_modified <= since
     {
         let _ = handle.close().await;
@@ -479,7 +479,7 @@ async fn handle_get_object(
 
     // Conditional: If-Unmodified-Since
     if let Some(ref ius) = if_unmodified_since
-        && let Some(since) = headers::parse_http_date(ius)
+        && let Some(since) = parse_http_date(ius)
         && meta.last_modified > since
     {
         let _ = handle.close().await;
@@ -496,7 +496,7 @@ async fn handle_get_object(
 
     // Determine read range
     let (start, end, is_range) = if let Some(ref range_str) = range_header {
-        if let Some(range) = headers::parse_range(range_str) {
+        if let Some(range) = parse_range(range_str) {
             let (s, e) = range.resolve(file_size);
             (s, e, true)
         } else {
@@ -567,8 +567,6 @@ async fn handle_put_object(
 ) -> Response<SpioBody> {
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
-    let _user_meta = headers::extract_user_metadata(hdrs);
-
     // Conditional write: If-None-Match: * means "only if not exists"
     if let Some(ref inm) = if_none_match
         && inm.trim() == "*"
@@ -586,7 +584,7 @@ async fn handle_put_object(
     // Open file for streaming writes
     let handle = match share.open_write(key).await {
         Ok(h) => h,
-        Err(e) => return internal_error(&e),
+        Err(e) => return io_to_s3_error(&e),
     };
 
     // Stream request body chunks directly to SMB
@@ -598,31 +596,31 @@ async fn handle_put_object(
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(frame) => {
-                if let Ok(data) = frame.into_data() {
-                    if !data.is_empty() {
-                        // Write in sub-chunks if necessary
-                        let max_write = handle.max_chunk as usize;
-                        for chunk in data.chunks(max_write) {
-                            match handle.write_chunk(offset, chunk).await {
-                                Ok(written) => {
-                                    offset += written as u64;
-                                    total_size += written as u64;
-                                }
-                                Err(e) => {
-                                    write_err = Some(e);
-                                    break;
-                                }
+                if let Ok(data) = frame.into_data()
+                    && !data.is_empty()
+                {
+                    // Write in sub-chunks if necessary
+                    let max_write = handle.max_chunk as usize;
+                    for chunk in data.chunks(max_write) {
+                        match handle.write_chunk(offset, chunk).await {
+                            Ok(written) => {
+                                offset += written as u64;
+                                total_size += written as u64;
+                            }
+                            Err(e) => {
+                                write_err = Some(e);
+                                break;
                             }
                         }
-                        if write_err.is_some() {
-                            break;
-                        }
+                    }
+                    if write_err.is_some() {
+                        break;
                     }
                 }
             }
             Err(e) => {
                 let _ = handle.close().await;
-                return internal_error(&io::Error::other(format!("body read error: {e}")));
+                return io_to_s3_error(&io::Error::other(format!("body read error: {e}")));
             }
         }
     }
@@ -630,7 +628,7 @@ async fn handle_put_object(
     let _ = handle.close().await;
 
     if let Some(e) = write_err {
-        return internal_error(&e);
+        return io_to_s3_error(&e);
     }
 
     let etag = format!("{:016x}", total_size.wrapping_mul(0x100000001b3));
@@ -688,7 +686,7 @@ async fn handle_copy_object(
                 "The specified source key does not exist.",
             );
         }
-        Err(e) => return internal_error(&e),
+        Err(e) => return io_to_s3_error(&e),
     };
 
     let etag = format!("\"{}\"", src_meta.etag);
@@ -704,13 +702,13 @@ async fn handle_copy_object(
         return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
     }
     if let Some(ref ims) = if_modified_since
-        && let Some(since) = headers::parse_http_date(ims)
+        && let Some(since) = parse_http_date(ims)
         && src_meta.last_modified <= since
     {
         return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
     }
     if let Some(ref ius) = if_unmodified_since
-        && let Some(since) = headers::parse_http_date(ius)
+        && let Some(since) = parse_http_date(ius)
         && src_meta.last_modified > since
     {
         return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
@@ -726,7 +724,7 @@ async fn handle_copy_object(
             w.close("CopyObjectResult");
             xml_response(StatusCode::OK, w.finish())
         }
-        Err(e) => internal_error(&e),
+        Err(e) => io_to_s3_error(&e),
     }
 }
 
@@ -775,7 +773,7 @@ async fn handle_head_object(
                     .unwrap();
             }
             if let Some(ref ims) = if_modified_since
-                && let Some(since) = headers::parse_http_date(ims)
+                && let Some(since) = parse_http_date(ims)
                 && meta.last_modified <= since
             {
                 return Response::builder()
@@ -785,7 +783,7 @@ async fn handle_head_object(
                     .unwrap();
             }
             if let Some(ref ius) = if_unmodified_since
-                && let Some(since) = headers::parse_http_date(ius)
+                && let Some(since) = parse_http_date(ius)
                 && meta.last_modified > since
             {
                 return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
@@ -806,7 +804,7 @@ async fn handle_head_object(
             .status(StatusCode::NOT_FOUND)
             .body(SpioBody::empty())
             .unwrap(),
-        Err(e) => internal_error(&e),
+        Err(e) => io_to_s3_error(&e),
     }
 }
 
@@ -866,10 +864,8 @@ async fn handle_create_multipart_upload(
     state: &AppState,
     key: &str,
 ) -> Response<SpioBody> {
-    let content_type = get_header(hdrs, "content-type").map(String::from);
-    let metadata = headers::extract_user_metadata(hdrs);
-
-    let upload_id = state.multipart.create(key, metadata, content_type).await;
+    let _content_type = get_header(hdrs, "content-type");
+    let upload_id = state.multipart.create(key).await;
 
     // Create the temp directory on the share
     let temp_dir = MultipartStore::temp_dir(&upload_id);
@@ -908,7 +904,7 @@ async fn handle_upload_part(
     let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
 
     if let Err(e) = state.share.write_temp(&temp_path, &body).await {
-        return internal_error(&e);
+        return io_to_s3_error(&e);
     }
 
     state
@@ -963,7 +959,7 @@ async fn handle_complete_multipart_upload(
                 Ok(data) => final_data.extend_from_slice(&data),
                 Err(e) => {
                     // Re-register the upload since we consumed it
-                    return internal_error(&e);
+                    return io_to_s3_error(&e);
                 }
             }
         }
@@ -972,7 +968,7 @@ async fn handle_complete_multipart_upload(
     // Write the assembled object
     let meta = match state.share.put_object(key, &final_data).await {
         Ok(m) => m,
-        Err(e) => return internal_error(&e),
+        Err(e) => return io_to_s3_error(&e),
     };
 
     // Clean up temp files (best effort)
@@ -1312,13 +1308,27 @@ fn ok_no_content() -> Response<SpioBody> {
         .unwrap()
 }
 
-fn internal_error(e: &io::Error) -> Response<SpioBody> {
-    eprintln!("[spio] error: {e}");
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "InternalError",
-        &e.to_string(),
-    )
+fn io_to_s3_error(e: &io::Error) -> Response<SpioBody> {
+    match e.kind() {
+        io::ErrorKind::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "The specified key does not exist.",
+        ),
+        io::ErrorKind::PermissionDenied => error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        ),
+        _ => {
+            eprintln!("[spio] error: {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                &e.to_string(),
+            )
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

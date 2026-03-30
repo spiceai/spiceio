@@ -52,13 +52,6 @@ impl XmlWriter {
         self
     }
 
-    pub fn element_opt(&mut self, tag: &str, value: Option<&str>) -> &mut Self {
-        if let Some(v) = value {
-            self.element(tag, v);
-        }
-        self
-    }
-
     pub fn finish(self) -> String {
         self.buf
     }
@@ -153,24 +146,6 @@ pub fn extract_element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)? + start;
     Some(&xml[start..end])
-}
-
-/// Extract all occurrences of an element.
-pub fn extract_elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut results = Vec::new();
-    let mut search = xml;
-    while let Some(start_pos) = search.find(&open) {
-        let content_start = start_pos + open.len();
-        if let Some(end_pos) = search[content_start..].find(&close) {
-            results.push(&search[content_start..content_start + end_pos]);
-            search = &search[content_start + end_pos + close.len()..];
-        } else {
-            break;
-        }
-    }
-    results
 }
 
 /// Extract text between two sections — used for parsing Delete requests.

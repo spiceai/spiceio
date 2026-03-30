@@ -15,45 +15,21 @@ pub const SMB2_HEADER_SIZE: usize = 64;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Command {
     Negotiate = 0x0000,
     SessionSetup = 0x0001,
-    Logoff = 0x0002,
     TreeConnect = 0x0003,
-    TreeDisconnect = 0x0004,
     Create = 0x0005,
     Close = 0x0006,
     Read = 0x0008,
     Write = 0x0009,
     QueryDirectory = 0x000E,
-    QueryInfo = 0x0010,
-}
-
-impl Command {
-    pub fn from_u16(v: u16) -> Option<Self> {
-        Some(match v {
-            0x0000 => Self::Negotiate,
-            0x0001 => Self::SessionSetup,
-            0x0002 => Self::Logoff,
-            0x0003 => Self::TreeConnect,
-            0x0004 => Self::TreeDisconnect,
-            0x0005 => Self::Create,
-            0x0006 => Self::Close,
-            0x0008 => Self::Read,
-            0x0009 => Self::Write,
-            0x000E => Self::QueryDirectory,
-            0x0010 => Self::QueryInfo,
-            _ => return None,
-        })
-    }
 }
 
 // ── NT Status codes we care about ───────────────────────────────────────────
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum NtStatus {
     Success = 0x00000000,
     MoreProcessingRequired = 0xC0000016,
@@ -61,11 +37,8 @@ pub enum NtStatus {
     ObjectNameNotFound = 0xC0000034,
     ObjectNameCollision = 0xC0000035,
     AccessDenied = 0xC0000022,
-    LogonFailure = 0xC000006D,
     EndOfFile = 0xC0000011,
     NoMoreFiles = 0x80000006,
-    BufferOverflow = 0x80000005,
-    NotADirectory = 0xC0000103,
     ObjectPathNotFound = 0xC000003A,
 }
 
@@ -78,11 +51,8 @@ impl NtStatus {
             0xC0000034 => Self::ObjectNameNotFound,
             0xC0000035 => Self::ObjectNameCollision,
             0xC0000022 => Self::AccessDenied,
-            0xC000006D => Self::LogonFailure,
             0xC0000011 => Self::EndOfFile,
             0x80000006 => Self::NoMoreFiles,
-            0x80000005 => Self::BufferOverflow,
-            0xC0000103 => Self::NotADirectory,
             0xC000003A => Self::ObjectPathNotFound,
             other => {
                 // Treat unknown as success if zero high-bit, else generic error
@@ -94,10 +64,6 @@ impl NtStatus {
                 }
             }
         }
-    }
-
-    pub fn is_success(self) -> bool {
-        (self as u32) & 0xC0000000 == 0
     }
 
     pub fn is_error(self) -> bool {
@@ -192,8 +158,13 @@ impl Header {
 
 // ── Negotiate ───────────────────────────────────────────────────────────────
 
-/// Only dialect: SMB 3.1.1 (macOS 26)
+/// SMB 3.1.x dialect family
 pub const DIALECT_SMB3_1_1: u16 = 0x0311;
+pub const DIALECT_SMB3_0_2: u16 = 0x0302;
+pub const DIALECT_SMB3_0_0: u16 = 0x0300;
+
+// Offered dialects in preference order (highest first)
+const DIALECTS: [u16; 3] = [DIALECT_SMB3_1_1, DIALECT_SMB3_0_2, DIALECT_SMB3_0_0];
 
 // Negotiate context types for SMB 3.1.1
 const SMB2_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;
@@ -206,18 +177,20 @@ const AES_128_GCM: u16 = 0x0002;
 const AES_128_CCM: u16 = 0x0001;
 
 pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
-    // Build negotiate contexts first so we can compute the offset
+    let dialect_count = DIALECTS.len() as u16;
+    let dialects_len = DIALECTS.len() * 2;
+
+    // Build negotiate contexts (required when offering 3.1.1)
     let mut contexts = BytesMut::new();
 
     // Preauth Integrity Capabilities context
-    let preauth_data_len: u16 = 2 + 2 + 32; // HashAlgCount + SaltLength + Salt
-    contexts.put_u16_le(SMB2_PREAUTH_INTEGRITY_CAPABILITIES); // ContextType
-    contexts.put_u16_le(preauth_data_len); // DataLength
+    let preauth_data_len: u16 = 2 + 2 + 2 + 32; // HashAlgCount + SaltLength + HashAlg + Salt
+    contexts.put_u16_le(SMB2_PREAUTH_INTEGRITY_CAPABILITIES);
+    contexts.put_u16_le(preauth_data_len);
     contexts.put_u32_le(0); // Reserved
     contexts.put_u16_le(1); // HashAlgorithmCount
     contexts.put_u16_le(32); // SaltLength
-    contexts.put_u16_le(SHA_512); // HashAlgorithm
-    // 32-byte random salt
+    contexts.put_u16_le(SHA_512);
     let salt = random_bytes::<32>();
     contexts.put_slice(&salt);
     // Pad to 8-byte alignment
@@ -226,30 +199,29 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
 
     // Encryption Capabilities context
     let enc_data_len: u16 = 2 + 2 * 2; // CipherCount + 2 ciphers
-    contexts.put_u16_le(SMB2_ENCRYPTION_CAPABILITIES); // ContextType
-    contexts.put_u16_le(enc_data_len); // DataLength
+    contexts.put_u16_le(SMB2_ENCRYPTION_CAPABILITIES);
+    contexts.put_u16_le(enc_data_len);
     contexts.put_u32_le(0); // Reserved
     contexts.put_u16_le(2); // CipherCount
     contexts.put_u16_le(AES_128_GCM); // Preferred
     contexts.put_u16_le(AES_128_CCM); // Fallback
 
-    // Fixed header portion: 36 bytes + 1 dialect (2 bytes) = 38
-    // Contexts start at header + negotiate body, 8-byte aligned
-    let body_fixed_len = 36 + 2; // 36 fixed + 2 for single dialect
+    let body_fixed_len = 36 + dialects_len;
     let ctx_padding = (8 - (body_fixed_len % 8)) % 8;
     let ctx_offset = (SMB2_HEADER_SIZE + body_fixed_len + ctx_padding) as u32;
 
     buf.put_u16_le(36); // StructureSize
-    buf.put_u16_le(1); // DialectCount: just 3.1.1
+    buf.put_u16_le(dialect_count);
     buf.put_u16_le(0x0001); // SecurityMode: signing enabled
     buf.put_u16_le(0); // Reserved
     buf.put_u32_le(0x00000041); // Capabilities: DFS | Leasing
-    buf.put_slice(client_guid); // ClientGuid
+    buf.put_slice(client_guid);
     buf.put_u32_le(ctx_offset); // NegotiateContextOffset
     buf.put_u16_le(2); // NegotiateContextCount
     buf.put_u16_le(0); // Reserved2
-    buf.put_u16_le(DIALECT_SMB3_1_1); // Single dialect
-    // Padding before contexts
+    for &d in &DIALECTS {
+        buf.put_u16_le(d);
+    }
     buf.put_slice(&vec![0u8; ctx_padding]);
     buf.put_slice(&contexts);
 }
@@ -268,38 +240,26 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct NegotiateResponse {
+    pub security_mode: u16,
     pub dialect_revision: u16,
-    pub max_transact_size: u32,
     pub max_read_size: u32,
     pub max_write_size: u32,
-    pub security_buffer: Bytes,
 }
 
 pub fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse> {
-    if body.len() < 65 {
+    if body.len() < 40 {
         return None;
     }
+    let security_mode = (&body[2..4]).get_u16_le();
     let dialect_revision = (&body[4..6]).get_u16_le();
-    let security_buffer_offset = (&body[56..58]).get_u16_le() as usize;
-    let security_buffer_length = (&body[58..60]).get_u16_le() as usize;
-    let max_transact_size = (&body[28..32]).get_u32_le();
     let max_read_size = (&body[32..36]).get_u32_le();
     let max_write_size = (&body[36..40]).get_u32_le();
 
-    // Security buffer offset is from the beginning of the SMB2 header
-    let sec_start = security_buffer_offset.checked_sub(SMB2_HEADER_SIZE)?;
-    let sec_end = sec_start.checked_add(security_buffer_length)?;
-    if sec_end > body.len() {
-        return None;
-    }
-    let security_buffer = Bytes::copy_from_slice(&body[sec_start..sec_end]);
-
     Some(NegotiateResponse {
+        security_mode,
         dialect_revision,
-        max_transact_size,
         max_read_size,
         max_write_size,
-        security_buffer,
     })
 }
 
@@ -321,7 +281,6 @@ pub fn encode_session_setup_request(buf: &mut BytesMut, security_blob: &[u8]) {
 #[derive(Debug)]
 pub struct SessionSetupResponse {
     pub session_id: u64,
-    pub status: u32,
     pub security_buffer: Bytes,
 }
 
@@ -342,7 +301,6 @@ pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<Ses
 
     Some(SessionSetupResponse {
         session_id: header.session_id,
-        status: header.status,
         security_buffer,
     })
 }
@@ -366,7 +324,6 @@ pub fn encode_tree_connect_request(buf: &mut BytesMut, path: &str) {
 pub enum DesiredAccess {
     GenericRead = 0x80000000,
     GenericWrite = 0x40000000,
-    GenericAll = 0x10000000,
     Delete = 0x00010000,
     ReadAttributes = 0x00000080,
 }
@@ -375,20 +332,15 @@ pub enum DesiredAccess {
 #[derive(Debug, Clone, Copy)]
 pub enum ShareAccess {
     Read = 0x00000001,
-    Write = 0x00000002,
     Delete = 0x00000004,
-    ReadWrite = 0x00000003,
     All = 0x00000007,
 }
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
 pub enum CreateDisposition {
-    Supersede = 0x00000000,
     Open = 0x00000001,
-    Create = 0x00000002,
     OpenIf = 0x00000003,
-    Overwrite = 0x00000004,
     OverwriteIf = 0x00000005,
 }
 
@@ -397,7 +349,6 @@ pub enum CreateDisposition {
 pub enum CreateOptions {
     DirectoryFile = 0x00000001,
     NonDirectoryFile = 0x00000040,
-    None = 0x00000000,
 }
 
 pub fn encode_create_request(
@@ -409,7 +360,7 @@ pub fn encode_create_request(
     create_options: u32,
 ) {
     let name_bytes: Vec<u8> = path.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-    let name_offset = (SMB2_HEADER_SIZE + 56 + 1) as u16; // header + create request fixed size
+    let name_offset = (SMB2_HEADER_SIZE + 56) as u16; // header + create request fixed part (57 - 1 buffer byte)
     // StructureSize for Create request is 57
     buf.put_u16_le(57); // StructureSize
     buf.put_u8(0); // SecurityFlags
@@ -432,37 +383,26 @@ pub fn encode_create_request(
 #[derive(Debug, Clone)]
 pub struct CreateResponse {
     pub file_id: [u8; 16],
-    pub creation_time: u64,
-    pub last_access_time: u64,
     pub last_write_time: u64,
-    pub change_time: u64,
     pub file_size: u64,
-    pub file_attributes: u32,
 }
 
 pub fn decode_create_response(body: &[u8]) -> Option<CreateResponse> {
-    if body.len() < 89 {
+    // Minimum: 88 bytes (StructureSize says 89, but the last byte is variable-length CreateContexts)
+    if body.len() < 88 {
         return None;
     }
-    let creation_time = (&body[8..16]).get_u64_le();
-    let last_access_time = (&body[16..24]).get_u64_le();
     let last_write_time = (&body[24..32]).get_u64_le();
-    let change_time = (&body[32..40]).get_u64_le();
     // AllocationSize at 40..48
     let file_size = (&body[48..56]).get_u64_le();
-    let file_attributes = (&body[56..60]).get_u32_le();
     // Reserved2 at 60..64
     let mut file_id = [0u8; 16];
     file_id.copy_from_slice(&body[64..80]);
 
     Some(CreateResponse {
         file_id,
-        creation_time,
-        last_access_time,
         last_write_time,
-        change_time,
         file_size,
-        file_attributes,
     })
 }
 
@@ -510,7 +450,7 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
 // ── Write ───────────────────────────────────────────────────────────────────
 
 pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, data: &[u8]) {
-    let data_offset = (SMB2_HEADER_SIZE + 48 + 1) as u16;
+    let data_offset = (SMB2_HEADER_SIZE + 48) as u16;
     buf.put_u16_le(49); // StructureSize
     buf.put_u16_le(data_offset); // DataOffset
     buf.put_u32_le(data.len() as u32); // Length
@@ -525,7 +465,7 @@ pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64,
 }
 
 pub fn decode_write_response(body: &[u8]) -> Option<u32> {
-    if body.len() < 17 {
+    if body.len() < 16 {
         return None;
     }
     Some((&body[4..8]).get_u32_le()) // Count (bytes written)
@@ -533,7 +473,6 @@ pub fn decode_write_response(body: &[u8]) -> Option<u32> {
 
 // ── Query Directory ─────────────────────────────────────────────────────────
 
-pub const FILE_DIRECTORY_INFORMATION: u8 = 0x01;
 pub const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
 
 pub fn encode_query_directory_request(
@@ -569,10 +508,7 @@ pub struct DirectoryEntry {
     pub file_name: String,
     pub file_size: u64,
     pub file_attributes: u32,
-    pub creation_time: u64,
-    pub last_access_time: u64,
     pub last_write_time: u64,
-    pub change_time: u64,
 }
 
 impl DirectoryEntry {
@@ -594,10 +530,10 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
 
         let next_entry_offset = (&entry[0..4]).get_u32_le() as usize;
         let _file_index = (&entry[4..8]).get_u32_le();
-        let creation_time = (&entry[8..16]).get_u64_le();
-        let last_access_time = (&entry[16..24]).get_u64_le();
+        let _creation_time = (&entry[8..16]).get_u64_le();
+        let _last_access_time = (&entry[16..24]).get_u64_le();
         let last_write_time = (&entry[24..32]).get_u64_le();
-        let change_time = (&entry[32..40]).get_u64_le();
+        let _change_time = (&entry[32..40]).get_u64_le();
         let file_size = (&entry[40..48]).get_u64_le(); // EndOfFile
         let _allocation_size = (&entry[48..56]).get_u64_le();
         let file_attributes = (&entry[56..60]).get_u32_le();
@@ -623,10 +559,7 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
                 file_name,
                 file_size,
                 file_attributes,
-                creation_time,
-                last_access_time,
                 last_write_time,
-                change_time,
             });
         }
 
@@ -637,65 +570,6 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
     }
 
     entries
-}
-
-// ── Query Info ──────────────────────────────────────────────────────────────
-
-pub const FILE_BASIC_INFORMATION: u8 = 0x04;
-pub const FILE_STANDARD_INFORMATION: u8 = 0x05;
-pub const FILE_ALL_INFORMATION: u8 = 0x12;
-
-pub fn encode_query_info_request(buf: &mut BytesMut, file_id: &[u8; 16], info_class: u8) {
-    buf.put_u16_le(41); // StructureSize
-    buf.put_u8(0x01); // InfoType: FILE
-    buf.put_u8(info_class); // FileInfoClass
-    buf.put_u32_le(65536); // OutputBufferLength
-    buf.put_u16_le(0); // InputBufferOffset
-    buf.put_u16_le(0); // Reserved
-    buf.put_u32_le(0); // InputBufferLength
-    buf.put_u32_le(0); // AdditionalInformation
-    buf.put_u32_le(0); // Flags
-    buf.put_slice(file_id); // FileId
-    buf.put_u8(0); // Buffer (padding)
-}
-
-/// Parsed standard file info
-#[derive(Debug, Clone)]
-pub struct FileStandardInfo {
-    pub allocation_size: u64,
-    pub end_of_file: u64,
-    pub number_of_links: u32,
-    pub delete_pending: bool,
-    pub directory: bool,
-}
-
-pub fn decode_file_standard_info(body: &[u8]) -> Option<FileStandardInfo> {
-    // Response body starts with StructureSize(2) + OutputBufferOffset(2) + OutputBufferLength(4)
-    if body.len() < 9 {
-        return None;
-    }
-    let buf_offset = (&body[2..4]).get_u16_le() as usize;
-    let buf_length = (&body[4..8]).get_u32_le() as usize;
-
-    let start = buf_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + buf_length;
-    if end > body.len() || buf_length < 22 {
-        return None;
-    }
-    let info = &body[start..end];
-    let allocation_size = (&info[0..8]).get_u64_le();
-    let end_of_file = (&info[8..16]).get_u64_le();
-    let number_of_links = (&info[16..20]).get_u32_le();
-    let delete_pending = info[20] != 0;
-    let directory = info[21] != 0;
-
-    Some(FileStandardInfo {
-        allocation_size,
-        end_of_file,
-        number_of_links,
-        delete_pending,
-        directory,
-    })
 }
 
 // ── Frame helpers ───────────────────────────────────────────────────────────
@@ -710,7 +584,7 @@ pub fn frame_packet(header: &Header, body: &[u8]) -> BytesMut {
     buf
 }
 
-/// Build a complete SMB2 request packet: [NetBIOS length][Header][Body]
+/// Build a complete SMB2 request packet: \[NetBIOS length]\[Header]\[Body]
 pub fn build_request<F>(header: &Header, body_builder: F) -> BytesMut
 where
     F: FnOnce(&mut BytesMut),
@@ -718,12 +592,4 @@ where
     let mut body = BytesMut::with_capacity(256);
     body_builder(&mut body);
     frame_packet(header, &body)
-}
-
-// ── Delete (via Create with DELETE_ON_CLOSE) ────────────────────────────────
-
-pub fn encode_close_and_delete_request(buf: &mut BytesMut, file_id: &[u8; 16]) {
-    // Set FileDispositionInformation via SET_INFO would be more proper,
-    // but we open with DELETE_ON_CLOSE flag in CreateOptions.
-    encode_close_request(buf, file_id);
 }

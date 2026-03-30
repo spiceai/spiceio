@@ -38,6 +38,8 @@ pub struct SmbClient {
     pub max_write_size: u32,
     /// 16-byte client GUID
     client_guid: [u8; 16],
+    /// SMB 3.1.1 signing key (derived after auth)
+    signing_key: Option<[u8; 16]>,
 }
 
 impl SmbClient {
@@ -55,7 +57,8 @@ impl SmbClient {
             arc4random_buf(client_guid.as_mut_ptr(), 16);
         }
 
-        let client = Arc::new(Self {
+        // Use a temporary non-Arc client for the handshake, then wrap in Arc.
+        let mut client = Self {
             stream: Mutex::new(stream),
             message_id: AtomicU64::new(0),
             session_id: 0,
@@ -63,77 +66,124 @@ impl SmbClient {
             max_read_size: 65536,
             max_write_size: 65536,
             client_guid,
-        });
+            signing_key: None,
+        };
 
-        // Perform negotiate + session setup
-        let client = client.negotiate_and_auth().await?;
-        Ok(client)
+        client.negotiate_and_auth().await?;
+        Ok(Arc::new(client))
     }
 
     fn next_message_id(&self) -> u64 {
         self.message_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Send a packet and receive a response, also returning the raw SMB2 response bytes
+    /// (without NetBIOS header) for preauth hash computation.
+    async fn send_recv_raw(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+        let (header, body, raw) = self.send_recv_inner(packet).await?;
+        Ok((header, body, raw))
+    }
+
     async fn send_recv(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>)> {
-        let mut stream = self.stream.lock().await;
-        stream.write_all(packet).await?;
-        stream.flush().await?;
-
-        // Read 4-byte NetBIOS header
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-        if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid SMB2 message length: {msg_len}"),
-            ));
-        }
-
-        let mut msg = vec![0u8; msg_len];
-        stream.read_exact(&mut msg).await?;
-
-        let header = Header::decode(&msg)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
-
-        let body = msg[SMB2_HEADER_SIZE..].to_vec();
+        let (header, body, _raw) = self.send_recv_inner(packet).await?;
         Ok((header, body))
     }
 
-    /// Perform negotiate + session setup (NTLM auth).
-    async fn negotiate_and_auth(self: &Arc<Self>) -> io::Result<Arc<Self>> {
+    async fn send_recv_inner(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+        let mut stream = self.stream.lock().await;
+
+        // Sign the packet if we have a signing key
+        if let Some(ref key) = self.signing_key {
+            let mut signed = packet.to_vec();
+            sign_packet(&mut signed, key);
+            stream.write_all(&signed).await?;
+        } else {
+            stream.write_all(packet).await?;
+        }
+        stream.flush().await?;
+
+        // Read responses, looping past STATUS_PENDING interim responses
+        loop {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SMB2 message length: {msg_len}"),
+                ));
+            }
+
+            let mut msg = vec![0u8; msg_len];
+            stream.read_exact(&mut msg).await?;
+
+            let header = Header::decode(&msg)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+
+            // STATUS_PENDING (0x00000103): server is still processing, wait for real response
+            if header.status == 0x0000_0103 {
+                continue;
+            }
+
+            let body = msg[SMB2_HEADER_SIZE..].to_vec();
+            return Ok((header, body, msg));
+        }
+    }
+
+    /// Perform negotiate + session setup (NTLM auth) with signing key derivation.
+    async fn negotiate_and_auth(&mut self) -> io::Result<()> {
+        // Preauth integrity hash — tracks all handshake messages for key derivation
+        let mut preauth_hash = [0u8; 64];
+
         // ── Step 1: Negotiate ──
         let msg_id = self.next_message_id();
-        let mut hdr = Header::new(Command::Negotiate, msg_id);
+        let hdr = Header::new(Command::Negotiate, msg_id);
         let packet = build_request(&hdr, |buf| {
             encode_negotiate_request(buf, &self.client_guid);
         });
 
-        let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
-        let status = NtStatus::from_u32(resp_hdr.status);
-        if status.is_error() {
+        // Hash the negotiate request (SMB2 message, skip 4-byte NetBIOS header)
+        update_preauth_hash(&mut preauth_hash, &packet[4..]);
+
+        let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
+        if NtStatus::from_u32(resp_hdr.status).is_error() {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("negotiate failed: status=0x{:08X}", resp_hdr.status),
             ));
         }
 
+        // Hash the negotiate response
+        update_preauth_hash(&mut preauth_hash, &resp_raw);
+
         let neg_resp = decode_negotiate_response(&resp_body).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
+        eprintln!(
+            "[spio] negotiated SMB 0x{:04X}, max_rw={}K",
+            neg_resp.dialect_revision,
+            neg_resp.max_write_size.min(65536) / 1024,
+        );
 
         // ── Step 2: Session Setup (NTLM Negotiate) ──
         let ntlm_negotiate = auth::build_negotiate_message();
         let spnego_negotiate = auth::wrap_spnego_negotiate(&ntlm_negotiate);
 
         let msg_id = self.next_message_id();
-        hdr = Header::new(Command::SessionSetup, msg_id);
+        let mut hdr = Header::new(Command::SessionSetup, msg_id);
         let packet = build_request(&hdr, |buf| {
             encode_session_setup_request(buf, &spnego_negotiate);
         });
 
-        let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
+        // Hash session setup request 1
+        update_preauth_hash(&mut preauth_hash, &packet[4..]);
+
+        let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
+
+        // Hash session setup response 1
+        update_preauth_hash(&mut preauth_hash, &resp_raw);
+
         let sess_resp = decode_session_setup_response(&resp_hdr, &resp_body).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid session setup response")
         })?;
@@ -144,7 +194,7 @@ impl SmbClient {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid NTLM challenge"))?;
 
         // ── Step 3: Session Setup (NTLM Auth) ──
-        let ntlm_auth = auth::build_authenticate_message(
+        let (ntlm_auth, session_base_key) = auth::build_authenticate_message(
             &challenge,
             &self.config.username,
             &self.config.password,
@@ -160,44 +210,28 @@ impl SmbClient {
             encode_session_setup_request(buf, &spnego_auth);
         });
 
-        let (resp_hdr, _resp_body) = self.send_recv(&packet).await?;
-        let status = NtStatus::from_u32(resp_hdr.status);
-        if status.is_error() {
+        // Hash session setup request 2 (this is the final hash for key derivation)
+        update_preauth_hash(&mut preauth_hash, &packet[4..]);
+
+        let (resp_hdr, ..) = self.send_recv_raw(&packet).await?;
+        if NtStatus::from_u32(resp_hdr.status).is_error() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("authentication failed: status=0x{:08X}", resp_hdr.status),
             ));
         }
 
-        // Build authenticated client
-        let stream = {
-            let guard = self.stream.lock().await;
-            // We need to move the TcpStream. Clone the fd using dup.
-            let std_stream = {
-                use std::os::fd::AsRawFd;
-                let fd = guard.as_raw_fd();
-                unsafe extern "C" {
-                    fn dup(fd: i32) -> i32;
-                }
-                let new_fd = unsafe { dup(fd) };
-                if new_fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                unsafe { std::net::TcpStream::from_raw_fd(new_fd) }
-            };
-            std_stream.set_nonblocking(true)?;
-            TcpStream::from_std(std_stream)?
-        };
+        // Derive the signing key
+        let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
+        eprintln!("[spio] authenticated, signing key derived");
 
-        Ok(Arc::new(Self {
-            stream: Mutex::new(stream),
-            message_id: AtomicU64::new(self.message_id.load(Ordering::Relaxed)),
-            session_id: resp_hdr.session_id,
-            config: self.config.clone(),
-            max_read_size: neg_resp.max_read_size.min(1024 * 1024),
-            max_write_size: neg_resp.max_write_size.min(1024 * 1024),
-            client_guid: self.client_guid,
-        }))
+        self.session_id = resp_hdr.session_id;
+        // Cap at 64KB to avoid oversized SMB messages; the negotiate value is often
+        // the max transaction size, but doesn't account for header overhead.
+        self.max_read_size = neg_resp.max_read_size.min(65536);
+        self.max_write_size = neg_resp.max_write_size.min(65536);
+        self.signing_key = Some(signing_key);
+        Ok(())
     }
 
     /// Connect to a share (Tree Connect).
@@ -335,11 +369,12 @@ impl SmbClient {
         });
 
         let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
-        let status = NtStatus::from_u32(resp_hdr.status);
-        if status.is_error() {
+        // Check raw status: high two bits indicate severity
+        // 0x00 = success, 0x40 = info, 0x80 = warning, 0xC0 = error
+        if resp_hdr.status & 0xC000_0000 == 0xC000_0000 {
             return Err(io::Error::other(format!(
-                "write failed: 0x{:08X}",
-                resp_hdr.status
+                "write failed: status=0x{:08X} offset={} len={}",
+                resp_hdr.status, offset, data.len()
             )));
         }
 
@@ -404,58 +439,62 @@ impl SmbClient {
 
         Ok(all_entries)
     }
+}
 
-    /// Get file info (standard: size, directory flag).
-    pub async fn query_info(
-        &self,
-        tree_id: u32,
-        file_id: &[u8; 16],
-    ) -> io::Result<FileStandardInfo> {
-        let msg_id = self.next_message_id();
-        let mut hdr = Header::new(Command::QueryInfo, msg_id);
-        hdr.session_id = self.session_id;
-        hdr.tree_id = tree_id;
+/// Sign an SMB2 packet in-place. `packet` includes the 4-byte NetBIOS header.
+/// Sets the SMB2_FLAGS_SIGNED bit and computes AES-128-CMAC over the SMB2 message.
+fn sign_packet(packet: &mut [u8], key: &[u8; 16]) {
+    use crate::crypto;
 
-        let packet = build_request(&hdr, |buf| {
-            encode_query_info_request(buf, file_id, FILE_STANDARD_INFORMATION);
-        });
+    const NETBIOS_HEADER: usize = 4;
+    const FLAGS_OFFSET: usize = NETBIOS_HEADER + 16; // Flags field at header offset 16
+    const SIGNATURE_OFFSET: usize = NETBIOS_HEADER + 48; // Signature at header offset 48
 
-        let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
-        let status = NtStatus::from_u32(resp_hdr.status);
-        if status.is_error() {
-            return Err(io::Error::other(format!(
-                "query info failed: 0x{:08X}",
-                resp_hdr.status
-            )));
-        }
+    // Set SMB2_FLAGS_SIGNED (0x00000008)
+    let flags = u32::from_le_bytes(packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].try_into().unwrap());
+    packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&(flags | 0x0000_0008).to_le_bytes());
 
-        decode_file_standard_info(&resp_body).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid query info response")
-        })
-    }
+    // Zero the signature field
+    packet[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].fill(0);
 
-    pub fn config(&self) -> &SmbConfig {
-        &self.config
-    }
+    // Compute AES-128-CMAC over the SMB2 message (skip NetBIOS header)
+    let smb2_msg = &packet[NETBIOS_HEADER..];
+    let signature = crypto::aes128_cmac(key, smb2_msg);
+
+    // Write the signature
+    packet[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
+}
+
+/// Update preauth integrity hash: hash = SHA-512(hash || message_bytes).
+fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
+    use crate::crypto;
+    let mut input = Vec::with_capacity(64 + message.len());
+    input.extend_from_slice(hash);
+    input.extend_from_slice(message);
+    *hash = crypto::sha512(&input);
 }
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
-    let nt = NtStatus::from_u32(status);
-    match nt {
-        NtStatus::ObjectNameNotFound | NtStatus::NoSuchFile | NtStatus::ObjectPathNotFound => {
-            io::Error::new(io::ErrorKind::NotFound, format!("not found: {path}"))
-        }
-        NtStatus::AccessDenied => io::Error::new(
+    // Map raw status codes directly to avoid losing info through NtStatus enum
+    match status {
+        0xC000_000F // STATUS_NO_SUCH_FILE
+        | 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
+        | 0xC000_003A // STATUS_OBJECT_PATH_NOT_FOUND
+        | 0xC000_0033 // STATUS_OBJECT_NAME_INVALID
+        => io::Error::new(io::ErrorKind::NotFound, format!("not found: {path}")),
+
+        0xC000_0022 => io::Error::new( // STATUS_ACCESS_DENIED
             io::ErrorKind::PermissionDenied,
             format!("access denied: {path}"),
         ),
-        NtStatus::ObjectNameCollision => io::Error::new(
+
+        0xC000_0035 => io::Error::new( // STATUS_OBJECT_NAME_COLLISION
             io::ErrorKind::AlreadyExists,
             format!("already exists: {path}"),
         ),
+
         _ => io::Error::other(format!("SMB error 0x{status:08X} for {path}")),
     }
 }
 
 // Need this for from_raw_fd
-use std::os::fd::FromRawFd;

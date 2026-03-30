@@ -18,7 +18,7 @@ spio is an S3-compatible API proxy that translates S3 HTTP requests into SMB 3.1
 ```bash
 make                           # fmt + lint + test + build (default target)
 make release                   # optimized release build
-make lint                      # cargo fmt --check + cargo clippy
+make lint                      # fmt-check + check + strict clippy + rustdoc warnings
 make test                      # sccache integration test (requires SPIO_SMB_USER/PASS)
 make fmt                       # auto-format
 make clean                     # cargo clean
@@ -39,11 +39,11 @@ The binary requires these environment variables:
 
 The codebase has three modules:
 
-- **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads, and stub endpoints for ACL/tagging/versioning. Auth is SigV4 (header + presigned URL) in `auth.rs`. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spio-uploads/` on the SMB share. `body.rs` implements `SpioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
+- **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads, and stub endpoints for ACL/tagging/versioning. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spio-uploads/` on the SMB share. `body.rs` implements `SpioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
 
-- **`smb`** — Wire protocol client. `protocol.rs` defines SMB 3.1.x packet structures (little-endian). `client.rs` manages the TCP connection, negotiate/session-setup handshake, and exposes operations (tree connect, create, read, write, close, query directory, query info). `auth.rs` implements NTLMv2 challenge-response. `ops.rs` provides the high-level `ShareSession` abstraction the S3 layer consumes (list, read, write, delete, stat, copy).
+- **`smb`** — Wire protocol client. `protocol.rs` defines SMB 3.1.x packet structures (little-endian). `client.rs` manages the TCP connection, negotiate/session-setup handshake, and exposes operations (tree connect, create, read, write, close, query directory). `auth.rs` implements NTLMv2 challenge-response. `ops.rs` provides the high-level `ShareSession` abstraction the S3 layer consumes (list, read, write, delete, stat, copy).
 
-- **`crypto`** — FFI bindings to macOS CommonCrypto (`Security.framework`/`libcommonCrypto`). Exposes MD4, SHA-256, HMAC-MD5, HMAC-SHA256. No Rust crypto crates.
+- **`crypto`** — FFI bindings to macOS CommonCrypto (`Security.framework`/`libcommonCrypto`). Exposes MD4, SHA-256, and HMAC-MD5. No Rust crypto crates.
 
 **Request flow:** HTTP request → `s3::router::handle_request` → S3 operation → `smb::ops::ShareSession` method → `smb::client::SmbClient` wire operations → TCP to SMB server.
 

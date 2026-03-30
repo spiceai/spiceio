@@ -300,55 +300,6 @@ impl ShareSession {
         Ok(meta)
     }
 
-    /// Read a byte range from a file (for Range GET).
-    pub async fn get_object_range(
-        &self,
-        key: &str,
-        start: u64,
-        end: u64,
-    ) -> io::Result<(ObjectMeta, Vec<u8>)> {
-        let smb_path = to_smb_path(key);
-        let file = self
-            .client
-            .create(
-                self.tree_id,
-                &smb_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::Read as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
-
-        let meta = ObjectMeta {
-            size: file.file_size,
-            last_modified: filetime_to_epoch_secs(file.last_write_time),
-            etag: format!("{:016x}", file.last_write_time),
-            content_type: guess_content_type(key),
-        };
-
-        let len = (end - start + 1).min(file.file_size.saturating_sub(start));
-        let mut data = Vec::with_capacity(len as usize);
-        let mut offset = start;
-        let chunk_size = self.client.max_read_size;
-
-        while offset <= end {
-            let to_read = ((end - offset + 1) as u32).min(chunk_size);
-            let chunk = self
-                .client
-                .read(self.tree_id, &file.file_id, offset, to_read)
-                .await?;
-            if chunk.is_empty() {
-                break;
-            }
-            data.extend_from_slice(&chunk);
-            offset += chunk.len() as u64;
-        }
-
-        let _ = self.client.close(self.tree_id, &file.file_id).await;
-        Ok((meta, data))
-    }
-
     /// Copy a file on the SMB share (read source, write dest).
     pub async fn copy_object(&self, src_key: &str, dst_key: &str) -> io::Result<ObjectMeta> {
         let (meta, data) = self.get_object(src_key).await?;
