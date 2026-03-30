@@ -1,9 +1,13 @@
 [package]
 name = "spiceio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "S3-compatible API proxy to SMB file shares"
-license = "MIT"
+license = "Apache-2.0"
+
+[lib]
+name = "spiceio"
+path = "src/lib.rs"
 
 [[bin]]
 name = "spiceio"
@@ -19,6 +23,21 @@ tower = { version = "0.5", features = ["util", "timeout"] }
 http = "1"
 bytes = "1"
 percent-encoding = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto_bench"
+harness = false
+
+[[bench]]
+name = "protocol_bench"
+harness = false
+
+[[bench]]
+name = "s3_bench"
+harness = false
 
 [lints.rust]
 warnings = "deny"

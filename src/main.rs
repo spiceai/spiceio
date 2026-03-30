@@ -68,6 +68,11 @@ impl Config {
 
 #[tokio::main]
 async fn main() {
+    if env::args().any(|a| a == "--version" || a == "-V") {
+        println!("spiceio {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let config = Config::from_env();
 
     eprintln!(

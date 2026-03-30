@@ -1,4 +1,4 @@
-.PHONY: build release check fmt fmt-check clippy doc lint test clean all
+.PHONY: build release check fmt fmt-check clippy doc lint test test-extended clean all
 
 all: fmt lint test build
 
@@ -27,6 +27,9 @@ lint: fmt-check check clippy doc
 
 test: build
 	./scripts/test-sccache.sh
+
+test-extended: build test
+	./scripts/test-sccache-spiceai.sh
 
 clean:
 	cargo clean

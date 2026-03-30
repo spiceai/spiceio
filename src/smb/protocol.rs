@@ -101,6 +101,13 @@ impl Header {
         }
     }
 
+    /// Set credit charge for operations transferring `payload_size` bytes.
+    /// Required for Read/Write/QueryDirectory with payloads >64KB.
+    pub fn with_credit_charge(mut self, payload_size: u32) -> Self {
+        self.credit_charge = credit_charge_for(payload_size);
+        self
+    }
+
     /// Encode the 64-byte SMB2 header into a buffer.
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_slice(SMB2_MAGIC); // 0: ProtocolId
@@ -154,6 +161,12 @@ impl Header {
             session_id,
         })
     }
+}
+
+/// Compute the credit charge for a payload of the given size.
+/// CreditCharge = max(1, ceil(payload_size / 65536))
+pub fn credit_charge_for(payload_size: u32) -> u16 {
+    1.max(payload_size.div_ceil(65536) as u16)
 }
 
 // ── Negotiate ───────────────────────────────────────────────────────────────
@@ -447,6 +460,25 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
     Some(Bytes::copy_from_slice(&body[start..end]))
 }
 
+/// Zero-copy variant of `decode_read_response` — takes ownership of the
+/// response body Vec and slices into it without copying the data.
+pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
+    if body.len() < 17 {
+        return None;
+    }
+    let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
+    let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+
+    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
+    let end = start + data_length;
+    if end > body.len() {
+        return None;
+    }
+    let mut bytes = Bytes::from(body);
+    bytes = bytes.slice(start..end);
+    Some(bytes)
+}
+
 // ── Write ───────────────────────────────────────────────────────────────────
 
 pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, data: &[u8]) {
@@ -572,6 +604,47 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
     entries
 }
 
+// ── Compound request support ───────────────────────────────────────────────
+
+/// Flag bit for related compound operations.
+pub const SMB2_FLAGS_RELATED: u32 = 0x0000_0004;
+
+/// Sentinel file ID — server substitutes the file ID from the preceding
+/// Create response in a related compound chain.
+pub const SENTINEL_FILE_ID: [u8; 16] = [0xFF; 16];
+
+/// Encode a Close request with optional post-query attribute retrieval.
+/// When `postquery` is true, the server returns file metadata in the response.
+pub fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], postquery: bool) {
+    buf.put_u16_le(24); // StructureSize
+    buf.put_u16_le(u16::from(postquery)); // Flags: SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB
+    buf.put_u32_le(0); // Reserved
+    buf.put_slice(file_id);
+}
+
+/// Parsed Close response (meaningful when postquery was requested).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CloseResponse {
+    pub last_write_time: u64,
+    pub file_size: u64,
+}
+
+pub fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
+    // Layout: StructureSize(2) + Flags(2) + Reserved(4) + CreationTime(8)
+    // + LastAccessTime(8) + LastWriteTime(8) + ChangeTime(8)
+    // + AllocationSize(8) + EndOfFile(8) + FileAttributes(4) = 60 bytes
+    if body.len() < 56 {
+        return None;
+    }
+    let last_write_time = u64::from_le_bytes(body[24..32].try_into().unwrap());
+    let file_size = u64::from_le_bytes(body[48..56].try_into().unwrap());
+    Some(CloseResponse {
+        last_write_time,
+        file_size,
+    })
+}
+
 // ── Frame helpers ───────────────────────────────────────────────────────────
 
 /// Prepend a 4-byte NetBIOS session length prefix to the packet.
@@ -592,4 +665,248 @@ where
     let mut body = BytesMut::with_capacity(256);
     body_builder(&mut body);
     frame_packet(header, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Header encode/decode round-trip ──────────────────────────────
+
+    #[test]
+    fn header_round_trip() {
+        let mut hdr = Header::new(Command::Create, 42);
+        hdr.session_id = 0xDEAD;
+        hdr.tree_id = 7;
+        hdr.flags = 0x04;
+
+        let mut buf = BytesMut::with_capacity(64);
+        hdr.encode(&mut buf);
+
+        let decoded = Header::decode(&buf).unwrap();
+        assert_eq!(decoded.command, Command::Create as u16);
+        assert_eq!(decoded.message_id, 42);
+        assert_eq!(decoded.session_id, 0xDEAD);
+        assert_eq!(decoded.tree_id, 7);
+        assert_eq!(decoded.flags, 0x04);
+    }
+
+    #[test]
+    fn header_decode_too_short() {
+        assert!(Header::decode(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn header_decode_bad_magic() {
+        let mut buf = [0u8; 64];
+        buf[0..4].copy_from_slice(b"XXXX");
+        assert!(Header::decode(&buf).is_none());
+    }
+
+    // ── NtStatus ─────────────────────────────────────────────────────
+
+    #[test]
+    fn nt_status_success_not_error() {
+        assert!(!NtStatus::Success.is_error());
+    }
+
+    #[test]
+    fn nt_status_not_found_is_error() {
+        assert!(NtStatus::ObjectNameNotFound.is_error());
+    }
+
+    #[test]
+    fn nt_status_no_more_files_not_error() {
+        // 0x80000006 has high bit set but not both high bits
+        assert!(!NtStatus::NoMoreFiles.is_error());
+    }
+
+    #[test]
+    fn nt_status_known_codes() {
+        assert_eq!(NtStatus::from_u32(0x00000000), NtStatus::Success);
+        assert_eq!(NtStatus::from_u32(0xC000000F), NtStatus::NoSuchFile);
+        assert_eq!(NtStatus::from_u32(0x80000006), NtStatus::NoMoreFiles);
+    }
+
+    // ── Decode responses ─────────────────────────────────────────────
+
+    #[test]
+    fn decode_create_response_valid() {
+        let mut body = vec![0u8; 88];
+        // last_write_time at offset 24
+        body[24..32].copy_from_slice(&100u64.to_le_bytes());
+        // file_size at offset 48
+        body[48..56].copy_from_slice(&42u64.to_le_bytes());
+        // file_id at offset 64
+        body[64..80].copy_from_slice(&[1u8; 16]);
+
+        let resp = decode_create_response(&body).unwrap();
+        assert_eq!(resp.last_write_time, 100);
+        assert_eq!(resp.file_size, 42);
+        assert_eq!(resp.file_id, [1u8; 16]);
+    }
+
+    #[test]
+    fn decode_create_response_too_short() {
+        assert!(decode_create_response(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_valid() {
+        // data_offset at body[2..4], data_length at body[4..8]
+        let mut body = vec![0u8; 32];
+        let data_offset = (SMB2_HEADER_SIZE + 16) as u16; // offset within full msg
+        body[2..4].copy_from_slice(&data_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&5u32.to_le_bytes()); // 5 bytes of data
+        body[16..21].copy_from_slice(b"hello");
+
+        let data = decode_read_response(&body).unwrap();
+        assert_eq!(&data[..], b"hello");
+    }
+
+    #[test]
+    fn decode_read_response_too_short() {
+        assert!(decode_read_response(&[0u8; 5]).is_none());
+    }
+
+    #[test]
+    fn decode_write_response_valid() {
+        let mut body = vec![0u8; 16];
+        body[4..8].copy_from_slice(&1024u32.to_le_bytes());
+        assert_eq!(decode_write_response(&body), Some(1024));
+    }
+
+    #[test]
+    fn decode_write_response_too_short() {
+        assert!(decode_write_response(&[0u8; 8]).is_none());
+    }
+
+    #[test]
+    fn decode_close_response_valid() {
+        let mut body = vec![0u8; 60];
+        body[24..32].copy_from_slice(&999u64.to_le_bytes()); // last_write_time
+        body[48..56].copy_from_slice(&4096u64.to_le_bytes()); // file_size
+        let resp = decode_close_response(&body).unwrap();
+        assert_eq!(resp.last_write_time, 999);
+        assert_eq!(resp.file_size, 4096);
+    }
+
+    #[test]
+    fn decode_close_response_too_short() {
+        assert!(decode_close_response(&[0u8; 20]).is_none());
+    }
+
+    // ── Directory entry parsing ──────────────────────────────────────
+
+    #[test]
+    fn parse_directory_entries_single() {
+        // Build a minimal FileIdBothDirectoryInformation entry
+        let name = "test.txt";
+        let name_utf16: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let entry_size = 104 + name_utf16.len();
+        let mut data = vec![0u8; entry_size];
+        // next_entry_offset = 0 (last entry)
+        // file_size at offset 40
+        data[40..48].copy_from_slice(&512u64.to_le_bytes());
+        // file_attributes at offset 56 (0x20 = ARCHIVE = regular file)
+        data[56..60].copy_from_slice(&0x20u32.to_le_bytes());
+        // file_name_length at offset 60
+        data[60..64].copy_from_slice(&(name_utf16.len() as u32).to_le_bytes());
+        // file_name at offset 104
+        data[104..].copy_from_slice(&name_utf16);
+
+        let entries = parse_directory_entries(&data);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_name, "test.txt");
+        assert_eq!(entries[0].file_size, 512);
+        assert!(!entries[0].is_directory());
+    }
+
+    #[test]
+    fn parse_directory_entries_skips_dot() {
+        let name = ".";
+        let name_utf16: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        let entry_size = 104 + name_utf16.len();
+        let mut data = vec![0u8; entry_size];
+        data[56..60].copy_from_slice(&0x10u32.to_le_bytes()); // directory
+        data[60..64].copy_from_slice(&(name_utf16.len() as u32).to_le_bytes());
+        data[104..].copy_from_slice(&name_utf16);
+
+        let entries = parse_directory_entries(&data);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_directory_entries_empty() {
+        assert!(parse_directory_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn directory_entry_is_directory() {
+        let entry = DirectoryEntry {
+            file_name: "dir".into(),
+            file_size: 0,
+            file_attributes: 0x10,
+            last_write_time: 0,
+        };
+        assert!(entry.is_directory());
+
+        let file = DirectoryEntry {
+            file_name: "f".into(),
+            file_size: 100,
+            file_attributes: 0x20,
+            last_write_time: 0,
+        };
+        assert!(!file.is_directory());
+    }
+
+    // ── Frame helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn build_request_has_netbios_header() {
+        let hdr = Header::new(Command::Close, 0);
+        let packet = build_request(&hdr, |buf| {
+            encode_close_request(buf, &[0u8; 16]);
+        });
+        // First 4 bytes are big-endian NetBIOS length
+        let netbios_len = u32::from_be_bytes(packet[0..4].try_into().unwrap());
+        assert_eq!(netbios_len as usize, packet.len() - 4);
+        // SMB2 magic at offset 4
+        assert_eq!(&packet[4..8], SMB2_MAGIC);
+    }
+
+    // ── Encode request sizes ─────────────────────────────────────────
+
+    #[test]
+    fn encode_close_request_size() {
+        let mut buf = BytesMut::new();
+        encode_close_request(&mut buf, &[0u8; 16]);
+        assert_eq!(buf.len(), 24); // StructureSize(2) + Flags(2) + Reserved(4) + FileId(16)
+    }
+
+    #[test]
+    fn encode_close_request_ex_postquery_flag() {
+        let mut buf = BytesMut::new();
+        encode_close_request_ex(&mut buf, &SENTINEL_FILE_ID, true);
+        assert_eq!(u16::from_le_bytes(buf[2..4].try_into().unwrap()), 1);
+
+        let mut buf2 = BytesMut::new();
+        encode_close_request_ex(&mut buf2, &SENTINEL_FILE_ID, false);
+        assert_eq!(u16::from_le_bytes(buf2[2..4].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn encode_read_request_size() {
+        let mut buf = BytesMut::new();
+        encode_read_request(&mut buf, &[0u8; 16], 0, 65536);
+        assert_eq!(buf.len(), 49);
+    }
+
+    #[test]
+    fn encode_write_request_includes_data() {
+        let mut buf = BytesMut::new();
+        let data = b"hello";
+        encode_write_request(&mut buf, &[0u8; 16], 0, data);
+        assert_eq!(buf.len(), 48 + data.len()); // fixed part + data
+    }
 }
