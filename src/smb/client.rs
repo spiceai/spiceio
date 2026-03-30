@@ -161,7 +161,7 @@ impl SmbClient {
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
         eprintln!(
-            "[spio] negotiated SMB 0x{:04X}, max_rw={}K",
+            "[spiceio] negotiated SMB 0x{:04X}, max_rw={}K",
             neg_resp.dialect_revision,
             neg_resp.max_write_size.min(65536) / 1024,
         );
@@ -223,7 +223,7 @@ impl SmbClient {
 
         // Derive the signing key
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
-        eprintln!("[spio] authenticated, signing key derived");
+        eprintln!("[spiceio] authenticated, signing key derived");
 
         self.session_id = resp_hdr.session_id;
         // Cap at 64KB to avoid oversized SMB messages; the negotiate value is often
@@ -374,7 +374,9 @@ impl SmbClient {
         if resp_hdr.status & 0xC000_0000 == 0xC000_0000 {
             return Err(io::Error::other(format!(
                 "write failed: status=0x{:08X} offset={} len={}",
-                resp_hdr.status, offset, data.len()
+                resp_hdr.status,
+                offset,
+                data.len()
             )));
         }
 

@@ -1,6 +1,6 @@
 //! Streaming response body for S3 operations.
 //!
-//! `SpioBody` is an enum body that can be either a full in-memory response
+//! `SpiceioBody` is an enum body that can be either a full in-memory response
 //! (for XML, errors, small payloads) or a streaming channel body (for
 //! GetObject reads from SMB).
 
@@ -12,14 +12,14 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
 /// Unified response body — either fully buffered or streamed via channel.
-pub enum SpioBody {
+pub enum SpiceioBody {
     /// Complete body in memory (XML responses, errors, small payloads).
     Full(Option<Bytes>),
     /// Streaming body fed by an mpsc channel (GetObject, large reads).
     Stream(mpsc::Receiver<Bytes>),
 }
 
-impl SpioBody {
+impl SpiceioBody {
     /// Create a full body from bytes.
     pub fn full(data: Bytes) -> Self {
         if data.is_empty() {
@@ -41,7 +41,7 @@ impl SpioBody {
     }
 }
 
-impl Body for SpioBody {
+impl Body for SpiceioBody {
     type Data = Bytes;
     type Error = Infallible;
 
@@ -50,27 +50,27 @@ impl Body for SpioBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match self.get_mut() {
-            SpioBody::Full(data) => {
+            SpiceioBody::Full(data) => {
                 // Yield the data once, then signal end of stream
                 Poll::Ready(data.take().map(|b| Ok(Frame::data(b))))
             }
-            SpioBody::Stream(rx) => rx.poll_recv(cx).map(|opt| opt.map(|b| Ok(Frame::data(b)))),
+            SpiceioBody::Stream(rx) => rx.poll_recv(cx).map(|opt| opt.map(|b| Ok(Frame::data(b)))),
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
-            SpioBody::Full(None) => true,
-            SpioBody::Full(Some(b)) => b.is_empty(),
-            SpioBody::Stream(_) => false,
+            SpiceioBody::Full(None) => true,
+            SpiceioBody::Full(Some(b)) => b.is_empty(),
+            SpiceioBody::Stream(_) => false,
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
-            SpioBody::Full(None) => http_body::SizeHint::with_exact(0),
-            SpioBody::Full(Some(b)) => http_body::SizeHint::with_exact(b.len() as u64),
-            SpioBody::Stream(_) => http_body::SizeHint::default(),
+            SpiceioBody::Full(None) => http_body::SizeHint::with_exact(0),
+            SpiceioBody::Full(Some(b)) => http_body::SizeHint::with_exact(b.len() as u64),
+            SpiceioBody::Stream(_) => http_body::SizeHint::default(),
         }
     }
 }

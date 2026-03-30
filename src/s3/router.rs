@@ -16,7 +16,7 @@ use hyper::body::Incoming;
 use std::io;
 use std::sync::Arc;
 
-use super::body::SpioBody;
+use super::body::SpiceioBody;
 use super::headers::*;
 use super::multipart::MultipartStore;
 use super::xml::{self, XmlWriter};
@@ -37,7 +37,7 @@ pub struct AppState {
 /// Accepts the raw `Incoming` body — GetObject and PutObject stream without
 /// buffering the entire payload. Operations that need the full body (multipart,
 /// multi-delete, copy) collect it internally.
-pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Response<SpioBody> {
+pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Response<SpiceioBody> {
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
     let method = req.method().clone();
@@ -207,7 +207,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         return with_common_headers(
             Response::builder()
                 .status(StatusCode::ACCEPTED)
-                .body(SpioBody::empty())
+                .body(SpiceioBody::empty())
                 .unwrap(),
             &request_id,
             &state.region,
@@ -267,7 +267,7 @@ async fn handle_list_objects(
     share: &ShareSession,
     bucket: &str,
     query: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let list_type = extract_query_param(query, "list-type").unwrap_or_default();
     let prefix = extract_query_param(query, "prefix").unwrap_or_default();
     let delimiter = extract_query_param(query, "delimiter");
@@ -346,8 +346,8 @@ async fn handle_list_objects(
                     w.element("StorageClass", "STANDARD");
                     if fetch_owner {
                         w.open("Owner");
-                        w.element("ID", "spio");
-                        w.element("DisplayName", "spio");
+                        w.element("ID", "spiceio");
+                        w.element("DisplayName", "spiceio");
                         w.close("Owner");
                     }
                     w.close("Contents");
@@ -379,8 +379,8 @@ async fn handle_list_objects(
                     w.element("ETag", &format!("\"{}\"", obj.etag));
                     w.element("Size", &obj.size.to_string());
                     w.open("Owner");
-                    w.element("ID", "spio");
-                    w.element("DisplayName", "spio");
+                    w.element("ID", "spiceio");
+                    w.element("DisplayName", "spiceio");
                     w.close("Owner");
                     w.element("StorageClass", "STANDARD");
                     w.close("Contents");
@@ -417,7 +417,7 @@ async fn handle_get_object(
     hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let range_header = get_header(hdrs, "range").map(String::from);
     let if_match = get_header(hdrs, IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
@@ -460,7 +460,7 @@ async fn handle_get_object(
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &etag)
-            .body(SpioBody::empty())
+            .body(SpiceioBody::empty())
             .unwrap();
     }
 
@@ -473,7 +473,7 @@ async fn handle_get_object(
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &etag)
-            .body(SpioBody::empty())
+            .body(SpiceioBody::empty())
             .unwrap();
     }
 
@@ -509,7 +509,7 @@ async fn handle_get_object(
     let content_length = end - start + 1;
 
     // Build response with streaming body
-    let (body, tx) = SpioBody::channel(4);
+    let (body, tx) = SpiceioBody::channel(4);
     let chunk_size = handle.max_chunk;
 
     // Spawn background task to stream SMB reads into the channel
@@ -564,7 +564,7 @@ async fn handle_put_object(
     hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
     // Conditional write: If-None-Match: * means "only if not exists"
@@ -638,7 +638,7 @@ async fn handle_put_object(
     if let Some(ct) = content_type {
         builder = builder.header("Content-Type", ct);
     }
-    builder.body(SpioBody::empty()).unwrap()
+    builder.body(SpiceioBody::empty()).unwrap()
 }
 
 // ── CopyObject ──────────────────────────────────────────────────────────────
@@ -647,7 +647,7 @@ async fn handle_copy_object(
     hdrs: &http::HeaderMap,
     share: &ShareSession,
     dest_key: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let copy_source = match get_header(hdrs, X_AMZ_COPY_SOURCE) {
         Some(s) => s.to_string(),
         None => {
@@ -730,13 +730,13 @@ async fn handle_copy_object(
 
 // ── DeleteObject ────────────────────────────────────────────────────────────
 
-async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<SpioBody> {
+async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<SpiceioBody> {
     match share.delete_object(key).await {
         Ok(()) | Err(_) => {
             // S3 returns 204 even if not found
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
-                .body(SpioBody::empty())
+                .body(SpiceioBody::empty())
                 .unwrap()
         }
     }
@@ -748,7 +748,7 @@ async fn handle_head_object(
     hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let if_match = get_header(hdrs, IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let if_modified_since = get_header(hdrs, IF_MODIFIED_SINCE).map(String::from);
@@ -769,7 +769,7 @@ async fn handle_head_object(
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header("ETag", &etag)
-                    .body(SpioBody::empty())
+                    .body(SpiceioBody::empty())
                     .unwrap();
             }
             if let Some(ref ims) = if_modified_since
@@ -779,7 +779,7 @@ async fn handle_head_object(
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header("ETag", &etag)
-                    .body(SpioBody::empty())
+                    .body(SpiceioBody::empty())
                     .unwrap();
             }
             if let Some(ref ius) = if_unmodified_since
@@ -797,12 +797,12 @@ async fn handle_head_object(
                 .header("ETag", &etag)
                 .header("Last-Modified", last_modified)
                 .header("Accept-Ranges", "bytes")
-                .body(SpioBody::empty())
+                .body(SpiceioBody::empty())
                 .unwrap()
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(SpioBody::empty())
+            .body(SpiceioBody::empty())
             .unwrap(),
         Err(e) => io_to_s3_error(&e),
     }
@@ -810,7 +810,7 @@ async fn handle_head_object(
 
 // ── Multi-object Delete ─────────────────────────────────────────────────────
 
-async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<SpioBody> {
+async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<SpiceioBody> {
     let body_str = String::from_utf8_lossy(&body);
 
     let keys: Vec<String> = xml::extract_sections(&body_str, "<Object>", "</Object>")
@@ -863,7 +863,7 @@ async fn handle_create_multipart_upload(
     hdrs: &http::HeaderMap,
     state: &AppState,
     key: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let _content_type = get_header(hdrs, "content-type");
     let upload_id = state.multipart.create(key).await;
 
@@ -890,7 +890,7 @@ async fn handle_upload_part(
     _key: &str,
     upload_id: &str,
     part_number: u32,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     if part_number == 0 || part_number > 10000 {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -921,7 +921,7 @@ async fn handle_upload_part(
     Response::builder()
         .status(StatusCode::OK)
         .header("ETag", format!("\"{}\"", etag))
-        .body(SpioBody::empty())
+        .body(SpiceioBody::empty())
         .unwrap()
 }
 
@@ -930,7 +930,7 @@ async fn handle_complete_multipart_upload(
     state: &AppState,
     key: &str,
     upload_id: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let upload = match state.multipart.complete(upload_id).await {
         Some(u) => u,
         None => {
@@ -996,7 +996,7 @@ async fn handle_abort_multipart_upload(
     state: &AppState,
     _key: &str,
     upload_id: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let upload = match state.multipart.abort(upload_id).await {
         Some(u) => u,
         None => return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", ""),
@@ -1016,7 +1016,7 @@ async fn handle_abort_multipart_upload(
     ok_no_content()
 }
 
-async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Response<SpioBody> {
+async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Response<SpiceioBody> {
     let upload = match state.multipart.get(upload_id).await {
         Some(u) => u,
         None => return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", ""),
@@ -1032,12 +1032,12 @@ async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Resp
     w.element("Key", key);
     w.element("UploadId", upload_id);
     w.open("Initiator");
-    w.element("ID", "spio");
-    w.element("DisplayName", "spio");
+    w.element("ID", "spiceio");
+    w.element("DisplayName", "spiceio");
     w.close("Initiator");
     w.open("Owner");
-    w.element("ID", "spio");
-    w.element("DisplayName", "spio");
+    w.element("ID", "spiceio");
+    w.element("DisplayName", "spiceio");
     w.close("Owner");
     w.element("StorageClass", "STANDARD");
     w.element("PartNumberMarker", "0");
@@ -1064,7 +1064,7 @@ async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Resp
     xml_response(StatusCode::OK, w.finish())
 }
 
-async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Response<SpioBody> {
+async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Response<SpiceioBody> {
     let prefix = extract_query_param(query, "prefix");
     let uploads = state.multipart.list(prefix.as_deref()).await;
 
@@ -1083,12 +1083,12 @@ async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Respons
         w.element("Key", &upload.key);
         w.element("UploadId", &upload.upload_id);
         w.open("Initiator");
-        w.element("ID", "spio");
-        w.element("DisplayName", "spio");
+        w.element("ID", "spiceio");
+        w.element("DisplayName", "spiceio");
         w.close("Initiator");
         w.open("Owner");
-        w.element("ID", "spio");
-        w.element("DisplayName", "spio");
+        w.element("ID", "spiceio");
+        w.element("DisplayName", "spiceio");
         w.close("Owner");
         w.element("StorageClass", "STANDARD");
         w.element("Initiated", &xml::epoch_to_iso8601(upload.initiated));
@@ -1101,7 +1101,7 @@ async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Respons
 
 // ── Bucket-level stubs ──────────────────────────────────────────────────────
 
-fn handle_get_bucket_location(region: &str) -> Response<SpioBody> {
+fn handle_get_bucket_location(region: &str) -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("LocationConstraint", S3_XMLNS);
@@ -1113,15 +1113,15 @@ fn handle_get_bucket_location(region: &str) -> Response<SpioBody> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn head_bucket_response(region: &str) -> Response<SpioBody> {
+fn head_bucket_response(region: &str) -> Response<SpiceioBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(X_AMZ_BUCKET_REGION, region)
-        .body(SpioBody::empty())
+        .body(SpiceioBody::empty())
         .unwrap()
 }
 
-fn handle_get_bucket_versioning() -> Response<SpioBody> {
+fn handle_get_bucket_versioning() -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("VersioningConfiguration", S3_XMLNS);
@@ -1130,20 +1130,20 @@ fn handle_get_bucket_versioning() -> Response<SpioBody> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_bucket_acl() -> Response<SpioBody> {
+fn handle_get_bucket_acl() -> Response<SpiceioBody> {
     // Return a minimal private ACL
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("AccessControlPolicy", S3_XMLNS);
     w.open("Owner");
-    w.element("ID", "spio");
-    w.element("DisplayName", "spio");
+    w.element("ID", "spiceio");
+    w.element("DisplayName", "spiceio");
     w.close("Owner");
     w.open("AccessControlList");
     w.open("Grant");
     w.open("Grantee");
-    w.element("ID", "spio");
-    w.element("DisplayName", "spio");
+    w.element("ID", "spiceio");
+    w.element("DisplayName", "spiceio");
     w.close("Grantee");
     w.element("Permission", "FULL_CONTROL");
     w.close("Grant");
@@ -1152,7 +1152,7 @@ fn handle_get_bucket_acl() -> Response<SpioBody> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_bucket_tagging() -> Response<SpioBody> {
+fn handle_get_bucket_tagging() -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("Tagging", S3_XMLNS);
@@ -1162,7 +1162,7 @@ fn handle_get_bucket_tagging() -> Response<SpioBody> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_bucket_cors() -> Response<SpioBody> {
+fn handle_get_bucket_cors() -> Response<SpiceioBody> {
     // No CORS configuration
     error_response(
         StatusCode::NOT_FOUND,
@@ -1171,11 +1171,11 @@ fn handle_get_bucket_cors() -> Response<SpioBody> {
     )
 }
 
-fn handle_get_bucket_lifecycle() -> Response<SpioBody> {
+fn handle_get_bucket_lifecycle() -> Response<SpiceioBody> {
     error_response(StatusCode::NOT_FOUND, "NoSuchLifecycleConfiguration", "")
 }
 
-fn handle_get_bucket_policy() -> Response<SpioBody> {
+fn handle_get_bucket_policy() -> Response<SpiceioBody> {
     error_response(
         StatusCode::NOT_FOUND,
         "NoSuchBucketPolicy",
@@ -1183,7 +1183,7 @@ fn handle_get_bucket_policy() -> Response<SpioBody> {
     )
 }
 
-fn handle_get_bucket_encryption() -> Response<SpioBody> {
+fn handle_get_bucket_encryption() -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("ServerSideEncryptionConfiguration", S3_XMLNS);
@@ -1197,11 +1197,11 @@ fn handle_get_bucket_encryption() -> Response<SpioBody> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_object_acl() -> Response<SpioBody> {
+fn handle_get_object_acl() -> Response<SpiceioBody> {
     handle_get_bucket_acl() // Same structure
 }
 
-fn handle_get_object_tagging() -> Response<SpioBody> {
+fn handle_get_object_tagging() -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("Tagging", S3_XMLNS);
@@ -1213,13 +1213,13 @@ fn handle_get_object_tagging() -> Response<SpioBody> {
 
 // ── ListBuckets ─────────────────────────────────────────────────────────────
 
-fn list_buckets_response(bucket: &str) -> Response<SpioBody> {
+fn list_buckets_response(bucket: &str) -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("ListAllMyBucketsResult", S3_XMLNS);
     w.open("Owner");
-    w.element("ID", "spio");
-    w.element("DisplayName", "spio");
+    w.element("ID", "spiceio");
+    w.element("DisplayName", "spiceio");
     w.close("Owner");
     w.open("Buckets");
     w.open("Bucket");
@@ -1233,7 +1233,7 @@ fn list_buckets_response(bucket: &str) -> Response<SpioBody> {
 
 // ── CORS preflight ──────────────────────────────────────────────────────────
 
-fn cors_preflight(request_id: &str, region: &str) -> Response<SpioBody> {
+fn cors_preflight(request_id: &str, region: &str) -> Response<SpiceioBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header("Access-Control-Allow-Origin", "*")
@@ -1243,24 +1243,24 @@ fn cors_preflight(request_id: &str, region: &str) -> Response<SpioBody> {
         .header("Access-Control-Max-Age", "86400")
         .header(X_AMZ_REQUEST_ID, request_id)
         .header(X_AMZ_BUCKET_REGION, region)
-        .body(SpioBody::empty())
+        .body(SpiceioBody::empty())
         .unwrap()
 }
 
 // ── Response helpers ────────────────────────────────────────────────────────
 
 fn with_common_headers(
-    mut resp: Response<SpioBody>,
+    mut resp: Response<SpiceioBody>,
     request_id: &str,
     region: &str,
-) -> Response<SpioBody> {
+) -> Response<SpiceioBody> {
     let headers = resp.headers_mut();
     if !headers.contains_key(X_AMZ_REQUEST_ID) {
         headers.insert(X_AMZ_REQUEST_ID, request_id.parse().unwrap());
     }
     headers.insert(X_AMZ_ID_2, request_id.parse().unwrap());
     headers.insert(X_AMZ_BUCKET_REGION, region.parse().unwrap());
-    headers.insert("Server", "spio".parse().unwrap());
+    headers.insert("Server", "spiceio".parse().unwrap());
     // CORS allow
     if !headers.contains_key("access-control-allow-origin") {
         headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
@@ -1274,16 +1274,16 @@ fn with_common_headers(
     resp
 }
 
-fn xml_response(status: StatusCode, body: String) -> Response<SpioBody> {
+fn xml_response(status: StatusCode, body: String) -> Response<SpiceioBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/xml")
         .header("Content-Length", body.len().to_string())
-        .body(SpioBody::full(Bytes::from(body)))
+        .body(SpiceioBody::full(Bytes::from(body)))
         .unwrap()
 }
 
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response<SpioBody> {
+fn error_response(status: StatusCode, code: &str, message: &str) -> Response<SpiceioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open("Error");
@@ -1294,34 +1294,32 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Spi
     xml_response(status, w.finish())
 }
 
-fn ok_empty() -> Response<SpioBody> {
+fn ok_empty() -> Response<SpiceioBody> {
     Response::builder()
         .status(StatusCode::OK)
-        .body(SpioBody::empty())
+        .body(SpiceioBody::empty())
         .unwrap()
 }
 
-fn ok_no_content() -> Response<SpioBody> {
+fn ok_no_content() -> Response<SpiceioBody> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(SpioBody::empty())
+        .body(SpiceioBody::empty())
         .unwrap()
 }
 
-fn io_to_s3_error(e: &io::Error) -> Response<SpioBody> {
+fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
     match e.kind() {
         io::ErrorKind::NotFound => error_response(
             StatusCode::NOT_FOUND,
             "NoSuchKey",
             "The specified key does not exist.",
         ),
-        io::ErrorKind::PermissionDenied => error_response(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
-            "Access Denied",
-        ),
+        io::ErrorKind::PermissionDenied => {
+            error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied")
+        }
         _ => {
-            eprintln!("[spio] error: {e}");
+            eprintln!("[spiceio] error: {e}");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -1373,7 +1371,7 @@ async fn collect_body(req: Request<Incoming>) -> Bytes {
     match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            eprintln!("[spio] body collect error: {e}");
+            eprintln!("[spiceio] body collect error: {e}");
             Bytes::new()
         }
     }

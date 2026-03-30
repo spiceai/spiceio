@@ -1,4 +1,4 @@
-//! spio — S3-compatible API proxy to SMB 3.1.1 file shares (macOS 26).
+//! spiceio — S3-compatible API proxy to SMB 3.1.1 file shares (macOS 26).
 
 mod crypto;
 mod s3;
@@ -45,22 +45,23 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         Self {
-            bind_addr: env::var("SPIO_BIND")
+            bind_addr: env::var("SPICEIO_BIND")
                 .unwrap_or_else(|_| "0.0.0.0:8333".into())
                 .parse()
-                .expect("SPIO_BIND must be a valid socket address"),
-            smb_server: env::var("SPIO_SMB_SERVER").expect("SPIO_SMB_SERVER is required"),
-            smb_port: env::var("SPIO_SMB_PORT")
+                .expect("SPICEIO_BIND must be a valid socket address"),
+            smb_server: env::var("SPICEIO_SMB_SERVER").expect("SPICEIO_SMB_SERVER is required"),
+            smb_port: env::var("SPICEIO_SMB_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(445),
-            smb_username: env::var("SPIO_SMB_USER").expect("SPIO_SMB_USER is required"),
-            smb_password: env::var("SPIO_SMB_PASS").expect("SPIO_SMB_PASS is required"),
-            smb_domain: env::var("SPIO_SMB_DOMAIN").unwrap_or_default(),
-            smb_share: env::var("SPIO_SMB_SHARE").expect("SPIO_SMB_SHARE is required"),
-            bucket_name: env::var("SPIO_BUCKET")
-                .unwrap_or_else(|_| env::var("SPIO_SMB_SHARE").unwrap_or_else(|_| "data".into())),
-            region: env::var("SPIO_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            smb_username: env::var("SPICEIO_SMB_USER").expect("SPICEIO_SMB_USER is required"),
+            smb_password: env::var("SPICEIO_SMB_PASS").expect("SPICEIO_SMB_PASS is required"),
+            smb_domain: env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
+            smb_share: env::var("SPICEIO_SMB_SHARE").expect("SPICEIO_SMB_SHARE is required"),
+            bucket_name: env::var("SPICEIO_BUCKET").unwrap_or_else(|_| {
+                env::var("SPICEIO_SMB_SHARE").unwrap_or_else(|_| "data".into())
+            }),
+            region: env::var("SPICEIO_REGION").unwrap_or_else(|_| "us-east-1".into()),
         }
     }
 }
@@ -70,7 +71,7 @@ async fn main() {
     let config = Config::from_env();
 
     eprintln!(
-        "[spio] connecting to smb://{}@{}:{}/{}",
+        "[spiceio] connecting to smb://{}@{}:{}/{}",
         config.smb_username, config.smb_server, config.smb_port, config.smb_share
     );
 
@@ -81,7 +82,7 @@ async fn main() {
         username: config.smb_username.clone(),
         password: config.smb_password.clone(),
         domain: config.smb_domain.clone(),
-        workstation: "SPIO".into(),
+        workstation: "SPICEIO".into(),
     };
 
     let client = smb::SmbClient::connect(smb_config)
@@ -108,9 +109,9 @@ async fn main() {
         .await
         .expect("failed to bind TCP listener");
 
-    eprintln!("[spio] listening on http://{bind_addr}");
+    eprintln!("[spiceio] listening on http://{bind_addr}");
     eprintln!(
-        "[spio] bucket: {} region: {}",
+        "[spiceio] bucket: {} region: {}",
         config.bucket_name, config.region
     );
 
@@ -121,7 +122,7 @@ async fn main() {
                 let (stream, peer_addr) = match accepted {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[spio] accept error: {e}");
+                        eprintln!("[spiceio] accept error: {e}");
                         continue;
                     }
                 };
@@ -142,12 +143,12 @@ async fn main() {
                         .serve_connection(io, service)
                         .await
                         && !e.to_string().contains("connection reset") {
-                            eprintln!("[spio] connection error from {peer_addr}: {e}");
+                            eprintln!("[spiceio] connection error from {peer_addr}: {e}");
                         }
                 });
             }
             _ = signal::ctrl_c() => {
-                eprintln!("\n[spio] shutting down");
+                eprintln!("\n[spiceio] shutting down");
                 break;
             }
         }

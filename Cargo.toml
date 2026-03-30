@@ -1,12 +1,12 @@
 [package]
-name = "spio"
+name = "spiceio"
 version = "0.1.0"
 edition = "2024"
 description = "S3-compatible API proxy to SMB file shares"
 license = "MIT"
 
 [[bin]]
-name = "spio"
+name = "spiceio"
 path = "src/main.rs"
 
 [dependencies]
