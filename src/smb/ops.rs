@@ -558,4 +558,3 @@ fn guess_content_type(key: &str) -> String {
     }
     .into()
 }
-

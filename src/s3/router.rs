@@ -978,7 +978,9 @@ async fn handle_complete_multipart_upload(
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "InvalidPart",
-                &format!("One or more of the specified parts could not be found. Part number: {pn}"),
+                &format!(
+                    "One or more of the specified parts could not be found. Part number: {pn}"
+                ),
             );
         }
     }
