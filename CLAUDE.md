@@ -19,7 +19,7 @@ spio is an S3-compatible API proxy that translates S3 HTTP requests into SMB 3.1
 make                           # fmt + lint + test + build (default target)
 make release                   # optimized release build
 make lint                      # cargo fmt --check + cargo clippy
-make test                      # cargo test
+make test                      # sccache integration test (requires SPIO_SMB_USER/PASS)
 make fmt                       # auto-format
 make clean                     # cargo clean
 ```
@@ -39,7 +39,7 @@ The binary requires these environment variables:
 
 The codebase has three modules:
 
-- **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads, and stub endpoints for ACL/tagging/versioning. Auth is SigV4 (header + presigned URL) in `auth.rs`. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spio-uploads/` on the SMB share.
+- **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads, and stub endpoints for ACL/tagging/versioning. Auth is SigV4 (header + presigned URL) in `auth.rs`. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spio-uploads/` on the SMB share. `body.rs` implements `SpioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
 
 - **`smb`** — Wire protocol client. `protocol.rs` defines SMB 3.1.x packet structures (little-endian). `client.rs` manages the TCP connection, negotiate/session-setup handshake, and exposes operations (tree connect, create, read, write, close, query directory, query info). `auth.rs` implements NTLMv2 challenge-response. `ops.rs` provides the high-level `ShareSession` abstraction the S3 layer consumes (list, read, write, delete, stat, copy).
 
@@ -51,6 +51,8 @@ The codebase has three modules:
 
 - Zero external crypto dependencies — all crypto goes through `crypto::ffi` to CommonCrypto.
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.
-- Body is fully collected into `Bytes` before routing (no streaming).
+- GetObject streams SMB read chunks directly to the HTTP response via `SpioBody::channel` — no full-file buffering.
+- PutObject streams HTTP request body chunks directly to SMB write calls — no full-body collection.
+- Body is collected into `Bytes` only for operations that require the full payload (multi-delete, multipart complete, upload-part for ETag hashing).
 - S3 path-style addressing only (no virtual-hosted-style).
 - Multipart upload parts are stored as temporary SMB files, not in memory.

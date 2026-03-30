@@ -27,17 +27,17 @@ make lint           # cargo fmt --check + cargo clippy
 
 All configuration is via environment variables:
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `SPIO_SMB_SERVER` | yes | | SMB server hostname or IP |
-| `SPIO_SMB_USER` | yes | | SMB username |
-| `SPIO_SMB_PASS` | yes | | SMB password |
-| `SPIO_SMB_SHARE` | yes | | SMB share name |
-| `SPIO_BIND` | no | `0.0.0.0:8333` | Listen address |
-| `SPIO_SMB_PORT` | no | `445` | SMB port |
-| `SPIO_SMB_DOMAIN` | no | *(empty)* | SMB domain |
-| `SPIO_BUCKET` | no | `SPIO_SMB_SHARE` | Virtual S3 bucket name |
-| `SPIO_REGION` | no | `us-east-1` | AWS region to advertise |
+| Variable          | Required | Default          | Description               |
+| ----------------- | -------- | ---------------- | ------------------------- |
+| `SPIO_SMB_SERVER` | yes      |                  | SMB server hostname or IP |
+| `SPIO_SMB_USER`   | yes      |                  | SMB username              |
+| `SPIO_SMB_PASS`   | yes      |                  | SMB password              |
+| `SPIO_SMB_SHARE`  | yes      |                  | SMB share name            |
+| `SPIO_BIND`       | no       | `0.0.0.0:8333`   | Listen address            |
+| `SPIO_SMB_PORT`   | no       | `445`            | SMB port                  |
+| `SPIO_SMB_DOMAIN` | no       | *(empty)*        | SMB domain                |
+| `SPIO_BUCKET`     | no       | `SPIO_SMB_SHARE` | Virtual S3 bucket name    |
+| `SPIO_REGION`     | no       | `us-east-1`      | AWS region to advertise   |
 
 ## Usage
 
