@@ -1,7 +1,7 @@
 //! Multipart upload state management.
 //!
 //! Tracks in-progress multipart uploads. Parts are stored as temporary SMB
-//! files under a `.spio-uploads/` directory on the share.
+//! files under a `.spiceio-uploads/` directory on the share.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +28,7 @@ pub struct PartInfo {
     pub part_number: u32,
     pub size: u64,
     pub etag: String,
-    /// Temp file path on SMB share (under .spio-uploads/)
+    /// Temp file path on SMB share (under .spiceio-uploads/)
     pub temp_path: String,
 }
 
@@ -109,12 +109,12 @@ impl MultipartStore {
 
     /// Get the temp directory path for multipart parts.
     pub fn temp_dir(upload_id: &str) -> String {
-        format!(".spio-uploads\\{}", upload_id)
+        format!(".spiceio-uploads\\{}", upload_id)
     }
 
     /// Get the temp file path for a specific part.
     pub fn temp_part_path(upload_id: &str, part_number: u32) -> String {
-        format!(".spio-uploads\\{}\\part-{:05}", upload_id, part_number)
+        format!(".spiceio-uploads\\{}\\part-{:05}", upload_id, part_number)
     }
 }
 

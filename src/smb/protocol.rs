@@ -486,7 +486,7 @@ pub fn encode_query_directory_request(
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
         .collect();
-    let name_offset = (SMB2_HEADER_SIZE + 32 + 1) as u16;
+    let name_offset = (SMB2_HEADER_SIZE + 32) as u16;
     let mut flags: u8 = 0;
     if restart {
         flags |= 0x01; // SMB2_RESTART_SCANS

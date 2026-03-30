@@ -312,17 +312,17 @@ pub fn wrap_spnego_negotiate(ntlmssp: &[u8]) -> Vec<u8> {
     ];
 
     // Build inside-out for correct DER lengths
-    let mech_list = der_wrap(0x30, oid_ntlmssp);           // SEQUENCE { OID }
-    let mech_types = der_wrap(0xa0, &mech_list);            // [0] mechTypes
-    let mech_token_inner = der_wrap(0x04, ntlmssp);         // OCTET STRING
-    let mech_token = der_wrap(0xa2, &mech_token_inner);     // [2] mechToken
+    let mech_list = der_wrap(0x30, oid_ntlmssp); // SEQUENCE { OID }
+    let mech_types = der_wrap(0xa0, &mech_list); // [0] mechTypes
+    let mech_token_inner = der_wrap(0x04, ntlmssp); // OCTET STRING
+    let mech_token = der_wrap(0xa2, &mech_token_inner); // [2] mechToken
 
     let mut inner = Vec::with_capacity(mech_types.len() + mech_token.len());
     inner.extend_from_slice(&mech_types);
     inner.extend_from_slice(&mech_token);
 
-    let neg_token_init = der_wrap(0x30, &inner);            // SEQUENCE
-    let neg_token = der_wrap(0xa0, &neg_token_init);        // [0] NegTokenInit
+    let neg_token_init = der_wrap(0x30, &inner); // SEQUENCE
+    let neg_token = der_wrap(0xa0, &neg_token_init); // [0] NegTokenInit
 
     // APPLICATION [0] { OID, NegotiationToken }
     let mut app_content = Vec::with_capacity(oid_spnego.len() + neg_token.len());
@@ -371,5 +371,177 @@ fn push_der_length(buf: &mut Vec<u8>, len: usize) {
         buf.push((len >> 16) as u8);
         buf.push((len >> 8) as u8);
         buf.push(len as u8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_challenge_bytes(
+        server_challenge: [u8; 8],
+        negotiate_flags: u32,
+        target_info: &[u8],
+        target_info_offset: usize,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; target_info_offset + target_info.len()];
+        data[..8].copy_from_slice(NTLMSSP_SIGNATURE);
+        data[8..12].copy_from_slice(&NTLMSSP_CHALLENGE.to_le_bytes());
+        data[20..24].copy_from_slice(&negotiate_flags.to_le_bytes());
+        data[24..32].copy_from_slice(&server_challenge);
+        data[40..42].copy_from_slice(&(target_info.len() as u16).to_le_bytes());
+        data[42..44].copy_from_slice(&(target_info.len() as u16).to_le_bytes());
+        data[44..48].copy_from_slice(&(target_info_offset as u32).to_le_bytes());
+        data[target_info_offset..target_info_offset + target_info.len()]
+            .copy_from_slice(target_info);
+        data
+    }
+
+    #[test]
+    fn test_build_negotiate_message_layout() {
+        let message = build_negotiate_message();
+        assert_eq!(message.len(), 40);
+        assert_eq!(&message[..8], NTLMSSP_SIGNATURE);
+        assert_eq!(
+            u32::from_le_bytes(message[8..12].try_into().unwrap()),
+            NTLMSSP_NEGOTIATE
+        );
+
+        let expected_flags = NTLMSSP_NEGOTIATE_UNICODE
+            | NTLMSSP_NEGOTIATE_NTLM
+            | NTLMSSP_REQUEST_TARGET
+            | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+            | NTLMSSP_NEGOTIATE_VERSION;
+        assert_eq!(
+            u32::from_le_bytes(message[12..16].try_into().unwrap()),
+            expected_flags
+        );
+        assert_eq!(&message[16..32], &[0u8; 16]);
+        assert_eq!(&message[32..40], &[10, 0, 0, 0, 0, 0, 0, 0x0f]);
+    }
+
+    #[test]
+    fn test_parse_challenge_message_extracts_fields() {
+        let server_challenge = *b"12345678";
+        let negotiate_flags = 0xaabbccdd;
+        let target_info = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
+        let challenge = build_challenge_bytes(server_challenge, negotiate_flags, &target_info, 48);
+
+        let parsed = parse_challenge_message(&challenge).unwrap();
+        assert_eq!(parsed.server_challenge, server_challenge);
+        assert_eq!(parsed.negotiate_flags, negotiate_flags);
+        assert_eq!(parsed.target_info, target_info);
+    }
+
+    #[test]
+    fn test_parse_challenge_message_rejects_invalid_inputs() {
+        assert!(parse_challenge_message(&[]).is_none());
+
+        let mut wrong_signature = vec![0u8; 32];
+        wrong_signature[..8].copy_from_slice(b"badtoken");
+        assert!(parse_challenge_message(&wrong_signature).is_none());
+
+        let mut wrong_type = vec![0u8; 32];
+        wrong_type[..8].copy_from_slice(NTLMSSP_SIGNATURE);
+        wrong_type[8..12].copy_from_slice(&NTLMSSP_NEGOTIATE.to_le_bytes());
+        assert!(parse_challenge_message(&wrong_type).is_none());
+    }
+
+    #[test]
+    fn test_parse_challenge_message_ignores_out_of_bounds_target_info() {
+        let mut challenge = build_challenge_bytes(*b"ABCDEFGH", 0x01020304, &[0xaa, 0xbb], 48);
+        challenge[44..48].copy_from_slice(&200u32.to_le_bytes());
+        let parsed = parse_challenge_message(&challenge).unwrap();
+        assert!(parsed.target_info.is_empty());
+    }
+
+    #[test]
+    fn test_derive_signing_key_known_vector() {
+        let session_key = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let preauth_hash = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+            0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+            0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+        ];
+
+        let derived = derive_signing_key(&session_key, &preauth_hash);
+        assert_eq!(
+            crypto::hex_encode(&derived),
+            "f7e5401ecc6e79ef9eab401b05004e4f"
+        );
+    }
+
+    #[test]
+    fn test_build_ntlmv2_blob_layout() {
+        let client_challenge = *b"12345678";
+        let target_info = [0x01, 0x02, 0x03, 0x04];
+        let blob = build_ntlmv2_blob(&client_challenge, &target_info);
+
+        assert_eq!(
+            &blob[..8],
+            &[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert!(u64::from_le_bytes(blob[8..16].try_into().unwrap()) >= 116444736000000000);
+        assert_eq!(&blob[16..24], client_challenge);
+        assert_eq!(&blob[24..28], &[0u8; 4]);
+        assert_eq!(&blob[28..32], &target_info);
+        assert_eq!(&blob[32..36], &[0u8; 4]);
+    }
+
+    #[test]
+    fn test_unwrap_spnego_returns_original_slice_without_signature() {
+        let token = b"plain-token";
+        assert_eq!(unwrap_spnego(token), token);
+    }
+
+    #[test]
+    fn test_unwrap_spnego_finds_embedded_ntlmssp() {
+        let wrapped = b"junkNTLMSSP\0payload";
+        assert_eq!(unwrap_spnego(wrapped), b"NTLMSSP\0payload");
+    }
+
+    #[test]
+    fn test_wrap_spnego_negotiate_round_trips_token() {
+        let token = b"NTLMSSP\0\x01\x02\x03";
+        let wrapped = wrap_spnego_negotiate(token);
+        assert_eq!(wrapped[0], 0x60);
+        assert_eq!(unwrap_spnego(&wrapped), token);
+    }
+
+    #[test]
+    fn test_wrap_spnego_auth_round_trips_token() {
+        let token = b"NTLMSSP\0\x03\x02\x01";
+        let wrapped = wrap_spnego_auth(token);
+        assert_eq!(wrapped[0], 0xa1);
+        assert_eq!(unwrap_spnego(&wrapped), token);
+    }
+
+    #[test]
+    fn test_der_wrap_adds_tag_and_length() {
+        let wrapped = der_wrap(0x04, b"\xaa\xbb");
+        assert_eq!(wrapped, vec![0x04, 0x02, 0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_push_der_length_boundaries() {
+        let cases = [
+            (0x7f, vec![0x7f]),
+            (0x80, vec![0x81, 0x80]),
+            (0xff, vec![0x81, 0xff]),
+            (0x100, vec![0x82, 0x01, 0x00]),
+            (0xffff, vec![0x82, 0xff, 0xff]),
+            (0x10000, vec![0x83, 0x01, 0x00, 0x00]),
+        ];
+
+        for (len, expected) in cases {
+            let mut out = Vec::new();
+            push_der_length(&mut out, len);
+            assert_eq!(out, expected);
+        }
     }
 }
