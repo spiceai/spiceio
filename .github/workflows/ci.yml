@@ -2,7 +2,6 @@ name: CI
 
 on:
   pull_request:
-  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +15,7 @@ env:
 jobs:
   ci:
     name: Format, lint, build, and test
+    # Self-hosted macOS runner required for CommonCrypto FFI and NAS access
     runs-on: spiceai-macos
     permissions:
       contents: read
@@ -51,13 +51,15 @@ jobs:
         run: cargo test --locked
 
       - name: Run sccache integration test
+        # Skipped on fork PRs where the secret is unavailable
+        if: ${{ secrets.UNAS_SMB_PASS != '' }}
         env:
-          SPICEIO_SMB_SERVER: 192.168.3.148
-          SPICEIO_SMB_USER: runner
+          SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
+          SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
           SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
-          SPICEIO_SMB_SHARE: ai_platform_dev
-          SPICEIO_BUCKET: spiceio
-          SPICEIO_REGION: us-west-1
+          SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
+          SPICEIO_BUCKET: ${{ vars.SPICEIO_BUCKET || 'spiceio' }}
+          SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
         run: ./scripts/test-sccache.sh
 
       - name: Build release artifact
