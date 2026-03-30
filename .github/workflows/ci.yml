@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  ci:
+    name: Format, lint, build, and test
+    runs-on: spiceai-macos
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run cargo check
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::all -D clippy::cargo -A clippy::cargo-common-metadata
+
+      - name: Check rustdoc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+
+      - name: Build debug binary
+        run: cargo build --locked
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Run sccache integration test
+        env:
+          SPICEIO_SMB_SERVER: 192.168.3.148
+          SPICEIO_SMB_USER: runner
+          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_SHARE: ai_platform_dev
+          SPICEIO_BUCKET: spiceio
+          SPICEIO_REGION: us-west-1
+        run: ./scripts/test-sccache.sh
+
+      - name: Build release artifact
+        run: cargo build --release --locked --bin spiceio
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spiceio-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/spiceio
+          if-no-files-found: error
