@@ -60,12 +60,35 @@ pub fn parse_range(header: &str) -> Option<RangeSpec> {
 
 impl RangeSpec {
     /// Resolve to absolute byte positions given total file size.
-    pub fn resolve(&self, total: u64) -> (u64, u64) {
+    /// Returns `None` if the range is not satisfiable (empty file, start >= total, etc.).
+    pub fn resolve(&self, total: u64) -> Option<(u64, u64)> {
+        if total == 0 {
+            return None;
+        }
         match (self.start, self.end) {
-            (Some(s), Some(e)) => (s, e.min(total - 1)),
-            (Some(s), None) => (s, total - 1),
-            (None, Some(suffix)) => (total.saturating_sub(suffix), total - 1),
-            (None, None) => (0, total - 1),
+            (Some(s), Some(e)) => {
+                if s >= total {
+                    return None;
+                }
+                let end = e.min(total - 1);
+                if s > end {
+                    return None;
+                }
+                Some((s, end))
+            }
+            (Some(s), None) => {
+                if s >= total {
+                    return None;
+                }
+                Some((s, total - 1))
+            }
+            (None, Some(suffix)) => {
+                if suffix == 0 {
+                    return None;
+                }
+                Some((total.saturating_sub(suffix), total - 1))
+            }
+            (None, None) => Some((0, total - 1)),
         }
     }
 }

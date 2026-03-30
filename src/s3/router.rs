@@ -291,7 +291,11 @@ async fn handle_list_objects(
     };
 
     match result {
-        Ok((mut objects, common_prefixes)) => {
+        Ok((mut objects, mut common_prefixes)) => {
+            // Sort by key for consistent S3 listing semantics
+            objects.sort_by(|a, b| a.key.cmp(&b.key));
+            common_prefixes.sort();
+
             // Apply marker/start-after/continuation-token filtering
             if !skip_marker.is_empty() {
                 objects.retain(|o| o.key.as_str() > skip_marker);
@@ -497,8 +501,17 @@ async fn handle_get_object(
     // Determine read range
     let (start, end, is_range) = if let Some(ref range_str) = range_header {
         if let Some(range) = parse_range(range_str) {
-            let (s, e) = range.resolve(file_size);
-            (s, e, true)
+            match range.resolve(file_size) {
+                Some((s, e)) => (s, e, true),
+                None => {
+                    let _ = handle.close().await;
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header("Content-Range", format!("bytes */{file_size}"))
+                        .body(SpiceioBody::empty())
+                        .unwrap();
+                }
+            }
         } else {
             (0, file_size.saturating_sub(1), false)
         }
@@ -631,7 +644,12 @@ async fn handle_put_object(
         return io_to_s3_error(&e);
     }
 
-    let etag = format!("{:016x}", total_size.wrapping_mul(0x100000001b3));
+    // Re-read metadata so the ETag is derived from last_write_time,
+    // consistent with get/head/list operations.
+    let etag = match share.head_object(key).await {
+        Ok(meta) => meta.etag,
+        Err(_) => format!("{:016x}", total_size),
+    };
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("ETag", format!("\"{etag}\""));
@@ -931,7 +949,8 @@ async fn handle_complete_multipart_upload(
     key: &str,
     upload_id: &str,
 ) -> Response<SpiceioBody> {
-    let upload = match state.multipart.complete(upload_id).await {
+    // Look up but do NOT remove the upload yet — only remove after successful assembly.
+    let upload = match state.multipart.get(upload_id).await {
         Some(u) => u,
         None => {
             return error_response(
@@ -951,16 +970,29 @@ async fn handle_complete_multipart_upload(
         })
         .collect();
 
+    // Validate that all requested parts exist before starting assembly
+    for pn in &part_numbers {
+        if !upload.parts.contains_key(pn) {
+            // Re-register the upload so it is not lost
+            re_register_upload(&state.multipart, upload).await;
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidPart",
+                &format!("One or more of the specified parts could not be found. Part number: {pn}"),
+            );
+        }
+    }
+
     // Concatenate parts in order and write the final object
     let mut final_data = Vec::new();
     for pn in &part_numbers {
-        if let Some(part) = upload.parts.get(pn) {
-            match state.share.read_temp(&part.temp_path).await {
-                Ok(data) => final_data.extend_from_slice(&data),
-                Err(e) => {
-                    // Re-register the upload since we consumed it
-                    return io_to_s3_error(&e);
-                }
+        let part = upload.parts.get(pn).unwrap();
+        match state.share.read_temp(&part.temp_path).await {
+            Ok(data) => final_data.extend_from_slice(&data),
+            Err(e) => {
+                // Re-register the upload since we consumed it
+                re_register_upload(&state.multipart, upload).await;
+                return io_to_s3_error(&e);
             }
         }
     }
@@ -968,8 +1000,14 @@ async fn handle_complete_multipart_upload(
     // Write the assembled object
     let meta = match state.share.put_object(key, &final_data).await {
         Ok(m) => m,
-        Err(e) => return io_to_s3_error(&e),
+        Err(e) => {
+            // Upload state was not removed — it remains available for retry.
+            return io_to_s3_error(&e);
+        }
     };
+
+    // Success — now remove the upload state
+    let _ = state.multipart.complete(upload_id).await;
 
     // Clean up temp files (best effort)
     for part in upload.parts.values() {
@@ -990,6 +1028,15 @@ async fn handle_complete_multipart_upload(
     w.element("ETag", &format!("\"{}\"", meta.etag));
     w.close("CompleteMultipartUploadResult");
     xml_response(StatusCode::OK, w.finish())
+}
+
+/// Re-register an upload that was retrieved via `get` but needs to remain active
+/// (e.g., because assembly failed and the client should be able to retry).
+async fn re_register_upload(store: &MultipartStore, upload: super::multipart::UploadState) {
+    // Since we used `get` (non-destructive) the upload is still in the store,
+    // so this is a no-op. Kept for clarity and forward-compatibility.
+    let _ = upload;
+    let _ = store;
 }
 
 async fn handle_abort_multipart_upload(

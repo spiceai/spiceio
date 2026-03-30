@@ -242,13 +242,13 @@ impl ShareSession {
 
         let _ = self.client.close(self.tree_id, &file.file_id).await;
 
+        // Re-read metadata so the ETag is based on last_write_time, matching
+        // get/head/list which all use the same scheme.
+        let meta = self.head_object(key).await?;
         Ok(ObjectMeta {
             size: data.len() as u64,
-            last_modified: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            etag: format!("{:016x}", simple_hash(data)),
+            last_modified: meta.last_modified,
+            etag: meta.etag,
             content_type: guess_content_type(key),
         })
     }
@@ -559,13 +559,3 @@ fn guess_content_type(key: &str) -> String {
     .into()
 }
 
-/// Simple non-cryptographic hash for ETags.
-fn simple_hash(data: &[u8]) -> u64 {
-    // FNV-1a
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}

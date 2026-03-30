@@ -1,6 +1,5 @@
 //! SMB2 client — manages TCP connections and speaks the protocol.
 
-use bytes::Buf;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -428,8 +427,8 @@ impl SmbClient {
 
             // Parse the output buffer from the response body
             if resp_body.len() >= 9 {
-                let buf_offset = (&resp_body[2..4] as &[u8]).get_u16_le() as usize;
-                let buf_length = (&resp_body[4..8] as &[u8]).get_u32_le() as usize;
+                let buf_offset = u16::from_le_bytes(resp_body[2..4].try_into().unwrap()) as usize;
+                let buf_length = u32::from_le_bytes(resp_body[4..8].try_into().unwrap()) as usize;
                 let start = buf_offset.saturating_sub(SMB2_HEADER_SIZE);
                 let end = (start + buf_length).min(resp_body.len());
                 if start < end {

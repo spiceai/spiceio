@@ -4,7 +4,7 @@
 //! header layout, and per-command request/response formats needed for
 //! basic file I/O operations.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 // ── SMB2 magic ──────────────────────────────────────────────────────────────
 
@@ -28,18 +28,20 @@ pub enum Command {
 
 // ── NT Status codes we care about ───────────────────────────────────────────
 
-#[repr(u32)]
+/// NT status code. Wraps both known variants and unknown raw values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NtStatus {
-    Success = 0x00000000,
-    MoreProcessingRequired = 0xC0000016,
-    NoSuchFile = 0xC000000F,
-    ObjectNameNotFound = 0xC0000034,
-    ObjectNameCollision = 0xC0000035,
-    AccessDenied = 0xC0000022,
-    EndOfFile = 0xC0000011,
-    NoMoreFiles = 0x80000006,
-    ObjectPathNotFound = 0xC000003A,
+    Success,
+    MoreProcessingRequired,
+    NoSuchFile,
+    ObjectNameNotFound,
+    ObjectNameCollision,
+    AccessDenied,
+    EndOfFile,
+    NoMoreFiles,
+    ObjectPathNotFound,
+    /// An unknown status code — preserves the raw value and its severity.
+    Unknown(u32),
 }
 
 impl NtStatus {
@@ -54,20 +56,30 @@ impl NtStatus {
             0xC0000011 => Self::EndOfFile,
             0x80000006 => Self::NoMoreFiles,
             0xC000003A => Self::ObjectPathNotFound,
-            other => {
-                // Treat unknown as success if zero high-bit, else generic error
-                if other == 0 {
-                    Self::Success
-                } else {
-                    // store as-is via MoreProcessingRequired trick — caller checks raw
-                    Self::AccessDenied
-                }
-            }
+            other => Self::Unknown(other),
         }
     }
 
+    /// An error has the two high bits set (severity 0xC0 = error).
     pub fn is_error(self) -> bool {
-        (self as u32) & 0xC0000000 == 0xC0000000
+        let raw = self.raw();
+        raw & 0xC0000000 == 0xC0000000
+    }
+
+    /// Return the raw u32 status code.
+    pub fn raw(self) -> u32 {
+        match self {
+            Self::Success => 0x00000000,
+            Self::MoreProcessingRequired => 0xC0000016,
+            Self::NoSuchFile => 0xC000000F,
+            Self::ObjectNameNotFound => 0xC0000034,
+            Self::ObjectNameCollision => 0xC0000035,
+            Self::AccessDenied => 0xC0000022,
+            Self::EndOfFile => 0xC0000011,
+            Self::NoMoreFiles => 0x80000006,
+            Self::ObjectPathNotFound => 0xC000003A,
+            Self::Unknown(v) => v,
+        }
     }
 }
 
@@ -128,18 +140,18 @@ impl Header {
             return None;
         }
         buf = &buf[4..];
-        let _structure_size = (&buf[..2]).get_u16_le(); // skip past
+        let _structure_size = u16::from_le_bytes(buf[..2].try_into().unwrap()); // skip past
         let buf = &buf[2..];
-        let credit_charge = (&buf[..2]).get_u16_le();
-        let status = (&buf[2..6]).get_u32_le();
-        let command = (&buf[6..8]).get_u16_le();
-        let credits_requested = (&buf[8..10]).get_u16_le();
-        let flags = (&buf[10..14]).get_u32_le();
-        let next_command = (&buf[14..18]).get_u32_le();
-        let message_id = (&buf[18..26]).get_u64_le();
-        let _reserved = (&buf[26..30]).get_u32_le();
-        let tree_id = (&buf[30..34]).get_u32_le();
-        let session_id = (&buf[34..42]).get_u64_le();
+        let credit_charge = u16::from_le_bytes(buf[..2].try_into().unwrap());
+        let status = u32::from_le_bytes(buf[2..6].try_into().unwrap());
+        let command = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        let credits_requested = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        let flags = u32::from_le_bytes(buf[10..14].try_into().unwrap());
+        let next_command = u32::from_le_bytes(buf[14..18].try_into().unwrap());
+        let message_id = u64::from_le_bytes(buf[18..26].try_into().unwrap());
+        let _reserved = u32::from_le_bytes(buf[26..30].try_into().unwrap());
+        let tree_id = u32::from_le_bytes(buf[30..34].try_into().unwrap());
+        let session_id = u64::from_le_bytes(buf[34..42].try_into().unwrap());
         // signature at 42..58 — skip for now
 
         Some(Self {
@@ -250,10 +262,10 @@ pub fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse> {
     if body.len() < 40 {
         return None;
     }
-    let security_mode = (&body[2..4]).get_u16_le();
-    let dialect_revision = (&body[4..6]).get_u16_le();
-    let max_read_size = (&body[32..36]).get_u32_le();
-    let max_write_size = (&body[36..40]).get_u32_le();
+    let security_mode = u16::from_le_bytes(body[2..4].try_into().unwrap());
+    let dialect_revision = u16::from_le_bytes(body[4..6].try_into().unwrap());
+    let max_read_size = u32::from_le_bytes(body[32..36].try_into().unwrap());
+    let max_write_size = u32::from_le_bytes(body[36..40].try_into().unwrap());
 
     Some(NegotiateResponse {
         security_mode,
@@ -288,8 +300,8 @@ pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<Ses
     if body.len() < 9 {
         return None;
     }
-    let security_buffer_offset = (&body[4..6]).get_u16_le() as usize;
-    let security_buffer_length = (&body[6..8]).get_u16_le() as usize;
+    let security_buffer_offset = u16::from_le_bytes(body[4..6].try_into().unwrap()) as usize;
+    let security_buffer_length = u16::from_le_bytes(body[6..8].try_into().unwrap()) as usize;
 
     let sec_start = security_buffer_offset.saturating_sub(SMB2_HEADER_SIZE);
     let sec_end = sec_start + security_buffer_length;
@@ -364,7 +376,7 @@ pub fn encode_create_request(
     // StructureSize for Create request is 57
     buf.put_u16_le(57); // StructureSize
     buf.put_u8(0); // SecurityFlags
-    buf.put_u8(0x02); // RequestedOplockLevel: SMB2_OPLOCK_LEVEL_NONE = 0, BATCH=0x09, LEASE=0xFF, let's try none
+    buf.put_u8(0x00); // RequestedOplockLevel: SMB2_OPLOCK_LEVEL_NONE
     buf.put_u32_le(0x00000002); // ImpersonationLevel: Impersonation
     buf.put_u64_le(0); // SmbCreateFlags
     buf.put_u64_le(0); // Reserved
@@ -392,9 +404,9 @@ pub fn decode_create_response(body: &[u8]) -> Option<CreateResponse> {
     if body.len() < 88 {
         return None;
     }
-    let last_write_time = (&body[24..32]).get_u64_le();
+    let last_write_time = u64::from_le_bytes(body[24..32].try_into().unwrap());
     // AllocationSize at 40..48
-    let file_size = (&body[48..56]).get_u64_le();
+    let file_size = u64::from_le_bytes(body[48..56].try_into().unwrap());
     // Reserved2 at 60..64
     let mut file_id = [0u8; 16];
     file_id.copy_from_slice(&body[64..80]);
@@ -436,8 +448,8 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
     if body.len() < 17 {
         return None;
     }
-    let data_offset = (&body[2..3])[0] as usize;
-    let data_length = (&body[4..8]).get_u32_le() as usize;
+    let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
+    let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
 
     let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
     let end = start + data_length;
@@ -468,7 +480,7 @@ pub fn decode_write_response(body: &[u8]) -> Option<u32> {
     if body.len() < 16 {
         return None;
     }
-    Some((&body[4..8]).get_u32_le()) // Count (bytes written)
+    Some(u32::from_le_bytes(body[4..8].try_into().unwrap())) // Count (bytes written)
 }
 
 // ── Query Directory ─────────────────────────────────────────────────────────
@@ -528,16 +540,16 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
         }
         let entry = &data[offset..];
 
-        let next_entry_offset = (&entry[0..4]).get_u32_le() as usize;
-        let _file_index = (&entry[4..8]).get_u32_le();
-        let _creation_time = (&entry[8..16]).get_u64_le();
-        let _last_access_time = (&entry[16..24]).get_u64_le();
-        let last_write_time = (&entry[24..32]).get_u64_le();
-        let _change_time = (&entry[32..40]).get_u64_le();
-        let file_size = (&entry[40..48]).get_u64_le(); // EndOfFile
-        let _allocation_size = (&entry[48..56]).get_u64_le();
-        let file_attributes = (&entry[56..60]).get_u32_le();
-        let file_name_length = (&entry[60..64]).get_u32_le() as usize;
+        let next_entry_offset = u32::from_le_bytes(entry[0..4].try_into().unwrap()) as usize;
+        let _file_index = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+        let _creation_time = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+        let _last_access_time = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+        let last_write_time = u64::from_le_bytes(entry[24..32].try_into().unwrap());
+        let _change_time = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let file_size = u64::from_le_bytes(entry[40..48].try_into().unwrap()); // EndOfFile
+        let _allocation_size = u64::from_le_bytes(entry[48..56].try_into().unwrap());
+        let file_attributes = u32::from_le_bytes(entry[56..60].try_into().unwrap());
+        let file_name_length = u32::from_le_bytes(entry[60..64].try_into().unwrap()) as usize;
 
         // FileIdBothDirectoryInformation: filename starts at offset 104
         let name_start = 104;
@@ -577,8 +589,10 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
 /// Prepend a 4-byte NetBIOS session length prefix to the packet.
 pub fn frame_packet(header: &Header, body: &[u8]) -> BytesMut {
     let total = SMB2_HEADER_SIZE + body.len();
+    // NetBIOS session length is 3 bytes (17 + 7 bits), capped at 0x00FFFFFF
+    let netbios_len = (total as u32) & 0x00FF_FFFF;
     let mut buf = BytesMut::with_capacity(4 + total);
-    buf.put_u32(total as u32); // NetBIOS length (big-endian, no flags)
+    buf.put_u32(netbios_len); // NetBIOS length (big-endian, no flags)
     header.encode(&mut buf);
     buf.put_slice(body);
     buf
