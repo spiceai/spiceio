@@ -15,7 +15,9 @@ env:
 jobs:
   ci:
     name: Format, lint, build, and test
-    # Self-hosted macOS runner required for CommonCrypto FFI and NAS access
+    # Self-hosted macOS runner required for CommonCrypto FFI and NAS access.
+    # Skip fork PRs to prevent untrusted code execution on self-hosted runners.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: spiceai-macos
     permissions:
       contents: read

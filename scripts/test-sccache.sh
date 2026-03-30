@@ -271,8 +271,8 @@ echo "======================================="
 # ── Verify cache hits ───────────────────────────────────────────────────────
 
 STATS=$(sccache --show-stats 2>&1)
-CACHE_HITS=$(echo "$STATS" | grep -m1 "^Cache hits" | awk '{print $NF}')
-WRITE_ERRORS=$(echo "$STATS" | grep -m1 "Cache write errors" | awk '{print $NF}')
+CACHE_HITS=$(echo "$STATS" | grep -m1 "^Cache hits" | awk '{print $NF}' || echo "0")
+WRITE_ERRORS=$(echo "$STATS" | grep -m1 "Cache write errors" | awk '{print $NF}' || echo "0")
 
 echo ""
 if [[ "${CACHE_HITS:-0}" -gt 0 && "${WRITE_ERRORS:-0}" -eq 0 ]]; then
