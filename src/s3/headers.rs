@@ -4,35 +4,7 @@ use http::HeaderMap;
 
 // ── Standard S3 request headers ─────────────────────────────────────────────
 
-pub const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
-pub const X_AMZ_DATE: &str = "x-amz-date";
-pub const X_AMZ_SECURITY_TOKEN: &str = "x-amz-security-token";
 pub const X_AMZ_COPY_SOURCE: &str = "x-amz-copy-source";
-pub const X_AMZ_COPY_SOURCE_RANGE: &str = "x-amz-copy-source-range";
-pub const X_AMZ_METADATA_DIRECTIVE: &str = "x-amz-metadata-directive";
-pub const X_AMZ_TAGGING: &str = "x-amz-tagging";
-pub const X_AMZ_TAGGING_DIRECTIVE: &str = "x-amz-tagging-directive";
-pub const X_AMZ_STORAGE_CLASS: &str = "x-amz-storage-class";
-pub const X_AMZ_ACL: &str = "x-amz-acl";
-pub const X_AMZ_GRANT_READ: &str = "x-amz-grant-read";
-pub const X_AMZ_GRANT_WRITE: &str = "x-amz-grant-write";
-pub const X_AMZ_GRANT_FULL_CONTROL: &str = "x-amz-grant-full-control";
-pub const X_AMZ_SERVER_SIDE_ENCRYPTION: &str = "x-amz-server-side-encryption";
-pub const X_AMZ_SSE_CUSTOMER_ALGORITHM: &str = "x-amz-server-side-encryption-customer-algorithm";
-pub const X_AMZ_SSE_CUSTOMER_KEY: &str = "x-amz-server-side-encryption-customer-key";
-pub const X_AMZ_SSE_CUSTOMER_KEY_MD5: &str = "x-amz-server-side-encryption-customer-key-md5";
-pub const X_AMZ_REQUEST_PAYER: &str = "x-amz-request-payer";
-pub const X_AMZ_EXPECTED_BUCKET_OWNER: &str = "x-amz-expected-bucket-owner";
-pub const X_AMZ_OBJECT_LOCK_MODE: &str = "x-amz-object-lock-mode";
-pub const X_AMZ_OBJECT_LOCK_RETAIN_UNTIL: &str = "x-amz-object-lock-retain-until-date";
-pub const X_AMZ_OBJECT_LOCK_LEGAL_HOLD: &str = "x-amz-object-lock-legal-hold";
-pub const X_AMZ_DELETE_MARKER: &str = "x-amz-delete-marker";
-pub const X_AMZ_VERSION_ID: &str = "x-amz-version-id";
-pub const X_AMZ_MFA: &str = "x-amz-mfa";
-pub const X_AMZ_ABORT_DATE: &str = "x-amz-abort-date";
-pub const X_AMZ_ABORT_RULE_ID: &str = "x-amz-abort-rule-id";
-pub const X_AMZ_MP_PARTS_COUNT: &str = "x-amz-mp-parts-count";
-pub const X_AMZ_WRITE_OFFSET_BYTES: &str = "x-amz-write-offset-bytes";
 
 // ── Conditional headers ─────────────────────────────────────────────────────
 
@@ -51,24 +23,6 @@ pub const X_AMZ_COPY_SOURCE_IF_UNMODIFIED_SINCE: &str = "x-amz-copy-source-if-un
 pub const X_AMZ_REQUEST_ID: &str = "x-amz-request-id";
 pub const X_AMZ_ID_2: &str = "x-amz-id-2";
 pub const X_AMZ_BUCKET_REGION: &str = "x-amz-bucket-region";
-
-// ── User metadata prefix ────────────────────────────────────────────────────
-
-pub const X_AMZ_META_PREFIX: &str = "x-amz-meta-";
-
-/// Extract all user metadata headers (x-amz-meta-*) as key-value pairs.
-pub fn extract_user_metadata(headers: &HeaderMap) -> Vec<(String, String)> {
-    let mut meta = Vec::new();
-    for (key, value) in headers.iter() {
-        let name = key.as_str();
-        if let Some(suffix) = name.strip_prefix(X_AMZ_META_PREFIX)
-            && let Ok(val) = value.to_str()
-        {
-            meta.push((suffix.to_string(), val.to_string()));
-        }
-    }
-    meta
-}
 
 /// Get a header value as a string.
 pub fn get_header<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {

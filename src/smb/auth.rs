@@ -18,6 +18,7 @@ const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x00000001;
 const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x00000200;
 const NTLMSSP_REQUEST_TARGET: u32 = 0x00000004;
 const NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x00080000;
+const NTLMSSP_NEGOTIATE_VERSION: u32 = 0x02000000;
 
 /// Build the NTLMSSP Negotiate (Type 1) message.
 pub fn build_negotiate_message() -> Bytes {
@@ -28,7 +29,8 @@ pub fn build_negotiate_message() -> Bytes {
     let flags = NTLMSSP_NEGOTIATE_UNICODE
         | NTLMSSP_NEGOTIATE_NTLM
         | NTLMSSP_REQUEST_TARGET
-        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY;
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_VERSION;
     buf.put_u32_le(flags);
     // DomainNameFields (Len, MaxLen, Offset) = 0
     buf.put_u16_le(0);
@@ -38,7 +40,17 @@ pub fn build_negotiate_message() -> Bytes {
     buf.put_u16_le(0);
     buf.put_u16_le(0);
     buf.put_u32_le(0);
+    // Version (8 bytes)
+    put_ntlm_version(&mut buf);
     buf.freeze()
+}
+
+fn put_ntlm_version(buf: &mut BytesMut) {
+    buf.put_u8(10); // ProductMajorVersion
+    buf.put_u8(0); // ProductMinorVersion
+    buf.put_u16_le(0); // ProductBuild
+    buf.put_slice(&[0u8; 3]); // Reserved
+    buf.put_u8(0x0f); // NTLMRevisionCurrent
 }
 
 /// Parsed NTLMSSP Challenge (Type 2) message fields.
@@ -103,13 +115,14 @@ fn ntlmv2_hash(username: &str, password: &str, domain: &str) -> [u8; 16] {
 }
 
 /// Build the NTLMSSP Authenticate (Type 3) message.
+/// Returns (message_bytes, session_base_key).
 pub fn build_authenticate_message(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
     domain: &str,
     workstation: &str,
-) -> Bytes {
+) -> (Bytes, [u8; 16]) {
     let ntlmv2_hash = ntlmv2_hash(username, password, domain);
 
     // Generate client challenge (8 random bytes)
@@ -132,7 +145,7 @@ pub fn build_authenticate_message(
     nt_response.extend_from_slice(&blob);
 
     // Session base key = HMAC_MD5(ntlmv2_hash, NTProofStr)
-    let _session_base_key = crypto::hmac_md5(&ntlmv2_hash, &nt_proof_str);
+    let session_base_key = crypto::hmac_md5(&ntlmv2_hash, &nt_proof_str);
 
     // Encode fields in UTF-16LE
     let domain_bytes: Vec<u8> = domain
@@ -151,17 +164,16 @@ pub fn build_authenticate_message(
     // LM response — for NTLMv2, just 24 zero bytes
     let lm_response = [0u8; 24];
 
-    // Calculate offsets (Type 3 header is 88 bytes)
-    let payload_offset = 88u32;
+    // Calculate offsets (Type 3 header: 64 base + 8 Version = 72 bytes)
+    let payload_offset = 72u32;
     let lm_offset = payload_offset;
     let nt_offset = lm_offset + lm_response.len() as u32;
     let domain_offset = nt_offset + nt_response.len() as u32;
     let user_offset = domain_offset + domain_bytes.len() as u32;
     let ws_offset = user_offset + user_bytes.len() as u32;
 
-    let flags = NTLMSSP_NEGOTIATE_UNICODE
-        | NTLMSSP_NEGOTIATE_NTLM
-        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY;
+    // Echo back the server's negotiate flags with VERSION set
+    let flags = challenge.negotiate_flags | NTLMSSP_NEGOTIATE_VERSION;
 
     let mut buf = BytesMut::with_capacity(ws_offset as usize + ws_bytes.len());
     buf.put_slice(NTLMSSP_SIGNATURE); // Signature
@@ -192,16 +204,17 @@ pub fn build_authenticate_message(
     buf.put_u16_le(ws_bytes.len() as u16);
     buf.put_u32_le(ws_offset);
 
-    // EncryptedRandomSession
+    // EncryptedRandomSessionKey (empty, offset points past all payloads)
+    let enc_key_offset = ws_offset + ws_bytes.len() as u32;
     buf.put_u16_le(0);
     buf.put_u16_le(0);
-    buf.put_u32_le(0);
+    buf.put_u32_le(enc_key_offset);
 
     // NegotiateFlags
     buf.put_u32_le(flags);
 
-    // MIC (16 bytes of zero for now)
-    buf.put_slice(&[0u8; 16]);
+    // Version (8 bytes)
+    put_ntlm_version(&mut buf);
 
     // Payload
     buf.put_slice(&lm_response);
@@ -210,7 +223,31 @@ pub fn build_authenticate_message(
     buf.put_slice(&user_bytes);
     buf.put_slice(&ws_bytes);
 
-    buf.freeze()
+    (buf.freeze(), session_base_key)
+}
+
+/// Derive the SMB 3.1.1 signing key using SP800-108 Counter Mode KDF.
+/// `session_key` is the NTLMv2 session base key.
+/// `preauth_hash` is the 64-byte SHA-512 preauth integrity hash.
+pub fn derive_signing_key(session_key: &[u8; 16], preauth_hash: &[u8; 64]) -> [u8; 16] {
+    // KDF = HMAC-SHA256(Key, i || Label || 0x00 || Context || L)
+    // i = 0x00000001 (32-bit big-endian counter)
+    // Label = "SMBSigningKey\0"
+    // Context = preauth integrity hash (64 bytes)
+    // L = 0x00000080 (128 bits, big-endian)
+    let label = b"SMBSigningKey\0";
+
+    let mut input = Vec::with_capacity(4 + label.len() + 1 + 64 + 4);
+    input.extend_from_slice(&1u32.to_be_bytes()); // counter = 1
+    input.extend_from_slice(label);
+    input.push(0x00); // separator
+    input.extend_from_slice(preauth_hash);
+    input.extend_from_slice(&128u32.to_be_bytes()); // L = 128 bits
+
+    let derived = crypto::hmac_sha256(session_key, &input);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&derived[..16]);
+    key
 }
 
 /// Build NTLMv2 client blob (temp structure).
@@ -269,68 +306,53 @@ pub fn unwrap_spnego(data: &[u8]) -> &[u8] {
 /// Wrap an NTLMSSP token in a minimal SPNEGO NegTokenInit for the first
 /// message, or NegTokenResp for subsequent messages.
 pub fn wrap_spnego_negotiate(ntlmssp: &[u8]) -> Vec<u8> {
-    // Minimal ASN.1 SPNEGO wrapper for NegTokenInit
-    let oid_spnego: &[u8] = &[0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02]; // OID 1.3.6.1.5.5.2
+    let oid_spnego: &[u8] = &[0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
     let oid_ntlmssp: &[u8] = &[
         0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
-    ]; // OID 1.3.6.1.4.1.311.2.2.10
+    ];
 
-    let mech_list_len = oid_ntlmssp.len();
-    let mech_list_seq_len = 2 + mech_list_len;
-    let mech_token_len = ntlmssp.len();
+    // Build inside-out for correct DER lengths
+    let mech_list = der_wrap(0x30, oid_ntlmssp);           // SEQUENCE { OID }
+    let mech_types = der_wrap(0xa0, &mech_list);            // [0] mechTypes
+    let mech_token_inner = der_wrap(0x04, ntlmssp);         // OCTET STRING
+    let mech_token = der_wrap(0xa2, &mech_token_inner);     // [2] mechToken
 
-    // Build inner NegTokenInit sequence
-    let mut inner = Vec::new();
-    // mechTypes [0]
-    inner.push(0xa0);
-    push_der_length(&mut inner, mech_list_seq_len);
-    inner.push(0x30);
-    push_der_length(&mut inner, mech_list_len);
-    inner.extend_from_slice(oid_ntlmssp);
-    // mechToken [2]
-    inner.push(0xa2);
-    push_der_length(&mut inner, 2 + mech_token_len);
-    inner.push(0x04);
-    push_der_length(&mut inner, mech_token_len);
-    inner.extend_from_slice(ntlmssp);
+    let mut inner = Vec::with_capacity(mech_types.len() + mech_token.len());
+    inner.extend_from_slice(&mech_types);
+    inner.extend_from_slice(&mech_token);
 
-    // Wrap in NegotiationToken [0] SEQUENCE
-    let mut neg_token = Vec::new();
-    neg_token.push(0xa0);
-    push_der_length(&mut neg_token, 2 + inner.len());
-    neg_token.push(0x30);
-    push_der_length(&mut neg_token, inner.len());
-    neg_token.extend_from_slice(&inner);
+    let neg_token_init = der_wrap(0x30, &inner);            // SEQUENCE
+    let neg_token = der_wrap(0xa0, &neg_token_init);        // [0] NegTokenInit
 
-    // Wrap in APPLICATION [0]
-    let mut result = Vec::with_capacity(4 + oid_spnego.len() + neg_token.len());
-    result.push(0x60);
-    push_der_length(&mut result, oid_spnego.len() + neg_token.len());
-    result.extend_from_slice(oid_spnego);
-    result.extend_from_slice(&neg_token);
-
-    result
+    // APPLICATION [0] { OID, NegotiationToken }
+    let mut app_content = Vec::with_capacity(oid_spnego.len() + neg_token.len());
+    app_content.extend_from_slice(oid_spnego);
+    app_content.extend_from_slice(&neg_token);
+    der_wrap(0x60, &app_content)
 }
 
 /// Wrap an NTLMSSP auth token in SPNEGO NegTokenResp.
 pub fn wrap_spnego_auth(ntlmssp: &[u8]) -> Vec<u8> {
     // NegTokenResp ::= SEQUENCE { responseToken [2] OCTET STRING }
-    let mut inner = Vec::new();
-    // responseToken [2]
-    inner.push(0xa2);
-    push_der_length(&mut inner, 2 + ntlmssp.len());
-    inner.push(0x04);
-    push_der_length(&mut inner, ntlmssp.len());
-    inner.extend_from_slice(ntlmssp);
+    //
+    // Build inside-out so lengths are exact.
+    // OCTET STRING wrapping the NTLMSSP token
+    let octet_string = der_wrap(0x04, ntlmssp);
+    // [2] responseToken
+    let resp_token = der_wrap(0xa2, &octet_string);
+    // SEQUENCE containing the responseToken
+    let seq = der_wrap(0x30, &resp_token);
+    // [1] NegTokenResp
+    der_wrap(0xa1, &seq)
+}
 
-    let mut result = Vec::with_capacity(4 + inner.len());
-    result.push(0xa1);
-    push_der_length(&mut result, 2 + inner.len());
-    result.push(0x30);
-    push_der_length(&mut result, inner.len());
-    result.extend_from_slice(&inner);
-
-    result
+/// Wrap data in a DER TLV: [tag][length][data].
+fn der_wrap(tag: u8, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 4 + data.len());
+    buf.push(tag);
+    push_der_length(&mut buf, data.len());
+    buf.extend_from_slice(data);
+    buf
 }
 
 /// Push a DER length encoding.

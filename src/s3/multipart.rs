@@ -19,8 +19,6 @@ pub struct UploadState {
     pub upload_id: String,
     pub key: String,
     pub parts: HashMap<u32, PartInfo>,
-    pub metadata: Vec<(String, String)>,
-    pub content_type: Option<String>,
     pub initiated: u64,
 }
 
@@ -43,12 +41,7 @@ impl MultipartStore {
     }
 
     /// Create a new multipart upload and return its upload ID.
-    pub async fn create(
-        &self,
-        key: &str,
-        metadata: Vec<(String, String)>,
-        content_type: Option<String>,
-    ) -> String {
+    pub async fn create(&self, key: &str) -> String {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let upload_id = format!("{:016x}{:016x}", epoch_nanos(), id);
 
@@ -56,8 +49,6 @@ impl MultipartStore {
             upload_id: upload_id.clone(),
             key: key.to_string(),
             parts: HashMap::new(),
-            metadata,
-            content_type,
             initiated: epoch_secs(),
         };
 

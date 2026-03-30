@@ -20,6 +20,17 @@ http = "1"
 bytes = "1"
 percent-encoding = "2"
 
+[lints.rust]
+warnings = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+cargo_common_metadata = "allow"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
