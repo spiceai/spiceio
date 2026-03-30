@@ -39,9 +39,8 @@ inputs:
     required: false
     default: "127.0.0.1:8333"
   token:
-    description: GitHub token for downloading release assets
-    required: false
-    default: ${{ github.token }}
+    description: GitHub token for downloading release assets from private repos
+    required: true
 
 outputs:
   endpoint:
@@ -65,6 +64,7 @@ runs:
 
         REPO="spiceai/spiceio"
         INSTALL_DIR="${RUNNER_TEMP:-/tmp}/spiceio-bin"
+        PID_FILE="${RUNNER_TEMP:-/tmp}/spiceio.pid"
         mkdir -p "$INSTALL_DIR"
 
         if [[ "$VERSION" == "latest" ]]; then
@@ -73,13 +73,9 @@ runs:
           TAG="$VERSION"
         fi
 
-        OS=$(uname -s)
-        ARCH=$(uname -m)
-        # Map to GitHub runner naming
-        case "$ARCH" in
-          arm64|aarch64) ARCH="ARM64" ;;
-          x86_64)        ARCH="X64" ;;
-        esac
+        # Asset names use runner.os / runner.arch convention from the release workflow
+        OS="${RUNNER_OS:-$(uname -s)}"
+        ARCH="${RUNNER_ARCH:-$(uname -m)}"
 
         ASSET="spiceio-${OS}-${ARCH}.tar.gz"
         echo "Downloading $ASSET from $REPO@$TAG"
@@ -90,6 +86,7 @@ runs:
 
         echo "$INSTALL_DIR" >> "$GITHUB_PATH"
         echo "bin=$INSTALL_DIR/spiceio" >> "$GITHUB_OUTPUT"
+        echo "pid_file=$PID_FILE" >> "$GITHUB_OUTPUT"
 
     - name: Start spiceio
       id: start
@@ -108,9 +105,11 @@ runs:
         set -euo pipefail
 
         ENDPOINT="http://${SPICEIO_BIND}"
+        PID_FILE="${{ steps.download.outputs.pid_file }}"
 
         spiceio &
         PID=$!
+        echo "$PID" > "$PID_FILE"
         echo "pid=$PID" >> "$GITHUB_OUTPUT"
         echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
 
@@ -129,3 +128,18 @@ runs:
         done
         echo "::error::spiceio failed to start within 30s"
         exit 1
+
+    - name: Register cleanup
+      if: always()
+      shell: bash
+      run: |
+        PID_FILE="${{ steps.download.outputs.pid_file }}"
+        if [[ -f "$PID_FILE" ]]; then
+          PID=$(cat "$PID_FILE")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "Stopping spiceio (PID $PID)"
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          fi
+          rm -f "$PID_FILE"
+        fi
