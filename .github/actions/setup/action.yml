@@ -107,11 +107,21 @@ runs:
         ENDPOINT="http://${SPICEIO_BIND}"
         PID_FILE="${{ steps.download.outputs.pid_file }}"
 
+        # Skip if spiceio is already listening on the requested address
+        if curl -sf -o /dev/null "$ENDPOINT/" 2>/dev/null; then
+          echo "spiceio already running at $ENDPOINT — skipping start"
+          echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "pid=" >> "$GITHUB_OUTPUT"
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         spiceio &
         PID=$!
         echo "$PID" > "$PID_FILE"
         echo "pid=$PID" >> "$GITHUB_OUTPUT"
         echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
 
         # Wait for readiness
         echo "Waiting for spiceio on ${SPICEIO_BIND}..."
@@ -130,7 +140,7 @@ runs:
         exit 1
 
     - name: Register cleanup
-      if: always()
+      if: always() && steps.start.outputs.skipped != 'true'
       shell: bash
       run: |
         PID_FILE="${{ steps.download.outputs.pid_file }}"
