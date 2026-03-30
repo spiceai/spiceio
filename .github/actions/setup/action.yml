@@ -3,7 +3,7 @@ description: Install a released version of spiceio and start the S3-to-SMB proxy
 
 inputs:
   version:
-    description: Release tag to install (e.g. "v0.1.0"). Defaults to latest.
+    description: Release tag to install (e.g. "v0.1.0"). Use "latest" for the most recent release.
     required: false
     default: latest
   smb-server:
@@ -47,46 +47,33 @@ outputs:
     description: The S3-compatible endpoint URL
     value: ${{ steps.start.outputs.endpoint }}
   pid:
-    description: PID of the spiceio background process
+    description: PID of the spiceio background process (empty if skipped)
     value: ${{ steps.start.outputs.pid }}
 
 runs:
   using: composite
   steps:
-    - name: Download spiceio binary
-      id: download
+    - name: Download spiceio release
+      uses: robinraju/release-downloader@v1
+      with:
+        repository: spiceai/spiceio
+        tag: ${{ inputs.version }}
+        latest: ${{ inputs.version == 'latest' }}
+        fileName: spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz
+        out-file-path: ${{ runner.temp }}/spiceio-dl
+        token: ${{ inputs.token }}
+
+    - name: Install spiceio
+      id: install
       shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.token }}
-        VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-
-        REPO="spiceai/spiceio"
-        INSTALL_DIR="${RUNNER_TEMP:-/tmp}/spiceio-bin"
-        PID_FILE="${RUNNER_TEMP:-/tmp}/spiceio.pid"
+        INSTALL_DIR="${RUNNER_TEMP}/spiceio-bin"
         mkdir -p "$INSTALL_DIR"
-
-        if [[ "$VERSION" == "latest" ]]; then
-          TAG=$(gh release view --repo "$REPO" --json tagName -q .tagName)
-        else
-          TAG="$VERSION"
-        fi
-
-        # Asset names use runner.os / runner.arch convention from the release workflow
-        OS="${RUNNER_OS:-$(uname -s)}"
-        ARCH="${RUNNER_ARCH:-$(uname -m)}"
-
-        ASSET="spiceio-${OS}-${ARCH}.tar.gz"
-        echo "Downloading $ASSET from $REPO@$TAG"
-
-        gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir "$INSTALL_DIR"
-        tar xzf "$INSTALL_DIR/$ASSET" -C "$INSTALL_DIR"
+        tar xzf "${RUNNER_TEMP}/spiceio-dl/spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C "$INSTALL_DIR"
         chmod +x "$INSTALL_DIR/spiceio"
-
         echo "$INSTALL_DIR" >> "$GITHUB_PATH"
-        echo "bin=$INSTALL_DIR/spiceio" >> "$GITHUB_OUTPUT"
-        echo "pid_file=$PID_FILE" >> "$GITHUB_OUTPUT"
+        echo "pid_file=${RUNNER_TEMP}/spiceio.pid" >> "$GITHUB_OUTPUT"
 
     - name: Start spiceio
       id: start
@@ -105,7 +92,7 @@ runs:
         set -euo pipefail
 
         ENDPOINT="http://${SPICEIO_BIND}"
-        PID_FILE="${{ steps.download.outputs.pid_file }}"
+        PID_FILE="${{ steps.install.outputs.pid_file }}"
 
         # Skip if spiceio is already listening on the requested address
         if curl -sf -o /dev/null "$ENDPOINT/" 2>/dev/null; then
@@ -143,7 +130,7 @@ runs:
       if: always() && steps.start.outputs.skipped != 'true'
       shell: bash
       run: |
-        PID_FILE="${{ steps.download.outputs.pid_file }}"
+        PID_FILE="${{ steps.install.outputs.pid_file }}"
         if [[ -f "$PID_FILE" ]]; then
           PID=$(cat "$PID_FILE")
           if kill -0 "$PID" 2>/dev/null; then
