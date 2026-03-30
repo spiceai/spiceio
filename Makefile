@@ -22,8 +22,8 @@ clippy:
 
 lint: fmt-check clippy
 
-test:
-	cargo test
+test: build
+	./scripts/test-sccache.sh
 
 clean:
 	cargo clean

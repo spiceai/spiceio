@@ -12,11 +12,94 @@ pub struct ShareSession {
     tree_id: u32,
 }
 
+/// An open file handle for streaming reads or writes.
+pub struct FileHandle {
+    client: Arc<SmbClient>,
+    tree_id: u32,
+    file_id: [u8; 16],
+    pub meta: ObjectMeta,
+    pub file_size: u64,
+    pub max_chunk: u32,
+}
+
 impl ShareSession {
     pub async fn connect(client: Arc<SmbClient>, share: &str) -> io::Result<Self> {
         let tree_id = client.tree_connect(share).await?;
         Ok(Self { client, tree_id })
     }
+
+    // ── Streaming file operations ───────────────────────────────────────
+
+    /// Open a file for streaming reads. Returns a handle that can read chunks.
+    pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
+        let smb_path = to_smb_path(key);
+        let file = self
+            .client
+            .create(
+                self.tree_id,
+                &smb_path,
+                DesiredAccess::GenericRead as u32,
+                ShareAccess::Read as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+
+        let meta = ObjectMeta {
+            size: file.file_size,
+            last_modified: filetime_to_epoch_secs(file.last_write_time),
+            etag: format!("{:016x}", file.last_write_time),
+            content_type: guess_content_type(key),
+        };
+
+        Ok(FileHandle {
+            client: Arc::clone(&self.client),
+            tree_id: self.tree_id,
+            file_id: file.file_id,
+            file_size: file.file_size,
+            max_chunk: self.client.max_read_size,
+            meta,
+        })
+    }
+
+    /// Open (or create) a file for streaming writes.
+    pub async fn open_write(&self, key: &str) -> io::Result<FileHandle> {
+        let smb_path = to_smb_path(key);
+        self.ensure_parent_dirs(&smb_path).await?;
+
+        let file = self
+            .client
+            .create(
+                self.tree_id,
+                &smb_path,
+                DesiredAccess::GenericWrite as u32,
+                ShareAccess::Read as u32,
+                CreateDisposition::OverwriteIf as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+
+        let meta = ObjectMeta {
+            size: 0,
+            last_modified: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            etag: String::new(),
+            content_type: guess_content_type(key),
+        };
+
+        Ok(FileHandle {
+            client: Arc::clone(&self.client),
+            tree_id: self.tree_id,
+            file_id: file.file_id,
+            file_size: 0,
+            max_chunk: self.client.max_write_size,
+            meta,
+        })
+    }
+
+    // ── Buffered file operations (existing) ─────────────────────────────
 
     /// List objects in a directory. `prefix` uses forward-slash separators.
     pub async fn list_objects(
@@ -419,6 +502,27 @@ impl ShareSession {
             }
         }
         Ok(())
+    }
+}
+
+impl FileHandle {
+    /// Read a chunk at the given offset. Returns empty bytes at EOF.
+    pub async fn read_chunk(&self, offset: u64, len: u32) -> io::Result<bytes::Bytes> {
+        self.client
+            .read(self.tree_id, &self.file_id, offset, len)
+            .await
+    }
+
+    /// Write a chunk at the given offset. Returns bytes written.
+    pub async fn write_chunk(&self, offset: u64, data: &[u8]) -> io::Result<u32> {
+        self.client
+            .write(self.tree_id, &self.file_id, offset, data)
+            .await
+    }
+
+    /// Close the file handle.
+    pub async fn close(self) -> io::Result<()> {
+        self.client.close(self.tree_id, &self.file_id).await
     }
 }
 

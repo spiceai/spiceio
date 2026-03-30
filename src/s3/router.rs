@@ -11,10 +11,12 @@
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use std::io;
 use std::sync::Arc;
 
+use super::body::SpioBody;
 use super::headers::{self, *};
 use super::multipart::MultipartStore;
 use super::xml::{self, XmlWriter};
@@ -31,7 +33,11 @@ pub struct AppState {
 }
 
 /// Handle an incoming S3 API request.
-pub async fn handle_request(req: Request<Bytes>, state: &AppState) -> Response<Full<Bytes>> {
+///
+/// Accepts the raw `Incoming` body — GetObject and PutObject stream without
+/// buffering the entire payload. Operations that need the full body (multipart,
+/// multi-delete, copy) collect it internally.
+pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Response<SpioBody> {
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
     let method = req.method().clone();
@@ -106,7 +112,10 @@ pub async fn handle_request(req: Request<Bytes>, state: &AppState) -> Response<F
             Method::GET if query.contains("uploads") => {
                 handle_list_multipart_uploads(state, &query).await
             }
-            Method::POST if query.contains("delete") => handle_delete_objects(req, share).await,
+            Method::POST if query.contains("delete") => {
+                let body = collect_body(req).await;
+                handle_delete_objects(body, share).await
+            }
             Method::GET => handle_list_objects(share, &state.bucket, &query).await,
             Method::HEAD => head_bucket_response(&state.region),
             Method::PUT => ok_empty(),         // CreateBucket — noop
@@ -125,9 +134,10 @@ pub async fn handle_request(req: Request<Bytes>, state: &AppState) -> Response<F
     // Multipart: POST with ?uploads (initiate) or ?uploadId=... (complete)
     if method == Method::POST {
         let resp = if query.contains("uploads") && !query.contains("uploadId") {
-            handle_create_multipart_upload(req, state, key).await
+            handle_create_multipart_upload(&hdrs, state, key).await
         } else if let Some(upload_id) = extract_query_param(&query, "uploadId") {
-            handle_complete_multipart_upload(req, state, key, &upload_id).await
+            let body = collect_body(req).await;
+            handle_complete_multipart_upload(body, state, key, &upload_id).await
         } else {
             error_response(
                 StatusCode::BAD_REQUEST,
@@ -197,7 +207,7 @@ pub async fn handle_request(req: Request<Bytes>, state: &AppState) -> Response<F
         return with_common_headers(
             Response::builder()
                 .status(StatusCode::ACCEPTED)
-                .body(Full::new(Bytes::new()))
+                .body(SpioBody::empty())
                 .unwrap(),
             &request_id,
             &state.region,
@@ -218,17 +228,17 @@ pub async fn handle_request(req: Request<Bytes>, state: &AppState) -> Response<F
     }
 
     let resp = match method {
-        Method::GET => handle_get_object(req, share, key).await,
+        Method::GET => handle_get_object(&hdrs, share, key).await,
         Method::PUT => {
             // CopyObject: PUT with x-amz-copy-source header
             if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-                handle_copy_object(req, share, key).await
+                handle_copy_object(&hdrs, share, key).await
             } else {
-                handle_put_object(req, share, key).await
+                handle_put_object(req, &hdrs, share, key).await
             }
         }
         Method::DELETE => handle_delete_object(share, key).await,
-        Method::HEAD => handle_head_object(req, share, key).await,
+        Method::HEAD => handle_head_object(&hdrs, share, key).await,
         _ => error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "MethodNotAllowed",
@@ -257,7 +267,7 @@ async fn handle_list_objects(
     share: &ShareSession,
     bucket: &str,
     query: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<SpioBody> {
     let list_type = extract_query_param(query, "list-type").unwrap_or_default();
     let prefix = extract_query_param(query, "prefix").unwrap_or_default();
     let delimiter = extract_query_param(query, "delimiter");
@@ -401,143 +411,160 @@ async fn handle_list_objects(
     }
 }
 
-// ── GetObject (with Range + Conditional) ────────────────────────────────────
+// ── GetObject (streaming, with Range + Conditional) ─────────────────────────
 
 async fn handle_get_object(
-    req: Request<Bytes>,
+    hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
-) -> Response<Full<Bytes>> {
-    let hdrs = req.headers();
+) -> Response<SpioBody> {
     let range_header = get_header(hdrs, "range").map(String::from);
     let if_match = get_header(hdrs, IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let if_modified_since = get_header(hdrs, IF_MODIFIED_SINCE).map(String::from);
     let if_unmodified_since = get_header(hdrs, IF_UNMODIFIED_SINCE).map(String::from);
 
-    // Range read or full read
-    let result = if let Some(ref range_str) = range_header {
-        if let Some(range) = headers::parse_range(range_str) {
-            // We need file size first for resolution
-            match share.head_object(key).await {
-                Ok(meta) => {
-                    let (start, end) = range.resolve(meta.size);
-                    share.get_object_range(key, start, end).await
-                }
-                Err(e) => Err(e),
-            }
-        } else {
-            share.get_object(key).await
+    // Open the file for streaming reads
+    let handle = match share.open_read(key).await {
+        Ok(h) => h,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "The specified key does not exist.",
+            );
         }
-    } else {
-        share.get_object(key).await
+        Err(e) => return internal_error(&e),
     };
 
-    match result {
-        Ok((meta, data)) => {
-            let etag = format!("\"{}\"", meta.etag);
+    let meta = &handle.meta;
+    let etag = format!("\"{}\"", meta.etag);
 
-            // Conditional: If-Match
-            if let Some(ref im) = if_match
-                && !etag_matches(im, &etag)
-            {
-                return error_response(
-                    StatusCode::PRECONDITION_FAILED,
-                    "PreconditionFailed",
-                    "At least one of the preconditions you specified did not hold.",
-                );
-            }
+    // Conditional: If-Match
+    if let Some(ref im) = if_match
+        && !etag_matches(im, &etag)
+    {
+        let _ = handle.close().await;
+        return error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold.",
+        );
+    }
 
-            // Conditional: If-None-Match → 304
-            if let Some(ref inm) = if_none_match
-                && etag_matches(inm, &etag)
-            {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header("ETag", &etag)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap();
-            }
+    // Conditional: If-None-Match → 304
+    if let Some(ref inm) = if_none_match
+        && etag_matches(inm, &etag)
+    {
+        let _ = handle.close().await;
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .body(SpioBody::empty())
+            .unwrap();
+    }
 
-            // Conditional: If-Modified-Since → 304
-            if let Some(ref ims) = if_modified_since
-                && let Some(since) = headers::parse_http_date(ims)
-                && meta.last_modified <= since
-            {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header("ETag", &etag)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap();
-            }
+    // Conditional: If-Modified-Since → 304
+    if let Some(ref ims) = if_modified_since
+        && let Some(since) = headers::parse_http_date(ims)
+        && meta.last_modified <= since
+    {
+        let _ = handle.close().await;
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .body(SpioBody::empty())
+            .unwrap();
+    }
 
-            // Conditional: If-Unmodified-Since
-            if let Some(ref ius) = if_unmodified_since
-                && let Some(since) = headers::parse_http_date(ius)
-                && meta.last_modified > since
-            {
-                return error_response(
-                    StatusCode::PRECONDITION_FAILED,
-                    "PreconditionFailed",
-                    "At least one of the preconditions you specified did not hold.",
-                );
-            }
+    // Conditional: If-Unmodified-Since
+    if let Some(ref ius) = if_unmodified_since
+        && let Some(since) = headers::parse_http_date(ius)
+        && meta.last_modified > since
+    {
+        let _ = handle.close().await;
+        return error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold.",
+        );
+    }
 
-            let last_modified = xml::epoch_to_http_date(meta.last_modified);
+    let last_modified = xml::epoch_to_http_date(meta.last_modified);
+    let content_type = meta.content_type.clone();
+    let file_size = handle.file_size;
 
-            // Range response (206) vs full (200)
-            if range_header.is_some() {
-                let total = meta.size;
-                let content_range = if let Some(ref range_str) = range_header {
-                    if let Some(range) = headers::parse_range(range_str) {
-                        let (start, end) = range.resolve(total);
-                        format!("bytes {start}-{end}/{total}")
-                    } else {
-                        format!("bytes 0-{}/{}", data.len().saturating_sub(1), total)
+    // Determine read range
+    let (start, end, is_range) = if let Some(ref range_str) = range_header {
+        if let Some(range) = headers::parse_range(range_str) {
+            let (s, e) = range.resolve(file_size);
+            (s, e, true)
+        } else {
+            (0, file_size.saturating_sub(1), false)
+        }
+    } else {
+        (0, file_size.saturating_sub(1), false)
+    };
+
+    let content_length = end - start + 1;
+
+    // Build response with streaming body
+    let (body, tx) = SpioBody::channel(4);
+    let chunk_size = handle.max_chunk;
+
+    // Spawn background task to stream SMB reads into the channel
+    tokio::spawn(async move {
+        let mut offset = start;
+        let stream_end = end + 1;
+        while offset < stream_end {
+            let to_read = ((stream_end - offset) as u32).min(chunk_size);
+            match handle.read_chunk(offset, to_read).await {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => {
+                    offset += chunk.len() as u64;
+                    if tx.send(chunk).await.is_err() {
+                        break; // Client disconnected
                     }
-                } else {
-                    format!("bytes 0-{}/{}", data.len().saturating_sub(1), total)
-                };
-
-                Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header("Content-Type", &meta.content_type)
-                    .header("Content-Length", data.len().to_string())
-                    .header("Content-Range", content_range)
-                    .header("ETag", &etag)
-                    .header("Last-Modified", last_modified)
-                    .header("Accept-Ranges", "bytes")
-                    .body(Full::new(Bytes::from(data)))
-                    .unwrap()
-            } else {
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", &meta.content_type)
-                    .header("Content-Length", data.len().to_string())
-                    .header("ETag", &etag)
-                    .header("Last-Modified", last_modified)
-                    .header("Accept-Ranges", "bytes")
-                    .body(Full::new(Bytes::from(data)))
-                    .unwrap()
+                }
+                Err(_) => break,
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchKey",
-            "The specified key does not exist.",
-        ),
-        Err(e) => internal_error(&e),
+        let _ = handle.close().await;
+    });
+
+    if is_range {
+        let content_range = format!("bytes {start}-{end}/{file_size}");
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("Content-Type", &content_type)
+            .header("Content-Length", content_length.to_string())
+            .header("Content-Range", content_range)
+            .header("ETag", &etag)
+            .header("Last-Modified", last_modified)
+            .header("Accept-Ranges", "bytes")
+            .body(body)
+            .unwrap()
+    } else {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", &content_type)
+            .header("Content-Length", content_length.to_string())
+            .header("ETag", &etag)
+            .header("Last-Modified", last_modified)
+            .header("Accept-Ranges", "bytes")
+            .body(body)
+            .unwrap()
     }
 }
 
-// ── PutObject (with conditional-write via If-None-Match) ────────────────────
+// ── PutObject (streaming, with conditional-write via If-None-Match) ─────────
 
 async fn handle_put_object(
-    req: Request<Bytes>,
+    req: Request<Incoming>,
+    hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
-) -> Response<Full<Bytes>> {
-    let hdrs = req.headers();
+) -> Response<SpioBody> {
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
     let _user_meta = headers::extract_user_metadata(hdrs);
@@ -556,29 +583,73 @@ async fn handle_put_object(
         }
     }
 
-    let body = req.into_body();
-    match share.put_object(key, &body).await {
-        Ok(meta) => {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("ETag", format!("\"{}\"", meta.etag));
-            if let Some(ct) = content_type {
-                builder = builder.header("Content-Type", ct);
+    // Open file for streaming writes
+    let handle = match share.open_write(key).await {
+        Ok(h) => h,
+        Err(e) => return internal_error(&e),
+    };
+
+    // Stream request body chunks directly to SMB
+    let mut offset = 0u64;
+    let mut body = req.into_body();
+    let mut total_size = 0u64;
+    let mut write_err = None;
+
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    if !data.is_empty() {
+                        // Write in sub-chunks if necessary
+                        let max_write = handle.max_chunk as usize;
+                        for chunk in data.chunks(max_write) {
+                            match handle.write_chunk(offset, chunk).await {
+                                Ok(written) => {
+                                    offset += written as u64;
+                                    total_size += written as u64;
+                                }
+                                Err(e) => {
+                                    write_err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        if write_err.is_some() {
+                            break;
+                        }
+                    }
+                }
             }
-            builder.body(Full::new(Bytes::new())).unwrap()
+            Err(e) => {
+                let _ = handle.close().await;
+                return internal_error(&io::Error::other(format!("body read error: {e}")));
+            }
         }
-        Err(e) => internal_error(&e),
     }
+
+    let _ = handle.close().await;
+
+    if let Some(e) = write_err {
+        return internal_error(&e);
+    }
+
+    let etag = format!("{:016x}", total_size.wrapping_mul(0x100000001b3));
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("ETag", format!("\"{etag}\""));
+    if let Some(ct) = content_type {
+        builder = builder.header("Content-Type", ct);
+    }
+    builder.body(SpioBody::empty()).unwrap()
 }
 
 // ── CopyObject ──────────────────────────────────────────────────────────────
 
 async fn handle_copy_object(
-    req: Request<Bytes>,
+    hdrs: &http::HeaderMap,
     share: &ShareSession,
     dest_key: &str,
-) -> Response<Full<Bytes>> {
-    let hdrs = req.headers();
+) -> Response<SpioBody> {
     let copy_source = match get_header(hdrs, X_AMZ_COPY_SOURCE) {
         Some(s) => s.to_string(),
         None => {
@@ -661,13 +732,13 @@ async fn handle_copy_object(
 
 // ── DeleteObject ────────────────────────────────────────────────────────────
 
-async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<Full<Bytes>> {
+async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<SpioBody> {
     match share.delete_object(key).await {
         Ok(()) | Err(_) => {
             // S3 returns 204 even if not found
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
-                .body(Full::new(Bytes::new()))
+                .body(SpioBody::empty())
                 .unwrap()
         }
     }
@@ -676,11 +747,10 @@ async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<Full<
 // ── HeadObject (with conditional) ───────────────────────────────────────────
 
 async fn handle_head_object(
-    req: Request<Bytes>,
+    hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
-) -> Response<Full<Bytes>> {
-    let hdrs = req.headers();
+) -> Response<SpioBody> {
     let if_match = get_header(hdrs, IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let if_modified_since = get_header(hdrs, IF_MODIFIED_SINCE).map(String::from);
@@ -701,7 +771,7 @@ async fn handle_head_object(
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header("ETag", &etag)
-                    .body(Full::new(Bytes::new()))
+                    .body(SpioBody::empty())
                     .unwrap();
             }
             if let Some(ref ims) = if_modified_since
@@ -711,7 +781,7 @@ async fn handle_head_object(
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header("ETag", &etag)
-                    .body(Full::new(Bytes::new()))
+                    .body(SpioBody::empty())
                     .unwrap();
             }
             if let Some(ref ius) = if_unmodified_since
@@ -729,12 +799,12 @@ async fn handle_head_object(
                 .header("ETag", &etag)
                 .header("Last-Modified", last_modified)
                 .header("Accept-Ranges", "bytes")
-                .body(Full::new(Bytes::new()))
+                .body(SpioBody::empty())
                 .unwrap()
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::new()))
+            .body(SpioBody::empty())
             .unwrap(),
         Err(e) => internal_error(&e),
     }
@@ -742,8 +812,7 @@ async fn handle_head_object(
 
 // ── Multi-object Delete ─────────────────────────────────────────────────────
 
-async fn handle_delete_objects(req: Request<Bytes>, share: &ShareSession) -> Response<Full<Bytes>> {
-    let body = req.into_body();
+async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<SpioBody> {
     let body_str = String::from_utf8_lossy(&body);
 
     let keys: Vec<String> = xml::extract_sections(&body_str, "<Object>", "</Object>")
@@ -793,11 +862,10 @@ async fn handle_delete_objects(req: Request<Bytes>, share: &ShareSession) -> Res
 // ── Multipart Upload ────────────────────────────────────────────────────────
 
 async fn handle_create_multipart_upload(
-    req: Request<Bytes>,
+    hdrs: &http::HeaderMap,
     state: &AppState,
     key: &str,
-) -> Response<Full<Bytes>> {
-    let hdrs = req.headers();
+) -> Response<SpioBody> {
     let content_type = get_header(hdrs, "content-type").map(String::from);
     let metadata = headers::extract_user_metadata(hdrs);
 
@@ -821,12 +889,12 @@ async fn handle_create_multipart_upload(
 }
 
 async fn handle_upload_part(
-    req: Request<Bytes>,
+    req: Request<Incoming>,
     state: &AppState,
     _key: &str,
     upload_id: &str,
     part_number: u32,
-) -> Response<Full<Bytes>> {
+) -> Response<SpioBody> {
     if part_number == 0 || part_number > 10000 {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -835,7 +903,7 @@ async fn handle_upload_part(
         );
     }
 
-    let body = req.into_body();
+    let body = collect_body(req).await;
     let etag = crate::crypto::hex_encode(&crate::crypto::sha256(&body));
     let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
 
@@ -857,16 +925,16 @@ async fn handle_upload_part(
     Response::builder()
         .status(StatusCode::OK)
         .header("ETag", format!("\"{}\"", etag))
-        .body(Full::new(Bytes::new()))
+        .body(SpioBody::empty())
         .unwrap()
 }
 
 async fn handle_complete_multipart_upload(
-    req: Request<Bytes>,
+    body_bytes: Bytes,
     state: &AppState,
     key: &str,
     upload_id: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<SpioBody> {
     let upload = match state.multipart.complete(upload_id).await {
         Some(u) => u,
         None => {
@@ -879,7 +947,6 @@ async fn handle_complete_multipart_upload(
     };
 
     // Parse the completion XML to get ordered parts
-    let body_bytes = req.into_body();
     let body_str = String::from_utf8_lossy(&body_bytes);
     let part_numbers: Vec<u32> = xml::extract_sections(&body_str, "<Part>", "</Part>")
         .iter()
@@ -933,7 +1000,7 @@ async fn handle_abort_multipart_upload(
     state: &AppState,
     _key: &str,
     upload_id: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<SpioBody> {
     let upload = match state.multipart.abort(upload_id).await {
         Some(u) => u,
         None => return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", ""),
@@ -953,7 +1020,7 @@ async fn handle_abort_multipart_upload(
     ok_no_content()
 }
 
-async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Response<Full<Bytes>> {
+async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Response<SpioBody> {
     let upload = match state.multipart.get(upload_id).await {
         Some(u) => u,
         None => return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", ""),
@@ -1001,7 +1068,7 @@ async fn handle_list_parts(state: &AppState, key: &str, upload_id: &str) -> Resp
     xml_response(StatusCode::OK, w.finish())
 }
 
-async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Response<Full<Bytes>> {
+async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Response<SpioBody> {
     let prefix = extract_query_param(query, "prefix");
     let uploads = state.multipart.list(prefix.as_deref()).await;
 
@@ -1038,7 +1105,7 @@ async fn handle_list_multipart_uploads(state: &AppState, query: &str) -> Respons
 
 // ── Bucket-level stubs ──────────────────────────────────────────────────────
 
-fn handle_get_bucket_location(region: &str) -> Response<Full<Bytes>> {
+fn handle_get_bucket_location(region: &str) -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("LocationConstraint", S3_XMLNS);
@@ -1050,15 +1117,15 @@ fn handle_get_bucket_location(region: &str) -> Response<Full<Bytes>> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn head_bucket_response(region: &str) -> Response<Full<Bytes>> {
+fn head_bucket_response(region: &str) -> Response<SpioBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header(X_AMZ_BUCKET_REGION, region)
-        .body(Full::new(Bytes::new()))
+        .body(SpioBody::empty())
         .unwrap()
 }
 
-fn handle_get_bucket_versioning() -> Response<Full<Bytes>> {
+fn handle_get_bucket_versioning() -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("VersioningConfiguration", S3_XMLNS);
@@ -1067,7 +1134,7 @@ fn handle_get_bucket_versioning() -> Response<Full<Bytes>> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_bucket_acl() -> Response<Full<Bytes>> {
+fn handle_get_bucket_acl() -> Response<SpioBody> {
     // Return a minimal private ACL
     let mut w = XmlWriter::new();
     w.declaration();
@@ -1089,7 +1156,7 @@ fn handle_get_bucket_acl() -> Response<Full<Bytes>> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_bucket_tagging() -> Response<Full<Bytes>> {
+fn handle_get_bucket_tagging() -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("Tagging", S3_XMLNS);
@@ -1099,7 +1166,7 @@ fn handle_get_bucket_tagging() -> Response<Full<Bytes>> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_bucket_cors() -> Response<Full<Bytes>> {
+fn handle_get_bucket_cors() -> Response<SpioBody> {
     // No CORS configuration
     error_response(
         StatusCode::NOT_FOUND,
@@ -1108,11 +1175,11 @@ fn handle_get_bucket_cors() -> Response<Full<Bytes>> {
     )
 }
 
-fn handle_get_bucket_lifecycle() -> Response<Full<Bytes>> {
+fn handle_get_bucket_lifecycle() -> Response<SpioBody> {
     error_response(StatusCode::NOT_FOUND, "NoSuchLifecycleConfiguration", "")
 }
 
-fn handle_get_bucket_policy() -> Response<Full<Bytes>> {
+fn handle_get_bucket_policy() -> Response<SpioBody> {
     error_response(
         StatusCode::NOT_FOUND,
         "NoSuchBucketPolicy",
@@ -1120,7 +1187,7 @@ fn handle_get_bucket_policy() -> Response<Full<Bytes>> {
     )
 }
 
-fn handle_get_bucket_encryption() -> Response<Full<Bytes>> {
+fn handle_get_bucket_encryption() -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("ServerSideEncryptionConfiguration", S3_XMLNS);
@@ -1134,11 +1201,11 @@ fn handle_get_bucket_encryption() -> Response<Full<Bytes>> {
     xml_response(StatusCode::OK, w.finish())
 }
 
-fn handle_get_object_acl() -> Response<Full<Bytes>> {
+fn handle_get_object_acl() -> Response<SpioBody> {
     handle_get_bucket_acl() // Same structure
 }
 
-fn handle_get_object_tagging() -> Response<Full<Bytes>> {
+fn handle_get_object_tagging() -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("Tagging", S3_XMLNS);
@@ -1150,7 +1217,7 @@ fn handle_get_object_tagging() -> Response<Full<Bytes>> {
 
 // ── ListBuckets ─────────────────────────────────────────────────────────────
 
-fn list_buckets_response(bucket: &str) -> Response<Full<Bytes>> {
+fn list_buckets_response(bucket: &str) -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open_ns("ListAllMyBucketsResult", S3_XMLNS);
@@ -1170,7 +1237,7 @@ fn list_buckets_response(bucket: &str) -> Response<Full<Bytes>> {
 
 // ── CORS preflight ──────────────────────────────────────────────────────────
 
-fn cors_preflight(request_id: &str, region: &str) -> Response<Full<Bytes>> {
+fn cors_preflight(request_id: &str, region: &str) -> Response<SpioBody> {
     Response::builder()
         .status(StatusCode::OK)
         .header("Access-Control-Allow-Origin", "*")
@@ -1180,17 +1247,17 @@ fn cors_preflight(request_id: &str, region: &str) -> Response<Full<Bytes>> {
         .header("Access-Control-Max-Age", "86400")
         .header(X_AMZ_REQUEST_ID, request_id)
         .header(X_AMZ_BUCKET_REGION, region)
-        .body(Full::new(Bytes::new()))
+        .body(SpioBody::empty())
         .unwrap()
 }
 
 // ── Response helpers ────────────────────────────────────────────────────────
 
 fn with_common_headers(
-    mut resp: Response<Full<Bytes>>,
+    mut resp: Response<SpioBody>,
     request_id: &str,
     region: &str,
-) -> Response<Full<Bytes>> {
+) -> Response<SpioBody> {
     let headers = resp.headers_mut();
     if !headers.contains_key(X_AMZ_REQUEST_ID) {
         headers.insert(X_AMZ_REQUEST_ID, request_id.parse().unwrap());
@@ -1211,16 +1278,16 @@ fn with_common_headers(
     resp
 }
 
-fn xml_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+fn xml_response(status: StatusCode, body: String) -> Response<SpioBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/xml")
         .header("Content-Length", body.len().to_string())
-        .body(Full::new(Bytes::from(body)))
+        .body(SpioBody::full(Bytes::from(body)))
         .unwrap()
 }
 
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, code: &str, message: &str) -> Response<SpioBody> {
     let mut w = XmlWriter::new();
     w.declaration();
     w.open("Error");
@@ -1231,21 +1298,21 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Ful
     xml_response(status, w.finish())
 }
 
-fn ok_empty() -> Response<Full<Bytes>> {
+fn ok_empty() -> Response<SpioBody> {
     Response::builder()
         .status(StatusCode::OK)
-        .body(Full::new(Bytes::new()))
+        .body(SpioBody::empty())
         .unwrap()
 }
 
-fn ok_no_content() -> Response<Full<Bytes>> {
+fn ok_no_content() -> Response<SpioBody> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(Full::new(Bytes::new()))
+        .body(SpioBody::empty())
         .unwrap()
 }
 
-fn internal_error(e: &io::Error) -> Response<Full<Bytes>> {
+fn internal_error(e: &io::Error) -> Response<SpioBody> {
     eprintln!("[spio] error: {e}");
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1288,4 +1355,16 @@ fn etag_matches(condition: &str, etag: &str) -> bool {
         }
     }
     false
+}
+
+/// Collect an `Incoming` body into `Bytes`, for operations that need the full
+/// payload (multi-delete, multipart complete, upload-part).
+async fn collect_body(req: Request<Incoming>) -> Bytes {
+    match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            eprintln!("[spio] body collect error: {e}");
+            Bytes::new()
+        }
+    }
 }

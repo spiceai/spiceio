@@ -4,8 +4,6 @@ mod crypto;
 mod s3;
 mod smb;
 
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -135,16 +133,6 @@ async fn main() {
                     let service = hyper::service::service_fn(move |req: Request<Incoming>| {
                         let state = Arc::clone(&state);
                         async move {
-                            // Collect the full body
-                            let (parts, body) = req.into_parts();
-                            let body_bytes = match body.collect().await {
-                                Ok(collected) => collected.to_bytes(),
-                                Err(e) => {
-                                    eprintln!("[spio] body read error from {peer_addr}: {e}");
-                                    Bytes::new()
-                                }
-                            };
-                            let req = Request::from_parts(parts, body_bytes);
                             let resp = s3::router::handle_request(req, &state).await;
                             Ok::<_, Infallible>(resp)
                         }
