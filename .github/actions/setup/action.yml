@@ -53,27 +53,31 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Download spiceio release
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: spiceai/spiceio
-        tag: ${{ inputs.version }}
-        latest: ${{ inputs.version == 'latest' }}
-        fileName: spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz
-        out-file-path: ${{ runner.temp }}/spiceio-dl
-        token: ${{ inputs.token }}
-
-    - name: Install spiceio
+    - name: Download and install spiceio
       id: install
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
       run: |
         set -euo pipefail
-        INSTALL_DIR="${RUNNER_TEMP}/spiceio-bin"
+
+        REPO="spiceai/spiceio"
+        INSTALL_DIR="${RUNNER_TEMP:-/tmp}/spiceio-bin"
+        ASSET="spiceio-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+        VERSION="${{ inputs.version }}"
+
         mkdir -p "$INSTALL_DIR"
-        tar xzf "${RUNNER_TEMP}/spiceio-dl/spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C "$INSTALL_DIR"
+
+        if [[ "$VERSION" == "latest" ]]; then
+          gh release download --repo "$REPO" --pattern "$ASSET" --dir "$INSTALL_DIR"
+        else
+          gh release download "$VERSION" --repo "$REPO" --pattern "$ASSET" --dir "$INSTALL_DIR"
+        fi
+
+        tar xzf "$INSTALL_DIR/$ASSET" -C "$INSTALL_DIR"
         chmod +x "$INSTALL_DIR/spiceio"
         echo "$INSTALL_DIR" >> "$GITHUB_PATH"
-        echo "pid_file=${RUNNER_TEMP}/spiceio.pid" >> "$GITHUB_OUTPUT"
+        echo "pid_file=${RUNNER_TEMP:-/tmp}/spiceio.pid" >> "$GITHUB_OUTPUT"
 
     - name: Start spiceio
       id: start
