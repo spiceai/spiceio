@@ -35,9 +35,6 @@ outputs:
   endpoint:
     description: The S3-compatible endpoint URL
     value: ${{ steps.start.outputs.endpoint }}
-  pid:
-    description: PID of the spiceio background process (empty if skipped)
-    value: ${{ steps.start.outputs.pid }}
 
 runs:
   using: composite
@@ -70,7 +67,6 @@ runs:
         tar xzf "$ASSET" -C "$INSTALL_DIR"
         chmod +x "$INSTALL_DIR/spiceio"
         echo "$INSTALL_DIR" >> "$GITHUB_PATH"
-        echo "pid_file=${RUNNER_TEMP}/spiceio.pid" >> "$GITHUB_OUTPUT"
 
     - name: Start spiceio
       id: start
@@ -85,15 +81,11 @@ runs:
         set -euo pipefail
 
         ENDPOINT="http://${SPICEIO_BIND}"
-        PID_FILE="${{ steps.install.outputs.pid_file }}"
 
         # Skip if spiceio is already listening on the requested address
-        # Verify it's spiceio by checking for the "spiceio" server header
         if curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
           echo "spiceio already running at $ENDPOINT — skipping start"
           echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
-          echo "pid=" >> "$GITHUB_OUTPUT"
-          echo "skipped=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -137,10 +129,7 @@ runs:
 
         spiceio &
         PID=$!
-        echo "$PID" > "$PID_FILE"
-        echo "pid=$PID" >> "$GITHUB_OUTPUT"
         echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
-        echo "skipped=false" >> "$GITHUB_OUTPUT"
 
         # Wait for readiness
         echo "Waiting for spiceio on ${SPICEIO_BIND}..."
@@ -158,17 +147,3 @@ runs:
         echo "::error::spiceio failed to start within 30s"
         exit 1
 
-    - name: Register cleanup
-      if: always() && steps.start.outputs.skipped != 'true'
-      shell: bash
-      run: |
-        PID_FILE="${{ steps.install.outputs.pid_file }}"
-        if [[ -f "$PID_FILE" ]]; then
-          PID=$(cat "$PID_FILE")
-          if kill -0 "$PID" 2>/dev/null; then
-            echo "Stopping spiceio (PID $PID)"
-            kill "$PID" 2>/dev/null || true
-            wait "$PID" 2>/dev/null || true
-          fi
-          rm -f "$PID_FILE"
-        fi
