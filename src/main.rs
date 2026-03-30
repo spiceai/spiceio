@@ -1,8 +1,7 @@
 //! spiceio — S3-compatible API proxy to SMB 3.1.1 file shares (macOS 26).
 
-mod crypto;
-mod s3;
-mod smb;
+use spiceio::s3;
+use spiceio::smb;
 
 use hyper::Request;
 use hyper::body::Incoming;

@@ -5,11 +5,17 @@ pub struct XmlWriter {
     buf: String,
 }
 
-impl XmlWriter {
-    pub fn new() -> Self {
+impl Default for XmlWriter {
+    fn default() -> Self {
         Self {
             buf: String::with_capacity(4096),
         }
+    }
+}
+
+impl XmlWriter {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn declaration(&mut self) -> &mut Self {
