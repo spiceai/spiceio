@@ -259,6 +259,7 @@ CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
 echo ""
 echo "[test] === warm build (should hit cache) ==="
 rm -rf "$TEST_TARGET_DIR"
+sccache --zero-stats 2>/dev/null || true
 CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
 
 echo ""
@@ -267,3 +268,17 @@ echo "[test] sccache stats:"
 echo "======================================="
 sccache --show-stats
 echo "======================================="
+
+# ── Verify cache hits ───────────────────────────────────────────────────────
+
+STATS=$(sccache --show-stats 2>&1)
+CACHE_HITS=$(echo "$STATS" | grep -m1 "^Cache hits" | awk '{print $NF}' || echo "0")
+WRITE_ERRORS=$(echo "$STATS" | grep -m1 "Cache write errors" | awk '{print $NF}' || echo "0")
+
+echo ""
+if [[ "${CACHE_HITS:-0}" -gt 0 && "${WRITE_ERRORS:-0}" -eq 0 ]]; then
+    echo "[test] PASS: warm build got $CACHE_HITS cache hits, 0 write errors"
+else
+    echo "[test] FAIL: expected cache hits > 0 (got ${CACHE_HITS:-0}) and write errors == 0 (got ${WRITE_ERRORS:-0})"
+    exit 1
+fi

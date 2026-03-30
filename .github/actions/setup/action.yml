@@ -1,0 +1,174 @@
+name: Setup spiceio
+description: Install a released version of spiceio and start the S3-to-SMB proxy
+
+inputs:
+  version:
+    description: Release tag to install (e.g. "v0.1.0"). Use "latest" for the most recent release.
+    required: false
+    default: latest
+  smb-url:
+    description: >
+      SMB connection URL: smb://user:pass@server/share or smb://user:pass@server:port/share.
+      Password can also be provided separately via smb-pass.
+    required: true
+  smb-pass:
+    description: SMB password (overrides password in smb-url if both provided)
+    required: false
+    default: ""
+  bucket:
+    description: Virtual S3 bucket name
+    required: false
+    default: spiceio
+  region:
+    description: AWS region to advertise
+    required: false
+    default: us-east-1
+  bind:
+    description: Listen address for the S3 endpoint
+    required: false
+    default: "127.0.0.1:8333"
+  token:
+    description: GitHub token for downloading release assets from private repos
+    required: true
+
+outputs:
+  endpoint:
+    description: The S3-compatible endpoint URL
+    value: ${{ steps.start.outputs.endpoint }}
+  pid:
+    description: PID of the spiceio background process (empty if skipped)
+    value: ${{ steps.start.outputs.pid }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download and install spiceio
+      id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+
+        REPO="spiceai/spiceio"
+        INSTALL_DIR="${RUNNER_TEMP}/spiceio-bin"
+        ASSET="spiceio-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+        VERSION="${{ inputs.version }}"
+
+        mkdir -p "$INSTALL_DIR"
+
+        if [[ "$VERSION" == "latest" ]]; then
+          gh release download --repo "$REPO" --pattern "$ASSET" --pattern "${ASSET}.sha256" --dir "$INSTALL_DIR"
+        else
+          gh release download "$VERSION" --repo "$REPO" --pattern "$ASSET" --pattern "${ASSET}.sha256" --dir "$INSTALL_DIR"
+        fi
+
+        # Verify integrity
+        cd "$INSTALL_DIR"
+        shasum -a 256 -c "${ASSET}.sha256"
+
+        tar xzf "$ASSET" -C "$INSTALL_DIR"
+        chmod +x "$INSTALL_DIR/spiceio"
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        echo "pid_file=${RUNNER_TEMP}/spiceio.pid" >> "$GITHUB_OUTPUT"
+
+    - name: Start spiceio
+      id: start
+      shell: bash
+      env:
+        SMB_URL: ${{ inputs.smb-url }}
+        SMB_PASS_OVERRIDE: ${{ inputs.smb-pass }}
+        SPICEIO_BUCKET: ${{ inputs.bucket }}
+        SPICEIO_REGION: ${{ inputs.region }}
+        SPICEIO_BIND: ${{ inputs.bind }}
+      run: |
+        set -euo pipefail
+
+        ENDPOINT="http://${SPICEIO_BIND}"
+        PID_FILE="${{ steps.install.outputs.pid_file }}"
+
+        # Skip if spiceio is already listening on the requested address
+        # Verify it's spiceio by checking for the "spiceio" server header
+        if curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
+          echo "spiceio already running at $ENDPOINT — skipping start"
+          echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "pid=" >> "$GITHUB_OUTPUT"
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Parse smb://user:pass@server:port/share
+        # Strips the smb:// prefix, then splits on :, @, /
+        URL="${SMB_URL#smb://}"
+
+        USERINFO="${URL%%@*}"
+        HOSTPATH="${URL#*@}"
+
+        SPICEIO_SMB_USER="${USERINFO%%:*}"
+        # Extract password from URL only if user:pass@ format is used
+        if [[ "$USERINFO" == *:* ]]; then
+          URL_PASS="${USERINFO#*:}"
+        else
+          URL_PASS=""
+        fi
+        # smb-pass input takes priority, then URL password
+        if [[ -n "$SMB_PASS_OVERRIDE" ]]; then
+          SPICEIO_SMB_PASS="$SMB_PASS_OVERRIDE"
+        elif [[ -n "$URL_PASS" ]]; then
+          SPICEIO_SMB_PASS="$URL_PASS"
+        else
+          echo "::error::No SMB password provided (use smb-pass input or include in smb-url)"
+          exit 1
+        fi
+
+        HOSTPORT="${HOSTPATH%%/*}"
+        SPICEIO_SMB_SHARE="${HOSTPATH#*/}"
+
+        if [[ "$HOSTPORT" == *:* ]]; then
+          SPICEIO_SMB_SERVER="${HOSTPORT%%:*}"
+          SPICEIO_SMB_PORT="${HOSTPORT#*:}"
+        else
+          SPICEIO_SMB_SERVER="$HOSTPORT"
+          SPICEIO_SMB_PORT="445"
+        fi
+
+        export SPICEIO_SMB_SERVER SPICEIO_SMB_PORT SPICEIO_SMB_USER SPICEIO_SMB_PASS SPICEIO_SMB_SHARE
+        export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND
+
+        spiceio &
+        PID=$!
+        echo "$PID" > "$PID_FILE"
+        echo "pid=$PID" >> "$GITHUB_OUTPUT"
+        echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+        # Wait for readiness
+        echo "Waiting for spiceio on ${SPICEIO_BIND}..."
+        for i in $(seq 1 30); do
+          if curl -sf -o /dev/null "$ENDPOINT/" 2>/dev/null; then
+            echo "spiceio ready at $ENDPOINT (PID $PID)"
+            exit 0
+          fi
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "::error::spiceio exited unexpectedly"
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "::error::spiceio failed to start within 30s"
+        exit 1
+
+    - name: Register cleanup
+      if: always() && steps.start.outputs.skipped != 'true'
+      shell: bash
+      run: |
+        PID_FILE="${{ steps.install.outputs.pid_file }}"
+        if [[ -f "$PID_FILE" ]]; then
+          PID=$(cat "$PID_FILE")
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "Stopping spiceio (PID $PID)"
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          fi
+          rm -f "$PID_FILE"
+        fi
