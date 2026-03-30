@@ -6,24 +6,13 @@ inputs:
     description: Release tag to install (e.g. "v0.1.0"). Use "latest" for the most recent release.
     required: false
     default: latest
-  smb-server:
-    description: SMB server hostname or IP
-    required: true
-  smb-user:
-    description: SMB username
+  smb-url:
+    description: >
+      SMB connection URL: smb://user:pass@server/share or smb://user:pass@server:port/share.
+      Password can also be provided separately via smb-pass.
     required: true
   smb-pass:
-    description: SMB password
-    required: true
-  smb-share:
-    description: SMB share name
-    required: true
-  smb-port:
-    description: SMB port
-    required: false
-    default: "445"
-  smb-domain:
-    description: SMB domain
+    description: SMB password (overrides password in smb-url if both provided)
     required: false
     default: ""
   bucket:
@@ -87,12 +76,8 @@ runs:
       id: start
       shell: bash
       env:
-        SPICEIO_SMB_SERVER: ${{ inputs.smb-server }}
-        SPICEIO_SMB_PORT: ${{ inputs.smb-port }}
-        SPICEIO_SMB_USER: ${{ inputs.smb-user }}
-        SPICEIO_SMB_PASS: ${{ inputs.smb-pass }}
-        SPICEIO_SMB_DOMAIN: ${{ inputs.smb-domain }}
-        SPICEIO_SMB_SHARE: ${{ inputs.smb-share }}
+        SMB_URL: ${{ inputs.smb-url }}
+        SMB_PASS_OVERRIDE: ${{ inputs.smb-pass }}
         SPICEIO_BUCKET: ${{ inputs.bucket }}
         SPICEIO_REGION: ${{ inputs.region }}
         SPICEIO_BIND: ${{ inputs.bind }}
@@ -110,6 +95,36 @@ runs:
           echo "skipped=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
+
+        # Parse smb://user:pass@server:port/share
+        # Strips the smb:// prefix, then splits on :, @, /
+        URL="${SMB_URL#smb://}"
+
+        USERINFO="${URL%%@*}"
+        HOSTPATH="${URL#*@}"
+
+        SPICEIO_SMB_USER="${USERINFO%%:*}"
+        URL_PASS="${USERINFO#*:}"
+        # Use override password if provided, otherwise use URL password
+        if [[ -n "$SMB_PASS_OVERRIDE" ]]; then
+          SPICEIO_SMB_PASS="$SMB_PASS_OVERRIDE"
+        else
+          SPICEIO_SMB_PASS="$URL_PASS"
+        fi
+
+        HOSTPORT="${HOSTPATH%%/*}"
+        SPICEIO_SMB_SHARE="${HOSTPATH#*/}"
+
+        if [[ "$HOSTPORT" == *:* ]]; then
+          SPICEIO_SMB_SERVER="${HOSTPORT%%:*}"
+          SPICEIO_SMB_PORT="${HOSTPORT#*:}"
+        else
+          SPICEIO_SMB_SERVER="$HOSTPORT"
+          SPICEIO_SMB_PORT="445"
+        fi
+
+        export SPICEIO_SMB_SERVER SPICEIO_SMB_PORT SPICEIO_SMB_USER SPICEIO_SMB_PASS SPICEIO_SMB_SHARE
+        export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND
 
         spiceio &
         PID=$!
