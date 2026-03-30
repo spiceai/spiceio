@@ -1,0 +1,131 @@
+name: Setup spiceio
+description: Install a released version of spiceio and start the S3-to-SMB proxy
+
+inputs:
+  version:
+    description: Release tag to install (e.g. "v0.1.0"). Defaults to latest.
+    required: false
+    default: latest
+  smb-server:
+    description: SMB server hostname or IP
+    required: true
+  smb-user:
+    description: SMB username
+    required: true
+  smb-pass:
+    description: SMB password
+    required: true
+  smb-share:
+    description: SMB share name
+    required: true
+  smb-port:
+    description: SMB port
+    required: false
+    default: "445"
+  smb-domain:
+    description: SMB domain
+    required: false
+    default: ""
+  bucket:
+    description: Virtual S3 bucket name
+    required: false
+    default: spiceio
+  region:
+    description: AWS region to advertise
+    required: false
+    default: us-east-1
+  bind:
+    description: Listen address for the S3 endpoint
+    required: false
+    default: "127.0.0.1:8333"
+  token:
+    description: GitHub token for downloading release assets
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  endpoint:
+    description: The S3-compatible endpoint URL
+    value: ${{ steps.start.outputs.endpoint }}
+  pid:
+    description: PID of the spiceio background process
+    value: ${{ steps.start.outputs.pid }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download spiceio binary
+      id: download
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        REPO="spiceai/spiceio"
+        INSTALL_DIR="${RUNNER_TEMP:-/tmp}/spiceio-bin"
+        mkdir -p "$INSTALL_DIR"
+
+        if [[ "$VERSION" == "latest" ]]; then
+          TAG=$(gh release view --repo "$REPO" --json tagName -q .tagName)
+        else
+          TAG="$VERSION"
+        fi
+
+        OS=$(uname -s)
+        ARCH=$(uname -m)
+        # Map to GitHub runner naming
+        case "$ARCH" in
+          arm64|aarch64) ARCH="ARM64" ;;
+          x86_64)        ARCH="X64" ;;
+        esac
+
+        ASSET="spiceio-${OS}-${ARCH}.tar.gz"
+        echo "Downloading $ASSET from $REPO@$TAG"
+
+        gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir "$INSTALL_DIR"
+        tar xzf "$INSTALL_DIR/$ASSET" -C "$INSTALL_DIR"
+        chmod +x "$INSTALL_DIR/spiceio"
+
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        echo "bin=$INSTALL_DIR/spiceio" >> "$GITHUB_OUTPUT"
+
+    - name: Start spiceio
+      id: start
+      shell: bash
+      env:
+        SPICEIO_SMB_SERVER: ${{ inputs.smb-server }}
+        SPICEIO_SMB_PORT: ${{ inputs.smb-port }}
+        SPICEIO_SMB_USER: ${{ inputs.smb-user }}
+        SPICEIO_SMB_PASS: ${{ inputs.smb-pass }}
+        SPICEIO_SMB_DOMAIN: ${{ inputs.smb-domain }}
+        SPICEIO_SMB_SHARE: ${{ inputs.smb-share }}
+        SPICEIO_BUCKET: ${{ inputs.bucket }}
+        SPICEIO_REGION: ${{ inputs.region }}
+        SPICEIO_BIND: ${{ inputs.bind }}
+      run: |
+        set -euo pipefail
+
+        ENDPOINT="http://${SPICEIO_BIND}"
+
+        spiceio &
+        PID=$!
+        echo "pid=$PID" >> "$GITHUB_OUTPUT"
+        echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+
+        # Wait for readiness
+        echo "Waiting for spiceio on ${SPICEIO_BIND}..."
+        for i in $(seq 1 30); do
+          if curl -sf -o /dev/null "$ENDPOINT/" 2>/dev/null; then
+            echo "spiceio ready at $ENDPOINT (PID $PID)"
+            exit 0
+          fi
+          if ! kill -0 "$PID" 2>/dev/null; then
+            echo "::error::spiceio exited unexpectedly"
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "::error::spiceio failed to start within 30s"
+        exit 1
