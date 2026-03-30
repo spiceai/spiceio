@@ -80,6 +80,9 @@ jobs:
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
         run: ./scripts/test-sccache.sh
 
+      - name: Run benchmarks
+        run: cargo bench --locked
+
       - name: Build release artifact
         run: cargo build --release --locked --bin spiceio
 
