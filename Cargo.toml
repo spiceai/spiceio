@@ -1,0 +1,27 @@
+[package]
+name = "spio"
+version = "0.1.0"
+edition = "2024"
+description = "S3-compatible API proxy to SMB file shares"
+license = "MIT"
+
+[[bin]]
+name = "spio"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util", "timeout"] }
+http = "1"
+bytes = "1"
+percent-encoding = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

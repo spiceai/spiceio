@@ -16,12 +16,13 @@ spio is an S3-compatible API proxy that translates S3 HTTP requests into SMB 3.1
 ## Build & Run
 
 ```bash
-cargo build                    # debug build
-cargo build --release          # optimized release build
-cargo check                    # type-check without building
+make                           # fmt + lint + test + build (default target)
+make release                   # optimized release build
+make lint                      # cargo fmt --check + cargo clippy
+make test                      # cargo test
+make fmt                       # auto-format
+make clean                     # cargo clean
 ```
-
-No test suite exists yet. No linter or formatter is configured beyond `cargo check`.
 
 The binary requires these environment variables:
 - `SPIO_SMB_SERVER` (required) — SMB server hostname or IP
