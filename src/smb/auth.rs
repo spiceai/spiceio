@@ -346,7 +346,7 @@ pub fn wrap_spnego_auth(ntlmssp: &[u8]) -> Vec<u8> {
     der_wrap(0xa1, &seq)
 }
 
-/// Wrap data in a DER TLV: [tag][length][data].
+/// Wrap data in a DER TLV: \[tag\]\[length\]\[data\].
 fn der_wrap(tag: u8, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + 4 + data.len());
     buf.push(tag);

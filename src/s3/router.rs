@@ -424,7 +424,81 @@ async fn handle_get_object(
     let if_modified_since = get_header(hdrs, IF_MODIFIED_SINCE).map(String::from);
     let if_unmodified_since = get_header(hdrs, IF_UNMODIFIED_SINCE).map(String::from);
 
-    // Open the file for streaming reads
+    // ── Fast path: compound Create+Read+Close for small files ───────
+    // Tries to read the entire file in one SMB round trip. Falls back to
+    // streaming for large files or range requests.
+    let max_read = share.max_read_size();
+    let no_range = range_header.is_none();
+
+    if no_range {
+        let result = share.get_object_compound(key, max_read).await;
+        match result {
+            Ok((meta, data)) if meta.size <= max_read as u64 => {
+                let etag = format!("\"{}\"", meta.etag);
+
+                if let Some(ref im) = if_match
+                    && !etag_matches(im, &etag)
+                {
+                    return error_response(
+                        StatusCode::PRECONDITION_FAILED,
+                        "PreconditionFailed",
+                        "At least one of the preconditions you specified did not hold.",
+                    );
+                }
+                if let Some(ref inm) = if_none_match
+                    && etag_matches(inm, &etag)
+                {
+                    return Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header("ETag", &etag)
+                        .body(SpiceioBody::empty())
+                        .unwrap();
+                }
+                if let Some(ref ims) = if_modified_since
+                    && let Some(since) = parse_http_date(ims)
+                    && meta.last_modified <= since
+                {
+                    return Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header("ETag", &etag)
+                        .body(SpiceioBody::empty())
+                        .unwrap();
+                }
+                if let Some(ref ius) = if_unmodified_since
+                    && let Some(since) = parse_http_date(ius)
+                    && meta.last_modified > since
+                {
+                    return error_response(
+                        StatusCode::PRECONDITION_FAILED,
+                        "PreconditionFailed",
+                        "At least one of the preconditions you specified did not hold.",
+                    );
+                }
+
+                let last_modified = xml::epoch_to_http_date(meta.last_modified);
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", &meta.content_type)
+                    .header("Content-Length", data.len().to_string())
+                    .header("ETag", &etag)
+                    .header("Last-Modified", last_modified)
+                    .header("Accept-Ranges", "bytes")
+                    .body(SpiceioBody::full(data))
+                    .unwrap();
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "The specified key does not exist.",
+                );
+            }
+            Err(e) => return io_to_s3_error(&e),
+            _ => {} // Large file — fall through to streaming
+        }
+    }
+
+    // ── Streaming path for large files and range requests ─────────
     let handle = match share.open_read(key).await {
         Ok(h) => h,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -581,13 +655,43 @@ async fn handle_put_object(
         }
     }
 
-    // Open file for streaming writes
+    // ── Fast path: collect small bodies and use compound write ──────
+    let content_length: Option<u64> =
+        get_header(hdrs, "content-length").and_then(|s| s.parse().ok());
+    let max_write = share.max_write_size() as u64;
+
+    if let Some(cl) = content_length
+        && cl <= max_write
+    {
+        // Collect the (small) body
+        match BodyExt::collect(req.into_body()).await {
+            Ok(collected) => {
+                let data = collected.to_bytes();
+                match share.put_object(key, &data).await {
+                    Ok(meta) => {
+                        let mut builder = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("ETag", format!("\"{}\"", meta.etag));
+                        if let Some(ct) = content_type {
+                            builder = builder.header("Content-Type", ct);
+                        }
+                        return builder.body(SpiceioBody::empty()).unwrap();
+                    }
+                    Err(e) => return io_to_s3_error(&e),
+                }
+            }
+            Err(e) => {
+                return io_to_s3_error(&io::Error::other(format!("body read error: {e}")));
+            }
+        }
+    }
+
+    // ── Streaming path for large or unknown-size bodies ──────────
     let handle = match share.open_write(key).await {
         Ok(h) => h,
         Err(e) => return io_to_s3_error(&e),
     };
 
-    // Stream request body chunks directly to SMB
     let mut offset = 0u64;
     let mut body = req.into_body();
     let mut total_size = 0u64;
@@ -599,9 +703,8 @@ async fn handle_put_object(
                 if let Ok(data) = frame.into_data()
                     && !data.is_empty()
                 {
-                    // Write in sub-chunks if necessary
-                    let max_write = handle.max_chunk as usize;
-                    for chunk in data.chunks(max_write) {
+                    let max_w = handle.max_chunk as usize;
+                    for chunk in data.chunks(max_w) {
                         match handle.write_chunk(offset, chunk).await {
                             Ok(written) => {
                                 offset += written as u64;
@@ -631,7 +734,10 @@ async fn handle_put_object(
         return io_to_s3_error(&e);
     }
 
-    let etag = format!("{:016x}", total_size.wrapping_mul(0x100000001b3));
+    let etag = match share.head_object(key).await {
+        Ok(meta) => meta.etag,
+        Err(_) => format!("{:016x}", total_size),
+    };
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("ETag", format!("\"{etag}\""));
