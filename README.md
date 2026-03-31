@@ -56,4 +56,4 @@ aws s3 cp local.txt s3://files/remote.txt --endpoint-url http://localhost:8333
 
 ## License
 
-MIT
+Apache 2.0
