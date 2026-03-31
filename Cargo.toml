@@ -5,6 +5,10 @@ edition = "2024"
 description = "S3-compatible API proxy to SMB file shares"
 license = "Apache-2.0"
 
+[lib]
+name = "spiceio"
+path = "src/lib.rs"
+
 [[bin]]
 name = "spiceio"
 path = "src/main.rs"
@@ -19,6 +23,17 @@ tower = { version = "0.5", features = ["util", "timeout"] }
 http = "1"
 bytes = "1"
 percent-encoding = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "crypto_bench"
+harness = false
+
+[[bench]]
+name = "protocol_bench"
+harness = false
 
 [lints.rust]
 warnings = "deny"

@@ -32,12 +32,18 @@ pub struct PartInfo {
     pub temp_path: String,
 }
 
-impl MultipartStore {
-    pub fn new() -> Self {
+impl Default for MultipartStore {
+    fn default() -> Self {
         Self {
             uploads: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
+    }
+}
+
+impl MultipartStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Create a new multipart upload and return its upload ID.
