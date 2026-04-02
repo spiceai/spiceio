@@ -80,13 +80,29 @@ runs:
       run: |
         set -euo pipefail
 
-        ENDPOINT="http://${SPICEIO_BIND}"
-
-        # Skip if spiceio is already listening on the requested address
-        if curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
-          echo "spiceio already running at $ENDPOINT — skipping start"
-          echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
-          exit 0
+        # Check if spiceio is already listening on the requested address
+        WANT_VERSION=$(spiceio --version | awk '{print $2}')
+        RUNNING_HEADER=$(curl -sf -I "http://${SPICEIO_BIND}/" 2>/dev/null | grep -i '^server:.*spiceio' | tr -d '\r' || true)
+        if [[ -n "$RUNNING_HEADER" ]]; then
+          # Extract version from "Server: spiceio/X.Y.Z"; bare "Server: spiceio"
+          # (no slash) means a pre-versioned build — treat as outdated.
+          RUNNING_VERSION="${RUNNING_HEADER##*/}"
+          RUNNING_VERSION="${RUNNING_VERSION// /}"
+          if [[ "$RUNNING_HEADER" == */* && "$RUNNING_VERSION" == "$WANT_VERSION" ]]; then
+            echo "spiceio $WANT_VERSION already running at http://${SPICEIO_BIND} — skipping start"
+            echo "endpoint=http://${SPICEIO_BIND}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Old or mismatched version — kill it so we can replace it
+          OLD_PID=$(lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN 2>/dev/null || true)
+          if [[ -n "$OLD_PID" ]]; then
+            echo "replacing spiceio ${RUNNING_VERSION:-unknown} (PID $OLD_PID) with $WANT_VERSION"
+            kill "$OLD_PID" 2>/dev/null || true
+            for i in $(seq 1 10); do
+              lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN 2>/dev/null || break
+              sleep 1
+            done
+          fi
         fi
 
         # Parse smb://user:pass@server:port/share
@@ -127,20 +143,26 @@ runs:
         export SPICEIO_SMB_SERVER SPICEIO_SMB_PORT SPICEIO_SMB_USER SPICEIO_SMB_PASS SPICEIO_SMB_SHARE
         export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND
 
+        SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"
+        export SPICEIO_LOG_FILE="$SPICEIO_LOG"
+
         spiceio &
         PID=$!
-        echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
 
-        # Wait for readiness
+        # Wait for spiceio to report its actual listening address (port may
+        # auto-increment if the requested port was busy).
         echo "Waiting for spiceio on ${SPICEIO_BIND}..."
+        ENDPOINT=""
         for i in $(seq 1 30); do
-          if curl -sf -o /dev/null "$ENDPOINT/" 2>/dev/null; then
-            echo "spiceio ready at $ENDPOINT (PID $PID)"
-            exit 0
-          fi
           if ! kill -0 "$PID" 2>/dev/null; then
             echo "::error::spiceio exited unexpectedly"
             exit 1
+          fi
+          ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | head -1 || true)
+          if [[ -n "$ENDPOINT" ]] && curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
+            echo "spiceio ready at $ENDPOINT (PID $PID)"
+            echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           sleep 1
         done

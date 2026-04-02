@@ -1402,7 +1402,12 @@ fn with_common_headers(
     }
     headers.insert(X_AMZ_ID_2, request_id.parse().unwrap());
     headers.insert(X_AMZ_BUCKET_REGION, region.parse().unwrap());
-    headers.insert("Server", "spiceio".parse().unwrap());
+    headers.insert(
+        "Server",
+        concat!("spiceio/", env!("CARGO_PKG_VERSION"))
+            .parse()
+            .unwrap(),
+    );
     // CORS allow
     if !headers.contains_key("access-control-allow-origin") {
         headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
