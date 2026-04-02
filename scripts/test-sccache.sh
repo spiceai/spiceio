@@ -91,6 +91,15 @@ assert_fail() {
 
 echo "[test] starting spiceio -> smb://${SPICEIO_SMB_USER}@${SMB_SERVER}:${SMB_PORT}/${SMB_SHARE}"
 
+# ── Kill stale listener on our port ───────────────────────────────────────
+BIND_PORT="${BIND##*:}"
+STALE_PID=$(lsof -i ":${BIND_PORT}" -sTCP:LISTEN -t 2>/dev/null || true)
+if [[ -n "$STALE_PID" ]]; then
+    echo "[test] port ${BIND_PORT} already in use (pid ${STALE_PID}), killing..."
+    kill "$STALE_PID" 2>/dev/null || true
+    sleep 1
+fi
+
 SPICEIO_BIND="$BIND" \
 SPICEIO_SMB_SERVER="$SMB_SERVER" \
 SPICEIO_SMB_PORT="$SMB_PORT" \
@@ -247,6 +256,7 @@ export SCCACHE_S3_KEY_PREFIX="spiceio/${REGION}/${BUCKET}"
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 export RUSTC_WRAPPER=sccache
+export CARGO_INCREMENTAL=0  # sccache cannot cache incremental builds
 
 sccache --start-server
 sccache --zero-stats 2>/dev/null || true
@@ -256,10 +266,11 @@ echo "[test] === cold build (populating cache) ==="
 rm -rf "$TEST_TARGET_DIR"
 CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
 
+sccache --zero-stats 2>/dev/null || true
+
 echo ""
 echo "[test] === warm build (should hit cache) ==="
 rm -rf "$TEST_TARGET_DIR"
-sccache --zero-stats 2>/dev/null || true
 CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
 
 echo ""
@@ -269,7 +280,7 @@ echo "======================================="
 sccache --show-stats
 echo "======================================="
 
-# ── Verify cache hits ───────────────────────────────────────────────────────
+# ── Verify cache hits ───────────────────────────────────────────────
 
 STATS=$(sccache --show-stats 2>&1)
 CACHE_HITS=$(echo "$STATS" | grep -m1 "^Cache hits" | awk '{print $NF}' || echo "0")

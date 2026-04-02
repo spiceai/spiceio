@@ -1,4 +1,4 @@
-.PHONY: build release check fmt fmt-check clippy doc lint test bench bench-live clean all
+.PHONY: build release check fmt fmt-check clippy doc lint test test-extended clean all
 
 all: fmt lint test build
 
@@ -28,11 +28,8 @@ lint: fmt-check check clippy doc
 test: build
 	./scripts/test-sccache.sh
 
-bench:
-	cargo bench --locked
-
-bench-live: release
-	./scripts/bench-live.sh
+test-extended: build test
+	./scripts/test-sccache-spiceai.sh
 
 clean:
 	cargo clean

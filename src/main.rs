@@ -1,8 +1,5 @@
 //! spiceio — S3-compatible API proxy to SMB 3.1.1 file shares (macOS 26).
 
-use spiceio::s3;
-use spiceio::smb;
-
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -13,6 +10,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
+
+use spiceio::log;
+use spiceio::s3;
+use spiceio::serr;
+use spiceio::slog;
+use spiceio::smb;
 
 use s3::multipart::MultipartStore;
 use s3::router::AppState;
@@ -67,11 +70,20 @@ impl Config {
 
 #[tokio::main]
 async fn main() {
+    if env::args().any(|a| a == "--version" || a == "-V") {
+        println!("spiceio {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    log::init(env::var("SPICEIO_LOG_FILE").ok().as_deref());
+
     let config = Config::from_env();
 
-    eprintln!(
-        "[spiceio] connecting to smb://{}@{}:{}/{}",
-        config.smb_username, config.smb_server, config.smb_port, config.smb_share
+    slog!(
+        "[spiceio] connecting to smb://****@{}:{}/{}",
+        config.smb_server,
+        config.smb_port,
+        config.smb_share
     );
 
     // Connect to SMB server
@@ -108,10 +120,11 @@ async fn main() {
         .await
         .expect("failed to bind TCP listener");
 
-    eprintln!("[spiceio] listening on http://{bind_addr}");
-    eprintln!(
+    slog!("[spiceio] listening on http://{bind_addr}");
+    slog!(
         "[spiceio] bucket: {} region: {}",
-        config.bucket_name, config.region
+        config.bucket_name,
+        config.region
     );
 
     // Accept loop
@@ -119,9 +132,12 @@ async fn main() {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer_addr) = match accepted {
-                    Ok(v) => v,
+                    Ok(v) => {
+                        slog!("[spiceio] client connected: {}", v.1);
+                        v
+                    }
                     Err(e) => {
-                        eprintln!("[spiceio] accept error: {e}");
+                        serr!("[spiceio] accept error: {e}");
                         continue;
                     }
                 };
@@ -142,12 +158,12 @@ async fn main() {
                         .serve_connection(io, service)
                         .await
                         && !e.to_string().contains("connection reset") {
-                            eprintln!("[spiceio] connection error from {peer_addr}: {e}");
+                            serr!("[spiceio] connection error from {peer_addr}: {e}");
                         }
                 });
             }
             _ = signal::ctrl_c() => {
-                eprintln!("\n[spiceio] shutting down");
+                slog!("\n[spiceio] shutting down");
                 break;
             }
         }
