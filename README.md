@@ -19,7 +19,8 @@ S3 client  --->  spiceio (HTTP :8333)  --->  SMB server (TCP :445)
 - **Full S3 compatibility** for common operations: Get/Put/Copy/Delete/Head Object, ListObjects (v1 & v2), ListBuckets, multipart uploads, range + conditional requests
 - **SMB2 compounding** -- batches Create+Read+Close or Create+Write+Close into single round trips for small file performance
 - **Streaming I/O** -- GetObject and PutObject stream directly between HTTP and SMB without buffering entire files
-- **Simple config** -- everything via environment variables, single binary
+- **Non-blocking logging** -- timestamped stdout/stderr with optional file tee via `SPICEIO_LOG_FILE`; dedicated writer thread, never stalls the proxy
+- **Simple config** -- everything via environment variables, single binary, `--version` flag
 - **Zero external crypto** -- NTLMv2 auth and AES-CMAC signing via macOS CommonCrypto FFI
 
 ### Use cases
@@ -82,6 +83,7 @@ All configuration is via environment variables:
 | `SPICEIO_SMB_DOMAIN` | no       | *(empty)*           | SMB domain                |
 | `SPICEIO_BUCKET`     | no       | `SPICEIO_SMB_SHARE` | Virtual S3 bucket name    |
 | `SPICEIO_REGION`     | no       | `us-east-1`         | AWS region to advertise   |
+| `SPICEIO_LOG_FILE`   | no       | *(none)*            | Append logs to file (non-blocking) |
 
 ## Supported S3 operations
 
