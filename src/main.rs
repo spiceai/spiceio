@@ -104,10 +104,7 @@ async fn main() {
                     let next = match addr.port().checked_add(1) {
                         Some(n) if n - start_port <= 100 => n,
                         _ => {
-                            serr!(
-                                "no available port in range {start_port}–{}",
-                                addr.port()
-                            );
+                            serr!("no available port in range {start_port}–{}", addr.port());
                             std::process::exit(1);
                         }
                     };
