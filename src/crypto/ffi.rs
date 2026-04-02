@@ -199,14 +199,14 @@ pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
         xor_block(&mut last, &k2);
     }
 
-    // Step 4: CBC-MAC
+    // Step 4: CBC-MAC — XOR in-place into x to avoid per-block allocation
     let mut x = [0u8; AES_BLOCK_SIZE];
     for i in 0..n - 1 {
         let start = i * AES_BLOCK_SIZE;
-        let mut block = [0u8; AES_BLOCK_SIZE];
-        block.copy_from_slice(&data[start..start + AES_BLOCK_SIZE]);
-        xor_block(&mut block, &x);
-        x = aes128_ecb_block(key, &block);
+        for j in 0..AES_BLOCK_SIZE {
+            x[j] ^= data[start + j];
+        }
+        x = aes128_ecb_block(key, &x);
     }
     xor_block(&mut last, &x);
     aes128_ecb_block(key, &last)

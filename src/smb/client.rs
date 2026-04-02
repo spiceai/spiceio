@@ -1,11 +1,14 @@
 //! SMB2 client — manages TCP connections and speaks the protocol.
 
+use bytes::Buf;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+
+use bytes::{BufMut, BytesMut};
 
 use super::auth;
 use super::protocol::*;
@@ -45,7 +48,16 @@ impl SmbClient {
     /// Connect to the SMB server and authenticate.
     pub async fn connect(config: SmbConfig) -> io::Result<Arc<Self>> {
         let addr = format!("{}:{}", config.server, config.port);
-        let stream = TcpStream::connect(&addr).await?;
+        let stream = match TcpStream::connect(&addr).await {
+            Ok(s) => {
+                crate::slog!("[spiceio] smb tcp connected: {addr}");
+                s
+            }
+            Err(e) => {
+                crate::serr!("[spiceio] smb tcp connect failed: {addr}: {e}");
+                return Err(e);
+            }
+        };
         stream.set_nodelay(true)?;
 
         let mut client_guid = [0u8; 16];
@@ -108,6 +120,7 @@ impl SmbClient {
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                crate::serr!("[spiceio] smb invalid message length: {msg_len}");
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid SMB2 message length: {msg_len}"),
@@ -117,8 +130,10 @@ impl SmbClient {
             let mut msg = vec![0u8; msg_len];
             stream.read_exact(&mut msg).await?;
 
-            let header = Header::decode(&msg)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+            let header = Header::decode(&msg).ok_or_else(|| {
+                crate::serr!("[spiceio] smb invalid header");
+                io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
+            })?;
 
             // STATUS_PENDING (0x00000103): server is still processing, wait for real response
             if header.status == 0x0000_0103 {
@@ -147,6 +162,7 @@ impl SmbClient {
 
         let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
+            crate::serr!("[spiceio] smb negotiate failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("negotiate failed: status=0x{:08X}", resp_hdr.status),
@@ -157,9 +173,10 @@ impl SmbClient {
         update_preauth_hash(&mut preauth_hash, &resp_raw);
 
         let neg_resp = decode_negotiate_response(&resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid negotiate response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
-        eprintln!(
+        crate::slog!(
             "[spiceio] negotiated SMB 0x{:04X}, max_rw={}K",
             neg_resp.dialect_revision,
             neg_resp.max_write_size.min(65536) / 1024,
@@ -184,13 +201,16 @@ impl SmbClient {
         update_preauth_hash(&mut preauth_hash, &resp_raw);
 
         let sess_resp = decode_session_setup_response(&resp_hdr, &resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid session setup response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid session setup response")
         })?;
 
         // Parse NTLM challenge from SPNEGO wrapper
         let challenge_data = auth::unwrap_spnego(&sess_resp.security_buffer);
-        let challenge = auth::parse_challenge_message(challenge_data)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid NTLM challenge"))?;
+        let challenge = auth::parse_challenge_message(challenge_data).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid NTLM challenge");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid NTLM challenge")
+        })?;
 
         // ── Step 3: Session Setup (NTLM Auth) ──
         let (ntlm_auth, session_base_key) = auth::build_authenticate_message(
@@ -214,6 +234,7 @@ impl SmbClient {
 
         let (resp_hdr, ..) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
+            crate::serr!("[spiceio] smb auth failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("authentication failed: status=0x{:08X}", resp_hdr.status),
@@ -222,11 +243,11 @@ impl SmbClient {
 
         // Derive the signing key
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
-        eprintln!("[spiceio] authenticated, signing key derived");
+        crate::slog!("[spiceio] authenticated, signing key derived");
 
         self.session_id = resp_hdr.session_id;
-        // Cap at 64KB to avoid oversized SMB messages; the negotiate value is often
-        // the max transaction size, but doesn't account for header overhead.
+        // Cap at 64KB — the maximum reliably supported by common NAS servers.
+        // Some servers advertise larger max sizes but fail on compound requests.
         self.max_read_size = neg_resp.max_read_size.min(65536);
         self.max_write_size = neg_resp.max_write_size.min(65536);
         self.signing_key = Some(signing_key);
@@ -247,6 +268,11 @@ impl SmbClient {
         let (resp_hdr, _resp_body) = self.send_recv(&packet).await?;
         let status = NtStatus::from_u32(resp_hdr.status);
         if status.is_error() {
+            crate::serr!(
+                "[spiceio] smb tree connect failed: '{}': 0x{:08X}",
+                share,
+                resp_hdr.status
+            );
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -256,6 +282,11 @@ impl SmbClient {
             ));
         }
 
+        crate::slog!(
+            "[spiceio] smb tree connected: \\\\{}\\{}",
+            self.config.server,
+            share
+        );
         Ok(resp_hdr.tree_id)
     }
 
@@ -291,8 +322,10 @@ impl SmbClient {
             return Err(smb_status_to_io_error(resp_hdr.status, path));
         }
 
-        decode_create_response(&resp_body)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))
+        decode_create_response(&resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid create response: {path}");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid create response")
+        })
     }
 
     /// Close a file handle.
@@ -309,6 +342,7 @@ impl SmbClient {
         let (resp_hdr, _) = self.send_recv(&packet).await?;
         let status = NtStatus::from_u32(resp_hdr.status);
         if status.is_error() {
+            crate::serr!("[spiceio] smb close failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::other(format!(
                 "close failed: 0x{:08X}",
                 resp_hdr.status
@@ -326,7 +360,7 @@ impl SmbClient {
         length: u32,
     ) -> io::Result<bytes::Bytes> {
         let msg_id = self.next_message_id();
-        let mut hdr = Header::new(Command::Read, msg_id);
+        let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(length);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
 
@@ -340,14 +374,17 @@ impl SmbClient {
             return Ok(bytes::Bytes::new());
         }
         if status.is_error() {
+            crate::serr!("[spiceio] smb read failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::other(format!(
                 "read failed: 0x{:08X}",
                 resp_hdr.status
             )));
         }
 
-        decode_read_response(&resp_body)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid read response"))
+        decode_read_response_owned(resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid read response");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
+        })
     }
 
     /// Write to an open file.
@@ -359,7 +396,7 @@ impl SmbClient {
         data: &[u8],
     ) -> io::Result<u32> {
         let msg_id = self.next_message_id();
-        let mut hdr = Header::new(Command::Write, msg_id);
+        let mut hdr = Header::new(Command::Write, msg_id).with_credit_charge(data.len() as u32);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
 
@@ -371,6 +408,12 @@ impl SmbClient {
         // Check raw status: high two bits indicate severity
         // 0x00 = success, 0x40 = info, 0x80 = warning, 0xC0 = error
         if resp_hdr.status & 0xC000_0000 == 0xC000_0000 {
+            crate::serr!(
+                "[spiceio] smb write failed: 0x{:08X} offset={} len={}",
+                resp_hdr.status,
+                offset,
+                data.len()
+            );
             return Err(io::Error::other(format!(
                 "write failed: status=0x{:08X} offset={} len={}",
                 resp_hdr.status,
@@ -379,8 +422,10 @@ impl SmbClient {
             )));
         }
 
-        decode_write_response(&resp_body)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid write response"))
+        decode_write_response(&resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid write response");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
+        })
     }
 
     /// List directory contents.
@@ -419,6 +464,10 @@ impl SmbClient {
                 break;
             }
             if status.is_error() {
+                crate::serr!(
+                    "[spiceio] smb query directory failed: 0x{:08X}",
+                    resp_hdr.status
+                );
                 return Err(io::Error::other(format!(
                     "query directory failed: 0x{:08X}",
                     resp_hdr.status
@@ -427,8 +476,8 @@ impl SmbClient {
 
             // Parse the output buffer from the response body
             if resp_body.len() >= 9 {
-                let buf_offset = u16::from_le_bytes(resp_body[2..4].try_into().unwrap()) as usize;
-                let buf_length = u32::from_le_bytes(resp_body[4..8].try_into().unwrap()) as usize;
+                let buf_offset = (&resp_body[2..4] as &[u8]).get_u16_le() as usize;
+                let buf_length = (&resp_body[4..8] as &[u8]).get_u32_le() as usize;
                 let start = buf_offset.saturating_sub(SMB2_HEADER_SIZE);
                 let end = (start + buf_length).min(resp_body.len());
                 if start < end {
@@ -439,6 +488,325 @@ impl SmbClient {
         }
 
         Ok(all_entries)
+    }
+
+    // ── Compound operations (multiple SMB ops in one round trip) ────────
+
+    /// Send a compound request and parse the compound response.
+    ///
+    /// Caller sets `SMB2_FLAGS_RELATED` on related-chain requests.
+    /// This method handles `NextCommand` offsets, signing, and framing.
+    async fn send_compound(
+        &self,
+        requests: Vec<(Header, BytesMut)>,
+    ) -> io::Result<Vec<(Header, Vec<u8>)>> {
+        let n = requests.len();
+
+        // Padded message sizes (8-byte aligned except last).
+        let sizes: Vec<usize> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, (_, body))| {
+                let raw = SMB2_HEADER_SIZE + body.len();
+                if i < n - 1 {
+                    raw + (8 - raw % 8) % 8
+                } else {
+                    raw
+                }
+            })
+            .collect();
+
+        let total: usize = sizes.iter().sum();
+        let mut buf = BytesMut::with_capacity(4 + total);
+        buf.put_u32(total as u32); // NetBIOS length (big-endian)
+
+        for (i, (mut header, body)) in requests.into_iter().enumerate() {
+            let body_len = body.len();
+            header.next_command = if i < n - 1 { sizes[i] as u32 } else { 0 };
+
+            let msg_start = buf.len();
+            header.encode(&mut buf);
+            buf.put_slice(&body);
+
+            // Pad to 8-byte alignment
+            let pad = sizes[i] - SMB2_HEADER_SIZE - body_len;
+            if pad > 0 {
+                buf.extend_from_slice(&[0u8; 7][..pad]);
+            }
+
+            // Sign this message
+            if let Some(ref key) = self.signing_key {
+                sign_message(&mut buf[msg_start..msg_start + sizes[i]], key);
+            }
+        }
+
+        // Send and receive under the stream lock
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+
+        // Read response frames, skipping STATUS_PENDING interim responses
+        loop {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                crate::serr!("[spiceio] smb invalid message length: {msg_len}");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SMB2 message length: {msg_len}"),
+                ));
+            }
+
+            let mut msg = vec![0u8; msg_len];
+            stream.read_exact(&mut msg).await?;
+
+            // Single STATUS_PENDING interim — skip
+            if let Some(h) = Header::decode(&msg)
+                && h.status == 0x0000_0103
+                && h.next_command == 0
+            {
+                continue;
+            }
+
+            return Ok(parse_compound_response(&msg));
+        }
+    }
+
+    /// Compound Create + Close (1 round trip). Returns create and close
+    /// metadata. Used for head_object and delete_object.
+    pub async fn create_close(
+        &self,
+        tree_id: u32,
+        path: &str,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> io::Result<(CreateResponse, CloseResponse)> {
+        let base = self.message_id.fetch_add(2, Ordering::Relaxed);
+
+        let mut h1 = Header::new(Command::Create, base);
+        h1.session_id = self.session_id;
+        h1.tree_id = tree_id;
+        let mut b1 = BytesMut::with_capacity(128);
+        encode_create_request(
+            &mut b1,
+            path,
+            desired_access,
+            share_access,
+            create_disposition,
+            create_options,
+        );
+
+        let mut h2 = Header::new(Command::Close, base + 1);
+        h2.session_id = self.session_id;
+        h2.tree_id = tree_id;
+        h2.flags |= SMB2_FLAGS_RELATED;
+        let mut b2 = BytesMut::with_capacity(32);
+        encode_close_request_ex(&mut b2, &SENTINEL_FILE_ID, true);
+
+        let resp = self.send_compound(vec![(h1, b1), (h2, b2)]).await?;
+        if resp.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response too short",
+            ));
+        }
+
+        if NtStatus::from_u32(resp[0].0.status).is_error() {
+            return Err(smb_status_to_io_error(resp[0].0.status, path));
+        }
+        let cr = decode_create_response(&resp[0].1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))?;
+        let cl = decode_close_response(&resp[1].1).unwrap_or(CloseResponse {
+            last_write_time: cr.last_write_time,
+            file_size: cr.file_size,
+        });
+
+        Ok((cr, cl))
+    }
+
+    /// Compound Create + Read + Close (1 round trip). For small-file reads.
+    pub async fn create_read_close(
+        &self,
+        tree_id: u32,
+        path: &str,
+        max_read: u32,
+    ) -> io::Result<(CreateResponse, bytes::Bytes)> {
+        let base = self.message_id.fetch_add(3, Ordering::Relaxed);
+
+        let mut h1 = Header::new(Command::Create, base);
+        h1.session_id = self.session_id;
+        h1.tree_id = tree_id;
+        let mut b1 = BytesMut::with_capacity(128);
+        encode_create_request(
+            &mut b1,
+            path,
+            DesiredAccess::GenericRead as u32,
+            ShareAccess::Read as u32,
+            CreateDisposition::Open as u32,
+            CreateOptions::NonDirectoryFile as u32,
+        );
+
+        let mut h2 = Header::new(Command::Read, base + 1).with_credit_charge(max_read);
+        h2.session_id = self.session_id;
+        h2.tree_id = tree_id;
+        h2.flags |= SMB2_FLAGS_RELATED;
+        let mut b2 = BytesMut::with_capacity(64);
+        encode_read_request(&mut b2, &SENTINEL_FILE_ID, 0, max_read);
+
+        let mut h3 = Header::new(Command::Close, base + 2);
+        h3.session_id = self.session_id;
+        h3.tree_id = tree_id;
+        h3.flags |= SMB2_FLAGS_RELATED;
+        let mut b3 = BytesMut::with_capacity(32);
+        encode_close_request(&mut b3, &SENTINEL_FILE_ID);
+
+        let resp = self
+            .send_compound(vec![(h1, b1), (h2, b2), (h3, b3)])
+            .await?;
+        if resp.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response too short",
+            ));
+        }
+
+        if NtStatus::from_u32(resp[0].0.status).is_error() {
+            return Err(smb_status_to_io_error(resp[0].0.status, path));
+        }
+        let cr = decode_create_response(&resp[0].1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))?;
+
+        let data = if NtStatus::from_u32(resp[1].0.status) == NtStatus::EndOfFile {
+            bytes::Bytes::new()
+        } else if NtStatus::from_u32(resp[1].0.status).is_error() {
+            return Err(io::Error::other(format!(
+                "read failed: 0x{:08X}",
+                resp[1].0.status
+            )));
+        } else {
+            decode_read_response(&resp[1].1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
+            })?
+        };
+
+        Ok((cr, data))
+    }
+
+    /// Compound Create + Write + Close (1 round trip). For small-file writes.
+    /// Returns the Close response with post-query metadata.
+    pub async fn create_write_close(
+        &self,
+        tree_id: u32,
+        path: &str,
+        data: &[u8],
+    ) -> io::Result<CloseResponse> {
+        let base = self.message_id.fetch_add(3, Ordering::Relaxed);
+
+        let mut h1 = Header::new(Command::Create, base);
+        h1.session_id = self.session_id;
+        h1.tree_id = tree_id;
+        let mut b1 = BytesMut::with_capacity(128);
+        encode_create_request(
+            &mut b1,
+            path,
+            DesiredAccess::GenericWrite as u32,
+            ShareAccess::Read as u32,
+            CreateDisposition::OverwriteIf as u32,
+            CreateOptions::NonDirectoryFile as u32,
+        );
+
+        let mut h2 = Header::new(Command::Write, base + 1).with_credit_charge(data.len() as u32);
+        h2.session_id = self.session_id;
+        h2.tree_id = tree_id;
+        h2.flags |= SMB2_FLAGS_RELATED;
+        let mut b2 = BytesMut::with_capacity(64 + data.len());
+        encode_write_request(&mut b2, &SENTINEL_FILE_ID, 0, data);
+
+        let mut h3 = Header::new(Command::Close, base + 2);
+        h3.session_id = self.session_id;
+        h3.tree_id = tree_id;
+        h3.flags |= SMB2_FLAGS_RELATED;
+        let mut b3 = BytesMut::with_capacity(32);
+        encode_close_request_ex(&mut b3, &SENTINEL_FILE_ID, true);
+
+        let resp = self
+            .send_compound(vec![(h1, b1), (h2, b2), (h3, b3)])
+            .await?;
+        if resp.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compound response too short",
+            ));
+        }
+
+        if NtStatus::from_u32(resp[0].0.status).is_error() {
+            return Err(smb_status_to_io_error(resp[0].0.status, path));
+        }
+        if resp[1].0.status & 0xC000_0000 == 0xC000_0000 {
+            return Err(io::Error::other(format!(
+                "write failed: 0x{:08X}",
+                resp[1].0.status
+            )));
+        }
+
+        Ok(decode_close_response(&resp[2].1).unwrap_or(CloseResponse {
+            last_write_time: 0,
+            file_size: data.len() as u64,
+        }))
+    }
+
+    /// Compound batch of Create+Close pairs for directory creation (1 round trip).
+    /// Each pair forms a related chain; different pairs are unrelated.
+    pub async fn ensure_dirs(&self, tree_id: u32, dirs: &[String]) -> io::Result<()> {
+        if dirs.is_empty() {
+            return Ok(());
+        }
+
+        let count = dirs.len() * 2;
+        let base = self.message_id.fetch_add(count as u64, Ordering::Relaxed);
+        let mut requests = Vec::with_capacity(count);
+
+        for (i, dir) in dirs.iter().enumerate() {
+            // Create (unrelated — starts new chain)
+            let mut h1 = Header::new(Command::Create, base + (i as u64) * 2);
+            h1.session_id = self.session_id;
+            h1.tree_id = tree_id;
+            let mut b1 = BytesMut::with_capacity(128);
+            encode_create_request(
+                &mut b1,
+                dir,
+                DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::OpenIf as u32,
+                CreateOptions::DirectoryFile as u32,
+            );
+            requests.push((h1, b1));
+
+            // Close (related — sentinel file ID from preceding Create)
+            let mut h2 = Header::new(Command::Close, base + (i as u64) * 2 + 1);
+            h2.session_id = self.session_id;
+            h2.tree_id = tree_id;
+            h2.flags |= SMB2_FLAGS_RELATED;
+            let mut b2 = BytesMut::with_capacity(32);
+            encode_close_request(&mut b2, &SENTINEL_FILE_ID);
+            requests.push((h2, b2));
+        }
+
+        let responses = self.send_compound(requests).await?;
+
+        // Check Create responses (every other response)
+        for i in (0..responses.len()).step_by(2) {
+            let status = NtStatus::from_u32(responses[i].0.status);
+            if status.is_error() {
+                return Err(smb_status_to_io_error(responses[i].0.status, &dirs[i / 2]));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -476,6 +844,7 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
 }
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
+    crate::serr!("[spiceio] smb error 0x{status:08X}: {path}");
     // Map raw status codes directly to avoid losing info through NtStatus enum
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE
@@ -496,6 +865,52 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
 
         _ => io::Error::other(format!("SMB error 0x{status:08X} for {path}")),
     }
+}
+
+/// Sign a single SMB2 message in-place (no NetBIOS header prefix).
+/// Used for compound requests where each message is signed individually.
+fn sign_message(msg: &mut [u8], key: &[u8; 16]) {
+    use crate::crypto;
+    const FLAGS_OFFSET: usize = 16;
+    const SIGNATURE_OFFSET: usize = 48;
+
+    let flags = u32::from_le_bytes(msg[FLAGS_OFFSET..FLAGS_OFFSET + 4].try_into().unwrap());
+    msg[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&(flags | 0x0000_0008).to_le_bytes());
+
+    msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].fill(0);
+
+    let signature = crypto::aes128_cmac(key, msg);
+    msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
+}
+
+/// Parse a compound response (multiple SMB2 messages in one frame).
+fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
+    let mut results = Vec::new();
+    let mut offset = 0;
+
+    loop {
+        if offset + SMB2_HEADER_SIZE > msg.len() {
+            break;
+        }
+        let header = match Header::decode(&msg[offset..]) {
+            Some(h) => h,
+            None => break,
+        };
+
+        let next = header.next_command as usize;
+        let body_start = offset + SMB2_HEADER_SIZE;
+        let body_end = if next > 0 { offset + next } else { msg.len() };
+
+        let body = msg[body_start..body_end].to_vec();
+        results.push((header, body));
+
+        if next == 0 {
+            break;
+        }
+        offset += next;
+    }
+
+    results
 }
 
 // Need this for from_raw_fd

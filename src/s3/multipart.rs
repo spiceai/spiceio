@@ -34,16 +34,16 @@ pub struct PartInfo {
 
 impl Default for MultipartStore {
     fn default() -> Self {
-        Self {
-            uploads: RwLock::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-        }
+        Self::new()
     }
 }
 
 impl MultipartStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            uploads: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
     }
 
     /// Create a new multipart upload and return its upload ID.
@@ -136,4 +136,100 @@ fn epoch_nanos() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn create_and_get_upload() {
+        let store = MultipartStore::new();
+        let id = store.create("my/key.txt").await;
+        assert!(!id.is_empty());
+
+        let state = store.get(&id).await.unwrap();
+        assert_eq!(state.key, "my/key.txt");
+        assert!(state.parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_part_and_list() {
+        let store = MultipartStore::new();
+        let id = store.create("file.bin").await;
+
+        store
+            .put_part(&id, 1, 1024, "etag1".into(), "tmp/p1".into())
+            .await
+            .unwrap();
+        store
+            .put_part(&id, 2, 2048, "etag2".into(), "tmp/p2".into())
+            .await
+            .unwrap();
+
+        let state = store.get(&id).await.unwrap();
+        assert_eq!(state.parts.len(), 2);
+        assert_eq!(state.parts[&1].size, 1024);
+        assert_eq!(state.parts[&2].etag, "etag2");
+    }
+
+    #[tokio::test]
+    async fn complete_removes_upload() {
+        let store = MultipartStore::new();
+        let id = store.create("key").await;
+        let state = store.complete(&id).await.unwrap();
+        assert_eq!(state.key, "key");
+        assert!(store.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn abort_removes_upload() {
+        let store = MultipartStore::new();
+        let id = store.create("key").await;
+        store.abort(&id).await.unwrap();
+        assert!(store.get(&id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_prefix() {
+        let store = MultipartStore::new();
+        store.create("data/a.txt").await;
+        store.create("data/b.txt").await;
+        store.create("other/c.txt").await;
+
+        let data = store.list(Some("data/")).await;
+        assert_eq!(data.len(), 2);
+
+        let all = store.list(None).await;
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn get_nonexistent_returns_none() {
+        let store = MultipartStore::new();
+        assert!(store.get("nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_part_nonexistent_returns_none() {
+        let store = MultipartStore::new();
+        assert!(
+            store
+                .put_part("nope", 1, 100, "e".into(), "p".into())
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn temp_paths() {
+        assert_eq!(
+            MultipartStore::temp_dir("abc123"),
+            ".spiceio-uploads\\abc123"
+        );
+        assert_eq!(
+            MultipartStore::temp_part_path("abc123", 3),
+            ".spiceio-uploads\\abc123\\part-00003"
+        );
+    }
 }
