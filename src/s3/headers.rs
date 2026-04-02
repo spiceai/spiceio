@@ -60,35 +60,12 @@ pub fn parse_range(header: &str) -> Option<RangeSpec> {
 
 impl RangeSpec {
     /// Resolve to absolute byte positions given total file size.
-    /// Returns `None` if the range is not satisfiable (empty file, start >= total, etc.).
-    pub fn resolve(&self, total: u64) -> Option<(u64, u64)> {
-        if total == 0 {
-            return None;
-        }
+    pub fn resolve(&self, total: u64) -> (u64, u64) {
         match (self.start, self.end) {
-            (Some(s), Some(e)) => {
-                if s >= total {
-                    return None;
-                }
-                let end = e.min(total - 1);
-                if s > end {
-                    return None;
-                }
-                Some((s, end))
-            }
-            (Some(s), None) => {
-                if s >= total {
-                    return None;
-                }
-                Some((s, total - 1))
-            }
-            (None, Some(suffix)) => {
-                if suffix == 0 {
-                    return None;
-                }
-                Some((total.saturating_sub(suffix), total - 1))
-            }
-            (None, None) => Some((0, total - 1)),
+            (Some(s), Some(e)) => (s, e.min(total - 1)),
+            (Some(s), None) => (s, total - 1),
+            (None, Some(suffix)) => (total.saturating_sub(suffix), total - 1),
+            (None, None) => (0, total - 1),
         }
     }
 }
@@ -96,8 +73,8 @@ impl RangeSpec {
 /// Parse simple HTTP-date (RFC 7231 / IMF-fixdate) or ISO 8601 to epoch seconds.
 /// Supports: "Sun, 06 Nov 1994 08:49:37 GMT" and "2024-01-01T00:00:00Z".
 pub fn parse_http_date(s: &str) -> Option<u64> {
-    // Try ISO 8601 first
-    if s.contains('T') {
+    // Try ISO 8601 first (contains 'T' between date and time, not in "GMT")
+    if s.contains('T') && !s.ends_with("GMT") {
         return parse_iso8601(s);
     }
     // IMF-fixdate: "Day, DD Mon YYYY HH:MM:SS GMT"
@@ -180,4 +157,133 @@ pub fn generate_request_id() -> String {
         arc4random_buf(buf.as_mut_ptr(), 16);
     }
     crate::crypto::hex_encode(&buf).to_uppercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_range ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_range_start_end() {
+        let r = parse_range("bytes=0-499").unwrap();
+        assert_eq!(r.start, Some(0));
+        assert_eq!(r.end, Some(499));
+    }
+
+    #[test]
+    fn parse_range_open_end() {
+        let r = parse_range("bytes=100-").unwrap();
+        assert_eq!(r.start, Some(100));
+        assert_eq!(r.end, None);
+    }
+
+    #[test]
+    fn parse_range_suffix() {
+        let r = parse_range("bytes=-200").unwrap();
+        assert_eq!(r.start, None);
+        assert_eq!(r.end, Some(200));
+    }
+
+    #[test]
+    fn parse_range_invalid() {
+        assert!(parse_range("not-a-range").is_none());
+    }
+
+    // ── RangeSpec::resolve ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_full_range() {
+        let r = RangeSpec {
+            start: Some(0),
+            end: Some(99),
+        };
+        assert_eq!(r.resolve(100), (0, 99));
+    }
+
+    #[test]
+    fn resolve_clamps_end() {
+        let r = RangeSpec {
+            start: Some(0),
+            end: Some(999),
+        };
+        assert_eq!(r.resolve(100), (0, 99));
+    }
+
+    #[test]
+    fn resolve_open_end() {
+        let r = RangeSpec {
+            start: Some(50),
+            end: None,
+        };
+        assert_eq!(r.resolve(100), (50, 99));
+    }
+
+    #[test]
+    fn resolve_suffix() {
+        let r = RangeSpec {
+            start: None,
+            end: Some(10),
+        };
+        assert_eq!(r.resolve(100), (90, 99));
+    }
+
+    #[test]
+    fn resolve_suffix_larger_than_file() {
+        let r = RangeSpec {
+            start: None,
+            end: Some(200),
+        };
+        assert_eq!(r.resolve(100), (0, 99));
+    }
+
+    // ── parse_http_date ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_http_date_rfc7231() {
+        // date_to_epoch independently verified
+        assert_eq!(date_to_epoch(1994, 11, 6, 8, 49, 37), 784111777);
+
+        // IMF-fixdate parser: "Day, DD Mon YYYY HH:MM:SS GMT"
+        let input = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        // Sanity: verify split produces expected tokens
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[1], "06");
+        assert_eq!(parts[2], "Nov");
+
+        let result = parse_http_date(input);
+        assert!(
+            result.is_some(),
+            "parse_http_date returned None for: {input:?}, parts: {parts:?}"
+        );
+        assert_eq!(result.unwrap(), 784111777);
+    }
+
+    #[test]
+    fn parse_http_date_iso8601() {
+        let ts = parse_http_date("2024-01-15T12:30:45Z").unwrap();
+        assert_eq!(ts, 1705321845);
+    }
+
+    #[test]
+    fn parse_http_date_iso8601_millis() {
+        let ts = parse_http_date("2024-01-15T12:30:45.000Z").unwrap();
+        assert_eq!(ts, 1705321845);
+    }
+
+    #[test]
+    fn parse_http_date_invalid() {
+        assert!(parse_http_date("not a date").is_none());
+    }
+
+    // ── date round-trip ──────────────────────────────────────────────
+
+    #[test]
+    fn http_date_round_trip() {
+        let formatted = crate::s3::xml::epoch_to_http_date(784111777);
+        let parsed = parse_http_date(&formatted).unwrap();
+        assert_eq!(parsed, 784111777);
+    }
 }

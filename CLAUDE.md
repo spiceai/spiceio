@@ -21,26 +21,8 @@ make release                   # optimized release build
 make lint                      # fmt-check + check + strict clippy + rustdoc warnings
 make test                      # sccache integration test (requires SPICEIO_SMB_USER/PASS)
 make fmt                       # auto-format
-make bench                     # criterion benchmarks (crypto + protocol)
-make bench-live                # live throughput benchmarks against NAS
 make clean                     # cargo clean
 ```
-
-## Pre-PR checklist
-
-Always run these before creating a PR — they mirror what CI checks:
-
-```bash
-cargo fmt --all                # auto-format first
-cargo fmt --all --check        # verify no formatting diff remains
-cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::all -D clippy::cargo -A clippy::cargo-common-metadata
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
-cargo test --locked            # unit tests must pass
-```
-
-Or simply: `make lint && cargo test --locked`
-
-The CI also runs `./scripts/test-sccache.sh` (sccache integration test) when SMB credentials are available.
 
 The binary requires these environment variables:
 - `SPICEIO_SMB_SERVER` (required) — SMB server hostname or IP
@@ -52,6 +34,7 @@ The binary requires these environment variables:
 - `SPICEIO_SMB_DOMAIN` — SMB domain (default empty)
 - `SPICEIO_BUCKET` — virtual S3 bucket name (defaults to `SPICEIO_SMB_SHARE`)
 - `SPICEIO_REGION` — AWS region to advertise (default `us-east-1`)
+- `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
 
 ## Architecture
 

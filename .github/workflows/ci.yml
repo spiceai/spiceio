@@ -68,6 +68,22 @@ jobs:
             brew install awscli
           fi
 
+      - name: Verify spiceio binary version
+        run: |
+          BUILT_VERSION=$(./target/debug/spiceio --version)
+          echo "Built: ${BUILT_VERSION}"
+          echo "SPICEIO_BUILT_VERSION=${BUILT_VERSION}" >> "$GITHUB_ENV"
+
+          # If an older spiceio is already listening (e.g. from a previous run),
+          # kill it so the test starts the freshly-built binary.
+          for PORT in 18333 18334; do
+            STALE_PID=$(lsof -i ":${PORT}" -sTCP:LISTEN -t 2>/dev/null || true)
+            if [[ -n "$STALE_PID" ]]; then
+              echo "Stale process on :${PORT} (pid ${STALE_PID}), killing..."
+              kill "$STALE_PID" 2>/dev/null || true
+            fi
+          done
+
       - name: Run sccache integration test
         # Skipped when UNAS_SMB_PASS secret is not configured (e.g. fork PRs)
         if: ${{ env.HAS_SMB_PASS == 'true' }}
@@ -79,9 +95,6 @@ jobs:
           SPICEIO_BUCKET: ${{ vars.SPICEIO_BUCKET || 'spiceio' }}
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
         run: ./scripts/test-sccache.sh
-
-      - name: Compile benchmarks
-        run: cargo bench --locked --no-run
 
       - name: Build release artifact
         run: cargo build --release --locked --bin spiceio
