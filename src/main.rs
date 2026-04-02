@@ -21,6 +21,7 @@ use s3::multipart::MultipartStore;
 use s3::router::AppState;
 use smb::client::SmbConfig;
 use smb::ops::ShareSession;
+use smb::pool::SmbPool;
 
 /// Runtime configuration parsed from environment variables.
 struct Config {
@@ -42,6 +43,10 @@ struct Config {
     bucket_name: String,
     /// AWS region to advertise
     region: String,
+    /// Number of SMB TCP connections in the pool (default 4)
+    smb_connections: usize,
+    /// Max I/O size for standalone read/write operations (default 1MB)
+    smb_max_io: u32,
 }
 
 impl Config {
@@ -64,6 +69,14 @@ impl Config {
                 env::var("SPICEIO_SMB_SHARE").unwrap_or_else(|_| "data".into())
             }),
             region: env::var("SPICEIO_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            smb_connections: env::var("SPICEIO_SMB_CONNECTIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4),
+            smb_max_io: env::var("SPICEIO_SMB_MAX_IO")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -80,13 +93,14 @@ async fn main() {
     let config = Config::from_env();
 
     slog!(
-        "[spiceio] connecting to smb://****@{}:{}/{}",
+        "[spiceio] connecting to smb://****@{}:{}/{} ({}x)",
         config.smb_server,
         config.smb_port,
-        config.smb_share
+        config.smb_share,
+        config.smb_connections,
     );
 
-    // Connect to SMB server
+    // Connect SMB connection pool
     let smb_config = SmbConfig {
         server: config.smb_server.clone(),
         port: config.smb_port,
@@ -94,14 +108,15 @@ async fn main() {
         password: config.smb_password.clone(),
         domain: config.smb_domain.clone(),
         workstation: "SPICEIO".into(),
+        max_io_size: config.smb_max_io,
     };
 
-    let client = smb::SmbClient::connect(smb_config)
+    let pool = SmbPool::connect(smb_config, config.smb_connections)
         .await
         .expect("failed to connect to SMB server");
 
     let share = Arc::new(
-        ShareSession::connect(client, &config.smb_share)
+        ShareSession::connect(pool, &config.smb_share)
             .await
             .expect("failed to connect to SMB share"),
     );

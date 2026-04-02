@@ -259,6 +259,7 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 pub struct NegotiateResponse {
     pub security_mode: u16,
     pub dialect_revision: u16,
+    pub max_transact_size: u32,
     pub max_read_size: u32,
     pub max_write_size: u32,
 }
@@ -269,12 +270,14 @@ pub fn decode_negotiate_response(body: &[u8]) -> Option<NegotiateResponse> {
     }
     let security_mode = (&body[2..4]).get_u16_le();
     let dialect_revision = (&body[4..6]).get_u16_le();
+    let max_transact_size = (&body[28..32]).get_u32_le();
     let max_read_size = (&body[32..36]).get_u32_le();
     let max_write_size = (&body[36..40]).get_u32_le();
 
     Some(NegotiateResponse {
         security_mode,
         dialect_revision,
+        max_transact_size,
         max_read_size,
         max_write_size,
     })
