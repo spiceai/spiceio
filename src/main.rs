@@ -79,15 +79,8 @@ async fn main() {
 
     let config = Config::from_env();
 
-    let masked_user = if config.smb_username.is_empty() {
-        "***".to_string()
-    } else {
-        let first = &config.smb_username[..config.smb_username.chars().next().unwrap().len_utf8()];
-        format!("{first}***")
-    };
     slog!(
-        "[spiceio] connecting to smb://{}@{}:{}/{}",
-        masked_user,
+        "[spiceio] connecting to smb://****@{}:{}/{}",
         config.smb_server,
         config.smb_port,
         config.smb_share
