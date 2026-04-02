@@ -597,10 +597,14 @@ async fn handle_get_object(
                 Ok(chunk) => {
                     offset += chunk.len() as u64;
                     if tx.send(chunk).await.is_err() {
-                        break; // Client disconnected
+                        crate::serr!("[spiceio] getobject client disconnected");
+                        break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    crate::serr!("[spiceio] getobject read error: {e}");
+                    break;
+                }
             }
         }
         let _ = handle.close().await;
@@ -722,6 +726,7 @@ async fn handle_put_object(
                 }
             }
             Err(e) => {
+                crate::serr!("[spiceio] putobject body read error: {e}");
                 let _ = handle.close().await;
                 return io_to_s3_error(&io::Error::other(format!("body read error: {e}")));
             }
@@ -1422,10 +1427,11 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
             "The specified key does not exist.",
         ),
         io::ErrorKind::PermissionDenied => {
+            crate::serr!("[spiceio] access denied: {e}");
             error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied")
         }
         _ => {
-            eprintln!("[spiceio] error: {e}");
+            crate::serr!("[spiceio] error: {e}");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -1477,7 +1483,7 @@ async fn collect_body(req: Request<Incoming>) -> Bytes {
     match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            eprintln!("[spiceio] body collect error: {e}");
+            crate::serr!("[spiceio] body collect error: {e}");
             Bytes::new()
         }
     }
