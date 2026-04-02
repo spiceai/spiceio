@@ -25,12 +25,17 @@ FAIL=0
 # ── Cleanup on exit ─────────────────────────────────────────────────────────
 
 SPICEIO_PID=""
+SPICEIO_PID2=""
 cleanup() {
     echo ""
     echo "[test] cleaning up..."
     sccache --stop-server 2>/dev/null || true
     # Remove test objects
     $AWS s3 rm "s3://${BUCKET}/${TEST_PREFIX}/" --recursive 2>/dev/null || true
+    if [[ -n "$SPICEIO_PID2" ]]; then
+        kill "$SPICEIO_PID2" 2>/dev/null || true
+        wait "$SPICEIO_PID2" 2>/dev/null || true
+    fi
     if [[ -n "$SPICEIO_PID" ]]; then
         kill "$SPICEIO_PID" 2>/dev/null || true
         wait "$SPICEIO_PID" 2>/dev/null || true
@@ -234,6 +239,89 @@ echo "======================================="
 
 if [[ "$FAIL" -gt 0 ]]; then
     echo "[test] ABORTING — S3 API tests failed"
+    exit 1
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# Port auto-increment test
+# ════════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "======================================="
+echo "[test] port auto-increment test"
+echo "======================================="
+
+# Start a second instance requesting the same bind address.
+# It should auto-increment to the next port.
+SPICEIO_LOG2=$(mktemp /tmp/spiceio-test-log2.XXXXXX)
+
+SPICEIO_BIND="$BIND" \
+SPICEIO_SMB_SERVER="$SMB_SERVER" \
+SPICEIO_SMB_PORT="$SMB_PORT" \
+SPICEIO_SMB_USER="$SPICEIO_SMB_USER" \
+SPICEIO_SMB_PASS="$SPICEIO_SMB_PASS" \
+SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
+SPICEIO_SMB_SHARE="$SMB_SHARE" \
+SPICEIO_BUCKET="$BUCKET" \
+SPICEIO_REGION="$REGION" \
+SPICEIO_LOG_FILE="$SPICEIO_LOG2" \
+"$SPICEIO_BIN" &
+SPICEIO_PID2=$!
+
+echo "[test] waiting for second spiceio instance..."
+ENDPOINT2=""
+for i in $(seq 1 30); do
+    ENDPOINT2=$(grep 'listening on' "$SPICEIO_LOG2" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
+    if [[ -n "$ENDPOINT2" ]] && curl -sf -o /dev/null "${ENDPOINT2}/" 2>/dev/null; then
+        break
+    fi
+    if ! kill -0 "$SPICEIO_PID2" 2>/dev/null; then
+        echo "  FAIL: second spiceio exited unexpectedly"
+        FAIL=$((FAIL + 1))
+        SPICEIO_PID2=""
+        break
+    fi
+    sleep 0.5
+done
+
+if [[ -n "$ENDPOINT2" ]]; then
+    echo "[test] second instance at $ENDPOINT2"
+
+    PORT1="${BIND##*:}"
+    PORT2="${ENDPOINT2##*:}"
+    assert_eq "port auto-incremented" "$((PORT1 + 1))" "$PORT2"
+
+    # Both instances should serve requests
+    assert_ok "first instance health check" curl -sf -o /dev/null "${ENDPOINT}/"
+    assert_ok "second instance health check" curl -sf -o /dev/null "${ENDPOINT2}/"
+
+    # Both should serve S3 operations (same SMB share)
+    GOT1=$($AWS s3 cp "s3://${BUCKET}/${TEST_PREFIX}/small.txt" - 2>/dev/null || echo "FAIL")
+    assert_eq "first instance S3 read" "version2" "$GOT1"
+
+    AWS2="aws --endpoint-url $ENDPOINT2 --no-sign-request"
+    GOT2=$($AWS2 s3 cp "s3://${BUCKET}/${TEST_PREFIX}/small.txt" - 2>/dev/null || echo "FAIL")
+    assert_eq "second instance S3 read" "version2" "$GOT2"
+else
+    echo "  FAIL: second instance did not start"
+    FAIL=$((FAIL + 1))
+fi
+
+# Stop the second instance
+if [[ -n "$SPICEIO_PID2" ]]; then
+    kill "$SPICEIO_PID2" 2>/dev/null || true
+    wait "$SPICEIO_PID2" 2>/dev/null || true
+    SPICEIO_PID2=""
+fi
+rm -f "$SPICEIO_LOG2"
+
+echo ""
+echo "======================================="
+echo "[test] port auto-increment: $PASS passed, $FAIL failed"
+echo "======================================="
+
+if [[ "$FAIL" -gt 0 ]]; then
+    echo "[test] ABORTING — port auto-increment test failed"
     exit 1
 fi
 

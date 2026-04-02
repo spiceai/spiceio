@@ -55,7 +55,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     // Service-level operations (no bucket)
     if req_bucket.is_empty() {
         match method {
-            Method::GET => {
+            Method::GET | Method::HEAD => {
                 return with_common_headers(
                     list_buckets_response(&state.bucket),
                     &request_id,
