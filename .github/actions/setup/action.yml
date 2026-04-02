@@ -94,12 +94,12 @@ runs:
             exit 0
           fi
           # Old or mismatched version — kill it so we can replace it
-          OLD_PID=$(lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN 2>/dev/null || true)
-          if [[ -n "$OLD_PID" ]]; then
-            echo "replacing spiceio ${RUNNING_VERSION:-unknown} (PID $OLD_PID) with $WANT_VERSION"
-            kill "$OLD_PID" 2>/dev/null || true
+          mapfile -t OLD_PIDS < <(lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN 2>/dev/null || true)
+          if (( ${#OLD_PIDS[@]} > 0 )); then
+            echo "replacing spiceio ${RUNNING_VERSION:-unknown} (PID(s) ${OLD_PIDS[*]}) with $WANT_VERSION"
+            kill "${OLD_PIDS[@]}" 2>/dev/null || true
             for i in $(seq 1 10); do
-              lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN 2>/dev/null || break
+              lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN >/dev/null 2>&1 || break
               sleep 1
             done
           fi
@@ -144,6 +144,7 @@ runs:
         export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND
 
         SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"
+        : > "$SPICEIO_LOG"
         export SPICEIO_LOG_FILE="$SPICEIO_LOG"
 
         spiceio &
@@ -158,7 +159,7 @@ runs:
             echo "::error::spiceio exited unexpectedly"
             exit 1
           fi
-          ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | head -1 || true)
+          ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
           if [[ -n "$ENDPOINT" ]] && curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
             echo "spiceio ready at $ENDPOINT (PID $PID)"
             echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"

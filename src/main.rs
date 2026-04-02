@@ -101,11 +101,16 @@ async fn main() {
             match TcpListener::bind(addr).await {
                 Ok(l) => break (l, addr),
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    let next = addr.port().checked_add(1).expect("port range exhausted");
-                    if next - start_port > 100 {
-                        serr!("no available port in range {start_port}–{}", next - 1);
-                        std::process::exit(1);
-                    }
+                    let next = match addr.port().checked_add(1) {
+                        Some(n) if n - start_port <= 100 => n,
+                        _ => {
+                            serr!(
+                                "no available port in range {start_port}–{}",
+                                addr.port()
+                            );
+                            std::process::exit(1);
+                        }
+                    };
                     addr.set_port(next);
                 }
                 Err(e) => {
