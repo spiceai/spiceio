@@ -5,6 +5,8 @@
 pub mod auth;
 pub mod client;
 pub mod ops;
+pub mod pool;
 pub mod protocol;
 
 pub use client::SmbClient;
+pub use pool::SmbPool;

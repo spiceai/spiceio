@@ -22,6 +22,8 @@ pub struct SmbConfig {
     pub password: String,
     pub domain: String,
     pub workstation: String,
+    /// Cap for standalone read/write I/O (0 = use DEFAULT_MAX_IO).
+    pub max_io_size: u32,
 }
 
 impl SmbConfig {
@@ -30,14 +32,28 @@ impl SmbConfig {
     }
 }
 
+/// Default I/O cap for standalone (non-compound) read/write operations.
+/// Many NAS servers advertise multi-MB maximums in negotiate but fail at sizes
+/// well below the advertised limit. 64 KB is the safe conservative default;
+/// override via `SPICEIO_SMB_MAX_IO` for servers that handle larger I/O
+/// (e.g., Windows Server, enterprise NAS). Even at 64 KB the connection pool
+/// and pipelined reads still deliver major throughput gains.
+const DEFAULT_MAX_IO: u32 = 65536;
+
 /// An authenticated SMB2 session.
 pub struct SmbClient {
     stream: Mutex<TcpStream>,
     message_id: AtomicU64,
     session_id: u64,
     config: SmbConfig,
+    /// Effective max read size for standalone (non-compound) reads.
     pub max_read_size: u32,
+    /// Effective max write size for standalone (non-compound) writes.
     pub max_write_size: u32,
+    /// Capped max for compound operations (64KB — some NAS servers reject
+    /// larger payloads inside compound requests).
+    pub compound_max_read_size: u32,
+    pub compound_max_write_size: u32,
     /// 16-byte client GUID
     client_guid: [u8; 16],
     /// SMB 3.1.1 signing key (derived after auth)
@@ -60,6 +76,34 @@ impl SmbClient {
         };
         stream.set_nodelay(true)?;
 
+        // Enlarge socket buffers to 1 MB for large read/write throughput.
+        {
+            use std::os::fd::AsRawFd;
+
+            unsafe extern "C" {
+                fn setsockopt(
+                    socket: i32,
+                    level: i32,
+                    option_name: i32,
+                    option_value: *const u8,
+                    option_len: u32,
+                ) -> i32;
+            }
+
+            const SOL_SOCKET: i32 = 0xffff;
+            const SO_SNDBUF: i32 = 0x1001;
+            const SO_RCVBUF: i32 = 0x1002;
+
+            let fd = stream.as_raw_fd();
+            let buf_size: i32 = 1024 * 1024;
+            let ptr = std::ptr::from_ref(&buf_size).cast();
+            let len = size_of::<i32>() as u32;
+            unsafe {
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, ptr, len);
+                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, ptr, len);
+            }
+        }
+
         let mut client_guid = [0u8; 16];
         unsafe extern "C" {
             fn arc4random_buf(buf: *mut u8, nbytes: usize);
@@ -76,6 +120,8 @@ impl SmbClient {
             config,
             max_read_size: 65536,
             max_write_size: 65536,
+            compound_max_read_size: 65536,
+            compound_max_write_size: 65536,
             client_guid,
             signing_key: None,
         };
@@ -176,10 +222,16 @@ impl SmbClient {
             crate::serr!("[spiceio] smb invalid negotiate response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
+        let io_cap = if self.config.max_io_size > 0 {
+            self.config.max_io_size
+        } else {
+            DEFAULT_MAX_IO
+        };
         crate::slog!(
-            "[spiceio] negotiated SMB 0x{:04X}, max_rw={}K",
+            "[spiceio] negotiated SMB 0x{:04X}, server_max={}K io_cap={}K",
             neg_resp.dialect_revision,
-            neg_resp.max_write_size.min(65536) / 1024,
+            neg_resp.max_read_size / 1024,
+            io_cap / 1024,
         );
 
         // ── Step 2: Session Setup (NTLM Negotiate) ──
@@ -246,10 +298,20 @@ impl SmbClient {
         crate::slog!("[spiceio] authenticated, signing key derived");
 
         self.session_id = resp_hdr.session_id;
-        // Cap at 64KB — the maximum reliably supported by common NAS servers.
-        // Some servers advertise larger max sizes but fail on compound requests.
-        self.max_read_size = neg_resp.max_read_size.min(65536);
-        self.max_write_size = neg_resp.max_write_size.min(65536);
+        // Cap standalone I/O by: min(server_advertised, max_transact, configured_cap).
+        // Many NAS servers advertise multi-MB limits but fail at much smaller sizes.
+        let transact = neg_resp.max_transact_size;
+        let io_cap = if self.config.max_io_size > 0 {
+            self.config.max_io_size
+        } else {
+            DEFAULT_MAX_IO
+        };
+        self.max_read_size = neg_resp.max_read_size.min(transact).min(io_cap);
+        self.max_write_size = neg_resp.max_write_size.min(transact).min(io_cap);
+        // Cap at 64KB for compound requests — some NAS servers reject larger
+        // payloads inside compound (chained) operations.
+        self.compound_max_read_size = self.max_read_size.min(65536);
+        self.compound_max_write_size = self.max_write_size.min(65536);
         self.signing_key = Some(signing_key);
         Ok(())
     }
@@ -385,6 +447,101 @@ impl SmbClient {
             crate::serr!("[spiceio] smb invalid read response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
         })
+    }
+
+    /// Pipelined read: send `count` read requests, then receive all responses.
+    ///
+    /// Holds the stream lock for the entire batch, eliminating per-request
+    /// round-trip latency. Returns chunks in offset order. Stops early on EOF.
+    pub async fn pipelined_read(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        start_offset: u64,
+        chunk_size: u32,
+        count: usize,
+    ) -> io::Result<Vec<bytes::Bytes>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build all request packets
+        let mut packets = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = start_offset + (i as u64) * (chunk_size as u64);
+            let msg_id = self.next_message_id();
+            let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(chunk_size);
+            hdr.session_id = self.session_id;
+            hdr.tree_id = tree_id;
+            let packet = build_request(&hdr, |buf| {
+                encode_read_request(buf, file_id, offset, chunk_size);
+            });
+            packets.push(packet);
+        }
+
+        let mut stream = self.stream.lock().await;
+
+        // Send all requests
+        for packet in &packets {
+            if let Some(ref key) = self.signing_key {
+                let mut signed = packet.to_vec();
+                sign_packet(&mut signed, key);
+                stream.write_all(&signed).await?;
+            } else {
+                stream.write_all(packet).await?;
+            }
+        }
+        stream.flush().await?;
+
+        // Receive all responses
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            loop {
+                let mut len_buf = [0u8; 4];
+                stream.read_exact(&mut len_buf).await?;
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+                if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid SMB2 message length: {msg_len}"),
+                    ));
+                }
+
+                let mut msg = vec![0u8; msg_len];
+                stream.read_exact(&mut msg).await?;
+
+                let header = Header::decode(&msg).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
+                })?;
+
+                // Skip STATUS_PENDING interim responses
+                if header.status == 0x0000_0103 {
+                    continue;
+                }
+
+                let status = NtStatus::from_u32(header.status);
+                if status == NtStatus::EndOfFile {
+                    // EOF — no more data, return what we have
+                    return Ok(results);
+                }
+                if status.is_error() {
+                    return Err(io::Error::other(format!(
+                        "pipelined read failed: 0x{:08X}",
+                        header.status
+                    )));
+                }
+
+                let body = msg[SMB2_HEADER_SIZE..].to_vec();
+                let data = decode_read_response_owned(body).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
+                })?;
+                results.push(data);
+                break;
+            }
+        }
+
+        Ok(results)
     }
 
     /// Write to an open file.

@@ -6,15 +6,21 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::client::SmbClient;
+use super::pool::SmbPool;
 use super::protocol::*;
 
-/// A connected share session wrapping the SMB client + tree ID.
+/// A connected share session backed by a pool of SMB connections.
+///
+/// Each operation picks a connection from the pool via round-robin, so
+/// concurrent S3 requests fan out across multiple TCP streams instead of
+/// serializing on a single mutex.
 pub struct ShareSession {
-    client: Arc<SmbClient>,
-    tree_id: u32,
+    pool: Arc<SmbPool>,
+    tree_ids: Vec<u32>,
 }
 
 /// An open file handle for streaming reads or writes.
+/// Pinned to the specific connection that opened the file.
 pub struct FileHandle {
     client: Arc<SmbClient>,
     tree_id: u32,
@@ -25,31 +31,47 @@ pub struct FileHandle {
 }
 
 impl ShareSession {
-    pub async fn connect(client: Arc<SmbClient>, share: &str) -> io::Result<Self> {
-        let tree_id = client.tree_connect(share).await?;
-        Ok(Self { client, tree_id })
+    /// Connect to a share on every connection in the pool.
+    pub async fn connect(pool: Arc<SmbPool>, share: &str) -> io::Result<Self> {
+        let mut tree_ids = Vec::with_capacity(pool.size());
+        for i in 0..pool.size() {
+            let client = &pool.clients()[i];
+            let tree_id = client.tree_connect(share).await?;
+            tree_ids.push(tree_id);
+        }
+        Ok(Self { pool, tree_ids })
     }
 
-    pub fn max_read_size(&self) -> u32 {
-        self.client.max_read_size
+    /// Pick the next connection + tree_id via round-robin.
+    fn pick(&self) -> (&Arc<SmbClient>, u32) {
+        let idx = self.pool.next_index() % self.pool.size();
+        (self.pool.client(idx), self.tree_ids[idx])
     }
 
-    pub fn max_write_size(&self) -> u32 {
-        self.client.max_write_size
+    /// Max read size for compound operations (64KB cap for compatibility).
+    /// Used by the S3 layer to decide compound vs. streaming path.
+    pub fn compound_max_read_size(&self) -> u32 {
+        self.pool.compound_max_read_size
+    }
+
+    /// Max write size for compound operations (64KB cap for compatibility).
+    /// Used by the S3 layer to decide compound vs. streaming path.
+    pub fn compound_max_write_size(&self) -> u32 {
+        self.pool.compound_max_write_size
     }
 
     /// Compound Create+Read+Close. Returns metadata and data bytes.
     /// File handle is already closed on return. For files larger than
-    /// `max_read`, only the first chunk is returned.
+    /// `compound_max_read_size`, only the first chunk is returned.
     pub async fn get_object_compound(
         &self,
         key: &str,
         max_read: u32,
     ) -> io::Result<(ObjectMeta, Bytes)> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let (cr, data) = self
-            .client
-            .create_read_close(self.tree_id, &smb_path, max_read)
+        let (cr, data) = client
+            .create_read_close(tree_id, &smb_path, max_read)
             .await?;
 
         let meta = ObjectMeta {
@@ -64,13 +86,13 @@ impl ShareSession {
 
     // ── Streaming file operations ───────────────────────────────────────
 
-    /// Open a file for streaming reads. Returns a handle that can read chunks.
+    /// Open a file for streaming reads. Returns a handle pinned to one connection.
     pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let file = self
-            .client
+        let file = client
             .create(
-                self.tree_id,
+                tree_id,
                 &smb_path,
                 DesiredAccess::GenericRead as u32,
                 ShareAccess::Read as u32,
@@ -87,24 +109,25 @@ impl ShareSession {
         };
 
         Ok(FileHandle {
-            client: Arc::clone(&self.client),
-            tree_id: self.tree_id,
+            client: Arc::clone(client),
+            tree_id,
             file_id: file.file_id,
             file_size: file.file_size,
-            max_chunk: self.client.max_read_size,
+            max_chunk: self.pool.max_read_size,
             meta,
         })
     }
 
-    /// Open (or create) a file for streaming writes.
+    /// Open (or create) a file for streaming writes. Handle pinned to one connection.
     pub async fn open_write(&self, key: &str) -> io::Result<FileHandle> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs(&smb_path).await?;
+        self.ensure_parent_dirs_on(client, tree_id, &smb_path)
+            .await?;
 
-        let file = self
-            .client
+        let file = client
             .create(
-                self.tree_id,
+                tree_id,
                 &smb_path,
                 DesiredAccess::GenericWrite as u32,
                 ShareAccess::Read as u32,
@@ -124,11 +147,11 @@ impl ShareSession {
         };
 
         Ok(FileHandle {
-            client: Arc::clone(&self.client),
-            tree_id: self.tree_id,
+            client: Arc::clone(client),
+            tree_id,
             file_id: file.file_id,
             file_size: 0,
-            max_chunk: self.client.max_write_size,
+            max_chunk: self.pool.max_write_size,
             meta,
         })
     }
@@ -141,14 +164,14 @@ impl ShareSession {
         prefix: &str,
         delimiter: Option<&str>,
     ) -> io::Result<(Vec<ObjectInfo>, Vec<String>)> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(prefix);
         let (dir_path, pattern) = split_dir_pattern(&smb_path);
 
         // Open the directory
-        let dir = self
-            .client
+        let dir = client
             .create(
-                self.tree_id,
+                tree_id,
                 &dir_path,
                 DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
                 ShareAccess::All as u32,
@@ -157,13 +180,12 @@ impl ShareSession {
             )
             .await?;
 
-        let entries = self
-            .client
-            .query_directory(self.tree_id, &dir.file_id, &pattern)
+        let entries = client
+            .query_directory(tree_id, &dir.file_id, &pattern)
             .await;
 
         // Close directory handle regardless
-        let _ = self.client.close(self.tree_id, &dir.file_id).await;
+        let _ = client.close(tree_id, &dir.file_id).await;
 
         let entries = entries?;
 
@@ -202,13 +224,14 @@ impl ShareSession {
     /// Get object (file) content. Uses compound Create+Read+Close for files
     /// that fit in one read chunk, falling back to sequential for larger files.
     pub async fn get_object(&self, key: &str) -> io::Result<(ObjectMeta, Vec<u8>)> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let max_read = self.client.max_read_size;
+        let compound_max = self.pool.compound_max_read_size;
+        let max_read = self.pool.max_read_size;
 
-        // Compound: Create+Read+Close in 1 round trip
-        let (cr, first_chunk) = self
-            .client
-            .create_read_close(self.tree_id, &smb_path, max_read)
+        // Compound: Create+Read+Close in 1 round trip (uses compound cap)
+        let (cr, first_chunk) = client
+            .create_read_close(tree_id, &smb_path, compound_max)
             .await?;
 
         let meta = ObjectMeta {
@@ -224,10 +247,9 @@ impl ShareSession {
         }
 
         // Large file — re-open and read sequentially
-        let file = self
-            .client
+        let file = client
             .create(
-                self.tree_id,
+                tree_id,
                 &smb_path,
                 DesiredAccess::GenericRead as u32,
                 ShareAccess::Read as u32,
@@ -239,9 +261,8 @@ impl ShareSession {
         let mut data = Vec::with_capacity(cr.file_size as usize);
         let mut offset = 0u64;
         loop {
-            let chunk = self
-                .client
-                .read(self.tree_id, &file.file_id, offset, max_read)
+            let chunk = client
+                .read(tree_id, &file.file_id, offset, max_read)
                 .await?;
             if chunk.is_empty() {
                 break;
@@ -253,24 +274,24 @@ impl ShareSession {
             }
         }
 
-        let _ = self.client.close(self.tree_id, &file.file_id).await;
+        let _ = client.close(tree_id, &file.file_id).await;
         Ok((meta, data))
     }
 
     /// Put object (write file). Uses compound Create+Write+Close for small
     /// files, falling back to sequential for larger files.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs(&smb_path).await?;
+        self.ensure_parent_dirs_on(client, tree_id, &smb_path)
+            .await?;
 
-        let chunk_size = self.client.max_write_size as usize;
+        let compound_max = self.pool.compound_max_write_size as usize;
+        let chunk_size = self.pool.max_write_size as usize;
 
-        if data.len() <= chunk_size {
+        if data.len() <= compound_max {
             // Compound Create+Write+Close — 1 round trip, metadata from Close
-            let cl = self
-                .client
-                .create_write_close(self.tree_id, &smb_path, data)
-                .await?;
+            let cl = client.create_write_close(tree_id, &smb_path, data).await?;
             return Ok(ObjectMeta {
                 size: data.len() as u64,
                 last_modified: filetime_to_epoch_secs(cl.last_write_time),
@@ -280,10 +301,9 @@ impl ShareSession {
         }
 
         // Large file — sequential write
-        let file = self
-            .client
+        let file = client
             .create(
-                self.tree_id,
+                tree_id,
                 &smb_path,
                 DesiredAccess::GenericWrite as u32,
                 ShareAccess::Read as u32,
@@ -294,13 +314,11 @@ impl ShareSession {
 
         let mut offset = 0u64;
         for chunk in data.chunks(chunk_size) {
-            self.client
-                .write(self.tree_id, &file.file_id, offset, chunk)
-                .await?;
+            client.write(tree_id, &file.file_id, offset, chunk).await?;
             offset += chunk.len() as u64;
         }
 
-        let _ = self.client.close(self.tree_id, &file.file_id).await;
+        let _ = client.close(tree_id, &file.file_id).await;
 
         let meta = self.head_object(key).await?;
         Ok(ObjectMeta {
@@ -313,11 +331,11 @@ impl ShareSession {
 
     /// Delete an object. Compound Create(DELETE_ON_CLOSE)+Close in 1 round trip.
     pub async fn delete_object(&self, key: &str) -> io::Result<()> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let _ = self
-            .client
+        let _ = client
             .create_close(
-                self.tree_id,
+                tree_id,
                 &smb_path,
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
@@ -330,11 +348,11 @@ impl ShareSession {
 
     /// Head object (metadata only). Compound Create+Close in 1 round trip.
     pub async fn head_object(&self, key: &str) -> io::Result<ObjectMeta> {
+        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let (cr, _) = self
-            .client
+        let (cr, _) = client
             .create_close(
-                self.tree_id,
+                tree_id,
                 &smb_path,
                 DesiredAccess::ReadAttributes as u32,
                 ShareAccess::All as u32,
@@ -365,21 +383,20 @@ impl ShareSession {
 
     /// Write a temp part file for multipart upload.
     pub async fn write_temp(&self, smb_path: &str, data: &[u8]) -> io::Result<()> {
-        self.ensure_parent_dirs(smb_path).await?;
+        let (client, tree_id) = self.pick();
+        self.ensure_parent_dirs_on(client, tree_id, smb_path)
+            .await?;
 
-        let chunk_size = self.client.max_write_size as usize;
-        if data.len() <= chunk_size {
-            let _ = self
-                .client
-                .create_write_close(self.tree_id, smb_path, data)
-                .await?;
+        let compound_max = self.pool.compound_max_write_size as usize;
+        let chunk_size = self.pool.max_write_size as usize;
+        if data.len() <= compound_max {
+            let _ = client.create_write_close(tree_id, smb_path, data).await?;
             return Ok(());
         }
 
-        let file = self
-            .client
+        let file = client
             .create(
-                self.tree_id,
+                tree_id,
                 smb_path,
                 DesiredAccess::GenericWrite as u32,
                 ShareAccess::Read as u32,
@@ -390,22 +407,21 @@ impl ShareSession {
 
         let mut offset = 0u64;
         for chunk in data.chunks(chunk_size) {
-            self.client
-                .write(self.tree_id, &file.file_id, offset, chunk)
-                .await?;
+            client.write(tree_id, &file.file_id, offset, chunk).await?;
             offset += chunk.len() as u64;
         }
 
-        let _ = self.client.close(self.tree_id, &file.file_id).await;
+        let _ = client.close(tree_id, &file.file_id).await;
         Ok(())
     }
 
     /// Read a temp file.
     pub async fn read_temp(&self, smb_path: &str) -> io::Result<Vec<u8>> {
-        let max_read = self.client.max_read_size;
-        let (cr, first_chunk) = self
-            .client
-            .create_read_close(self.tree_id, smb_path, max_read)
+        let (client, tree_id) = self.pick();
+        let compound_max = self.pool.compound_max_read_size;
+        let max_read = self.pool.max_read_size;
+        let (cr, first_chunk) = client
+            .create_read_close(tree_id, smb_path, compound_max)
             .await?;
 
         if cr.file_size <= first_chunk.len() as u64 {
@@ -413,10 +429,9 @@ impl ShareSession {
         }
 
         // Large temp file — re-open and read sequentially
-        let file = self
-            .client
+        let file = client
             .create(
-                self.tree_id,
+                tree_id,
                 smb_path,
                 DesiredAccess::GenericRead as u32,
                 ShareAccess::Read as u32,
@@ -428,9 +443,8 @@ impl ShareSession {
         let mut data = Vec::with_capacity(cr.file_size as usize);
         let mut offset = 0u64;
         loop {
-            let chunk = self
-                .client
-                .read(self.tree_id, &file.file_id, offset, max_read)
+            let chunk = client
+                .read(tree_id, &file.file_id, offset, max_read)
                 .await?;
             if chunk.is_empty() {
                 break;
@@ -442,21 +456,25 @@ impl ShareSession {
             }
         }
 
-        let _ = self.client.close(self.tree_id, &file.file_id).await;
+        let _ = client.close(tree_id, &file.file_id).await;
         Ok(data)
     }
 
     /// Delete a temp file (best effort).
     pub async fn delete_temp(&self, smb_path: &str) {
-        let _ = self.delete_object_path(smb_path).await;
+        let (client, tree_id) = self.pick();
+        let _ = Self::delete_object_path_on(client, tree_id, smb_path).await;
     }
 
     /// Delete by SMB path directly. Compound Create+Close in 1 round trip.
-    async fn delete_object_path(&self, smb_path: &str) -> io::Result<()> {
-        let _ = self
-            .client
+    async fn delete_object_path_on(
+        client: &SmbClient,
+        tree_id: u32,
+        smb_path: &str,
+    ) -> io::Result<()> {
+        let _ = client
             .create_close(
-                self.tree_id,
+                tree_id,
                 smb_path,
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
@@ -469,10 +487,10 @@ impl ShareSession {
 
     /// Try to remove an empty directory (best effort). Compound Create+Close.
     pub async fn remove_dir(&self, smb_path: &str) {
-        let _ = self
-            .client
+        let (client, tree_id) = self.pick();
+        let _ = client
             .create_close(
-                self.tree_id,
+                tree_id,
                 smb_path,
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
@@ -482,9 +500,13 @@ impl ShareSession {
             .await;
     }
 
-    /// Ensure parent directories exist for a given path.
-    /// Batches all Create+Close pairs into a single compound round trip.
-    async fn ensure_parent_dirs(&self, smb_path: &str) -> io::Result<()> {
+    /// Ensure parent directories exist for a given path on a specific connection.
+    async fn ensure_parent_dirs_on(
+        &self,
+        client: &SmbClient,
+        tree_id: u32,
+        smb_path: &str,
+    ) -> io::Result<()> {
         let parts: Vec<&str> = smb_path.split('\\').collect();
         if parts.len() <= 1 {
             return Ok(());
@@ -500,15 +522,34 @@ impl ShareSession {
             dirs.push(current.clone());
         }
 
-        self.client.ensure_dirs(self.tree_id, &dirs).await
+        client.ensure_dirs(tree_id, &dirs).await
     }
 }
+
+/// Number of read requests to pipeline in a single batch.
+const PIPELINE_DEPTH: usize = 8;
 
 impl FileHandle {
     /// Read a chunk at the given offset. Returns empty bytes at EOF.
     pub async fn read_chunk(&self, offset: u64, len: u32) -> io::Result<Bytes> {
         self.client
             .read(self.tree_id, &self.file_id, offset, len)
+            .await
+    }
+
+    /// Pipelined read: send multiple read requests in one batch, then collect
+    /// all responses. Returns chunks in offset order. Stops early on EOF.
+    pub async fn read_pipeline(
+        &self,
+        offset: u64,
+        chunk_size: u32,
+        remaining: u64,
+    ) -> io::Result<Vec<Bytes>> {
+        let count = remaining
+            .div_ceil(chunk_size as u64)
+            .min(PIPELINE_DEPTH as u64) as usize;
+        self.client
+            .pipelined_read(self.tree_id, &self.file_id, offset, chunk_size, count)
             .await
     }
 

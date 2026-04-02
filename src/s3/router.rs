@@ -427,7 +427,7 @@ async fn handle_get_object(
     // ── Fast path: compound Create+Read+Close for small files ───────
     // Tries to read the entire file in one SMB round trip. Falls back to
     // streaming for large files or range requests.
-    let max_read = share.max_read_size();
+    let max_read = share.compound_max_read_size();
     let no_range = range_header.is_none();
 
     if no_range {
@@ -595,19 +595,26 @@ async fn handle_get_object(
     let (body, tx) = SpiceioBody::channel(4);
     let chunk_size = handle.max_chunk;
 
-    // Spawn background task to stream SMB reads into the channel
+    // Spawn background task to stream pipelined SMB reads into the channel.
+    // Sends batches of read requests to fill the network pipe, then pushes
+    // each chunk to the HTTP response body as it arrives.
     tokio::spawn(async move {
         let mut offset = start;
         let stream_end = end + 1;
-        while offset < stream_end {
-            let to_read = ((stream_end - offset) as u32).min(chunk_size);
-            match handle.read_chunk(offset, to_read).await {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => {
-                    offset += chunk.len() as u64;
-                    if tx.send(chunk).await.is_err() {
-                        crate::serr!("[spiceio] getobject client disconnected");
-                        break;
+        'outer: while offset < stream_end {
+            let remaining = stream_end - offset;
+            match handle.read_pipeline(offset, chunk_size, remaining).await {
+                Ok(chunks) if chunks.is_empty() => break,
+                Ok(chunks) => {
+                    for chunk in chunks {
+                        if chunk.is_empty() {
+                            break 'outer;
+                        }
+                        offset += chunk.len() as u64;
+                        if tx.send(chunk).await.is_err() {
+                            crate::serr!("[spiceio] getobject client disconnected");
+                            break 'outer;
+                        }
                     }
                 }
                 Err(e) => {
@@ -671,7 +678,7 @@ async fn handle_put_object(
     // ── Fast path: collect small bodies and use compound write ──────
     let content_length: Option<u64> =
         get_header(hdrs, "content-length").and_then(|s| s.parse().ok());
-    let max_write = share.max_write_size() as u64;
+    let max_write = share.compound_max_write_size() as u64;
 
     if let Some(cl) = content_length
         && cl <= max_write
