@@ -92,6 +92,32 @@ async fn main() {
 
     let config = Config::from_env();
 
+    // Bind TCP listener early (before SMB setup). If the port is taken,
+    // auto-increment until an available port is found.
+    let (listener, bind_addr) = {
+        let mut addr = config.bind_addr;
+        let start_port = addr.port();
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(l) => break (l, addr),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    let next = match addr.port().checked_add(1) {
+                        Some(n) if n - start_port <= 100 => n,
+                        _ => {
+                            serr!("no available port in range {start_port}–{}", addr.port());
+                            std::process::exit(1);
+                        }
+                    };
+                    addr.set_port(next);
+                }
+                Err(e) => {
+                    serr!("failed to bind TCP listener: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
     slog!(
         "[spiceio] connecting to smb://****@{}:{}/{} ({}x)",
         config.smb_server,
@@ -127,13 +153,6 @@ async fn main() {
         region: config.region.clone(),
         multipart: MultipartStore::new(),
     });
-
-    let bind_addr = config.bind_addr;
-
-    // Bind TCP listener
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .expect("failed to bind TCP listener");
 
     slog!("[spiceio] listening on http://{bind_addr}");
     slog!(
