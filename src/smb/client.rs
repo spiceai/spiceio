@@ -518,7 +518,7 @@ impl SmbClient {
 
         let total: usize = sizes.iter().sum();
         let mut buf = BytesMut::with_capacity(4 + total);
-        buf.put_u32(total as u32); // NetBIOS length (big-endian)
+        buf.put_u32((total as u32) & 0x00FF_FFFF); // NetBIOS length (big-endian, masked to 24 bits)
 
         for (i, (mut header, body)) in requests.into_iter().enumerate() {
             let body_len = body.len();
@@ -620,6 +620,12 @@ impl SmbClient {
         }
         let cr = decode_create_response(&resp[0].1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))?;
+        if NtStatus::from_u32(resp[1].0.status).is_error() {
+            crate::serr!(
+                "[spiceio] smb compound close failed: 0x{:08X}",
+                resp[1].0.status
+            );
+        }
         let cl = decode_close_response(&resp[1].1).unwrap_or(CloseResponse {
             last_write_time: cr.last_write_time,
             file_size: cr.file_size,
@@ -899,7 +905,18 @@ fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
 
         let next = header.next_command as usize;
         let body_start = offset + SMB2_HEADER_SIZE;
-        let body_end = if next > 0 { offset + next } else { msg.len() };
+        let body_end = if next > 0 {
+            let end = offset + next;
+            if end > msg.len() || end < body_start {
+                break;
+            }
+            end
+        } else {
+            msg.len()
+        };
+        if body_start > body_end || body_end > msg.len() {
+            break;
+        }
 
         let body = msg[body_start..body_end].to_vec();
         results.push((header, body));

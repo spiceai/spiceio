@@ -60,12 +60,26 @@ pub fn parse_range(header: &str) -> Option<RangeSpec> {
 
 impl RangeSpec {
     /// Resolve to absolute byte positions given total file size.
-    pub fn resolve(&self, total: u64) -> (u64, u64) {
+    /// Returns `None` if `total == 0` or `start >= total`.
+    pub fn resolve(&self, total: u64) -> Option<(u64, u64)> {
+        if total == 0 {
+            return None;
+        }
         match (self.start, self.end) {
-            (Some(s), Some(e)) => (s, e.min(total - 1)),
-            (Some(s), None) => (s, total - 1),
-            (None, Some(suffix)) => (total.saturating_sub(suffix), total - 1),
-            (None, None) => (0, total - 1),
+            (Some(s), Some(e)) => {
+                if s >= total {
+                    return None;
+                }
+                Some((s, e.min(total - 1)))
+            }
+            (Some(s), None) => {
+                if s >= total {
+                    return None;
+                }
+                Some((s, total - 1))
+            }
+            (None, Some(suffix)) => Some((total.saturating_sub(suffix), total - 1)),
+            (None, None) => Some((0, total - 1)),
         }
     }
 }
@@ -199,7 +213,7 @@ mod tests {
             start: Some(0),
             end: Some(99),
         };
-        assert_eq!(r.resolve(100), (0, 99));
+        assert_eq!(r.resolve(100), Some((0, 99)));
     }
 
     #[test]
@@ -208,7 +222,7 @@ mod tests {
             start: Some(0),
             end: Some(999),
         };
-        assert_eq!(r.resolve(100), (0, 99));
+        assert_eq!(r.resolve(100), Some((0, 99)));
     }
 
     #[test]
@@ -217,7 +231,7 @@ mod tests {
             start: Some(50),
             end: None,
         };
-        assert_eq!(r.resolve(100), (50, 99));
+        assert_eq!(r.resolve(100), Some((50, 99)));
     }
 
     #[test]
@@ -226,7 +240,7 @@ mod tests {
             start: None,
             end: Some(10),
         };
-        assert_eq!(r.resolve(100), (90, 99));
+        assert_eq!(r.resolve(100), Some((90, 99)));
     }
 
     #[test]
@@ -235,7 +249,25 @@ mod tests {
             start: None,
             end: Some(200),
         };
-        assert_eq!(r.resolve(100), (0, 99));
+        assert_eq!(r.resolve(100), Some((0, 99)));
+    }
+
+    #[test]
+    fn resolve_zero_total() {
+        let r = RangeSpec {
+            start: Some(0),
+            end: Some(99),
+        };
+        assert_eq!(r.resolve(0), None);
+    }
+
+    #[test]
+    fn resolve_start_past_end() {
+        let r = RangeSpec {
+            start: Some(200),
+            end: None,
+        };
+        assert_eq!(r.resolve(100), None);
     }
 
     // ── parse_http_date ──────────────────────────────────────────────

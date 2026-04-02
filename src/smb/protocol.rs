@@ -28,18 +28,18 @@ pub enum Command {
 
 // ── NT Status codes we care about ───────────────────────────────────────────
 
-#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NtStatus {
-    Success = 0x00000000,
-    MoreProcessingRequired = 0xC0000016,
-    NoSuchFile = 0xC000000F,
-    ObjectNameNotFound = 0xC0000034,
-    ObjectNameCollision = 0xC0000035,
-    AccessDenied = 0xC0000022,
-    EndOfFile = 0xC0000011,
-    NoMoreFiles = 0x80000006,
-    ObjectPathNotFound = 0xC000003A,
+    Success,
+    MoreProcessingRequired,
+    NoSuchFile,
+    ObjectNameNotFound,
+    ObjectNameCollision,
+    AccessDenied,
+    EndOfFile,
+    NoMoreFiles,
+    ObjectPathNotFound,
+    Unknown(u32),
 }
 
 impl NtStatus {
@@ -54,20 +54,24 @@ impl NtStatus {
             0xC0000011 => Self::EndOfFile,
             0x80000006 => Self::NoMoreFiles,
             0xC000003A => Self::ObjectPathNotFound,
-            other => {
-                // Treat unknown as success if zero high-bit, else generic error
-                if other == 0 {
-                    Self::Success
-                } else {
-                    // store as-is via MoreProcessingRequired trick — caller checks raw
-                    Self::AccessDenied
-                }
-            }
+            other => Self::Unknown(other),
         }
     }
 
     pub fn is_error(self) -> bool {
-        (self as u32) & 0xC0000000 == 0xC0000000
+        let code = match self {
+            Self::Success => 0x00000000,
+            Self::MoreProcessingRequired => 0xC0000016,
+            Self::NoSuchFile => 0xC000000F,
+            Self::ObjectNameNotFound => 0xC0000034,
+            Self::ObjectNameCollision => 0xC0000035,
+            Self::AccessDenied => 0xC0000022,
+            Self::EndOfFile => 0xC0000011,
+            Self::NoMoreFiles => 0x80000006,
+            Self::ObjectPathNotFound => 0xC000003A,
+            Self::Unknown(v) => v,
+        };
+        code & 0xC0000000 == 0xC0000000
     }
 }
 
@@ -377,7 +381,7 @@ pub fn encode_create_request(
     // StructureSize for Create request is 57
     buf.put_u16_le(57); // StructureSize
     buf.put_u8(0); // SecurityFlags
-    buf.put_u8(0x02); // RequestedOplockLevel: SMB2_OPLOCK_LEVEL_NONE = 0, BATCH=0x09, LEASE=0xFF, let's try none
+    buf.put_u8(0x00); // RequestedOplockLevel: SMB2_OPLOCK_LEVEL_NONE
     buf.put_u32_le(0x00000002); // ImpersonationLevel: Impersonation
     buf.put_u64_le(0); // SmbCreateFlags
     buf.put_u64_le(0); // Reserved
@@ -449,7 +453,7 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
     if body.len() < 17 {
         return None;
     }
-    let data_offset = (&body[2..3])[0] as usize;
+    let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = (&body[4..8]).get_u32_le() as usize;
 
     let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
@@ -651,7 +655,7 @@ pub fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
 pub fn frame_packet(header: &Header, body: &[u8]) -> BytesMut {
     let total = SMB2_HEADER_SIZE + body.len();
     let mut buf = BytesMut::with_capacity(4 + total);
-    buf.put_u32(total as u32); // NetBIOS length (big-endian, no flags)
+    buf.put_u32((total as u32) & 0x00FF_FFFF); // NetBIOS length (big-endian, masked to 24 bits)
     header.encode(&mut buf);
     buf.put_slice(body);
     buf

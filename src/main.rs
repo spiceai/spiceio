@@ -1,10 +1,5 @@
 //! spiceio — S3-compatible API proxy to SMB 3.1.1 file shares (macOS 26).
 
-mod crypto;
-mod log;
-mod s3;
-mod smb;
-
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -16,26 +11,16 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 
+use spiceio::log;
+use spiceio::s3;
+use spiceio::serr;
+use spiceio::slog;
+use spiceio::smb;
+
 use s3::multipart::MultipartStore;
 use s3::router::AppState;
 use smb::client::SmbConfig;
 use smb::ops::ShareSession;
-
-/// Log to stdout and optionally to a file (non-blocking).
-#[macro_export]
-macro_rules! slog {
-    ($($arg:tt)*) => {
-        $crate::log::emit(format_args!($($arg)*))
-    };
-}
-
-/// Log to stderr and optionally to a file (non-blocking).
-#[macro_export]
-macro_rules! serr {
-    ($($arg:tt)*) => {
-        $crate::log::emit_err(format_args!($($arg)*))
-    };
-}
 
 /// Runtime configuration parsed from environment variables.
 struct Config {
@@ -94,9 +79,15 @@ async fn main() {
 
     let config = Config::from_env();
 
+    let masked_user = if config.smb_username.is_empty() {
+        "***".to_string()
+    } else {
+        let first = &config.smb_username[..config.smb_username.chars().next().unwrap().len_utf8()];
+        format!("{first}***")
+    };
     slog!(
         "[spiceio] connecting to smb://{}@{}:{}/{}",
-        config.smb_username,
+        masked_user,
         config.smb_server,
         config.smb_port,
         config.smb_share

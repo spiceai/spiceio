@@ -571,8 +571,17 @@ async fn handle_get_object(
     // Determine read range
     let (start, end, is_range) = if let Some(ref range_str) = range_header {
         if let Some(range) = parse_range(range_str) {
-            let (s, e) = range.resolve(file_size);
-            (s, e, true)
+            match range.resolve(file_size) {
+                Some((s, e)) => (s, e, true),
+                None => {
+                    let _ = handle.close().await;
+                    return error_response(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "InvalidRange",
+                        "The requested range is not satisfiable",
+                    );
+                }
+            }
         } else {
             (0, file_size.saturating_sub(1), false)
         }
@@ -1042,7 +1051,7 @@ async fn handle_complete_multipart_upload(
     key: &str,
     upload_id: &str,
 ) -> Response<SpiceioBody> {
-    let upload = match state.multipart.complete(upload_id).await {
+    let upload = match state.multipart.get(upload_id).await {
         Some(u) => u,
         None => {
             return error_response(
@@ -1062,6 +1071,17 @@ async fn handle_complete_multipart_upload(
         })
         .collect();
 
+    // Validate all requested parts exist before assembly
+    for pn in &part_numbers {
+        if !upload.parts.contains_key(pn) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidPart",
+                &format!("Part {pn} not found"),
+            );
+        }
+    }
+
     // Concatenate parts in order and write the final object
     let mut final_data = Vec::new();
     for pn in &part_numbers {
@@ -1069,7 +1089,6 @@ async fn handle_complete_multipart_upload(
             match state.share.read_temp(&part.temp_path).await {
                 Ok(data) => final_data.extend_from_slice(&data),
                 Err(e) => {
-                    // Re-register the upload since we consumed it
                     return io_to_s3_error(&e);
                 }
             }
@@ -1082,9 +1101,14 @@ async fn handle_complete_multipart_upload(
         Err(e) => return io_to_s3_error(&e),
     };
 
+    // Only now remove the upload from the store
+    let upload = state.multipart.complete(upload_id).await;
+
     // Clean up temp files (best effort)
-    for part in upload.parts.values() {
-        state.share.delete_temp(&part.temp_path).await;
+    if let Some(upload) = upload {
+        for part in upload.parts.values() {
+            state.share.delete_temp(&part.temp_path).await;
+        }
     }
     let marker_path = format!("{}\\marker", MultipartStore::temp_dir(upload_id));
     state.share.delete_temp(&marker_path).await;
