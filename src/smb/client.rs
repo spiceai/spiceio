@@ -48,7 +48,16 @@ impl SmbClient {
     /// Connect to the SMB server and authenticate.
     pub async fn connect(config: SmbConfig) -> io::Result<Arc<Self>> {
         let addr = format!("{}:{}", config.server, config.port);
-        let stream = TcpStream::connect(&addr).await?;
+        let stream = match TcpStream::connect(&addr).await {
+            Ok(s) => {
+                crate::slog!("[spiceio] smb tcp connected: {addr}");
+                s
+            }
+            Err(e) => {
+                crate::serr!("[spiceio] smb tcp connect failed: {addr}: {e}");
+                return Err(e);
+            }
+        };
         stream.set_nodelay(true)?;
 
         let mut client_guid = [0u8; 16];
@@ -111,6 +120,7 @@ impl SmbClient {
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                crate::serr!("[spiceio] smb invalid message length: {msg_len}");
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid SMB2 message length: {msg_len}"),
@@ -120,8 +130,10 @@ impl SmbClient {
             let mut msg = vec![0u8; msg_len];
             stream.read_exact(&mut msg).await?;
 
-            let header = Header::decode(&msg)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+            let header = Header::decode(&msg).ok_or_else(|| {
+                crate::serr!("[spiceio] smb invalid header");
+                io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
+            })?;
 
             // STATUS_PENDING (0x00000103): server is still processing, wait for real response
             if header.status == 0x0000_0103 {
@@ -150,6 +162,7 @@ impl SmbClient {
 
         let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
+            crate::serr!("[spiceio] smb negotiate failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("negotiate failed: status=0x{:08X}", resp_hdr.status),
@@ -160,9 +173,10 @@ impl SmbClient {
         update_preauth_hash(&mut preauth_hash, &resp_raw);
 
         let neg_resp = decode_negotiate_response(&resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid negotiate response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
-        eprintln!(
+        crate::slog!(
             "[spiceio] negotiated SMB 0x{:04X}, max_rw={}K",
             neg_resp.dialect_revision,
             neg_resp.max_write_size.min(65536) / 1024,
@@ -187,13 +201,16 @@ impl SmbClient {
         update_preauth_hash(&mut preauth_hash, &resp_raw);
 
         let sess_resp = decode_session_setup_response(&resp_hdr, &resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid session setup response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid session setup response")
         })?;
 
         // Parse NTLM challenge from SPNEGO wrapper
         let challenge_data = auth::unwrap_spnego(&sess_resp.security_buffer);
-        let challenge = auth::parse_challenge_message(challenge_data)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid NTLM challenge"))?;
+        let challenge = auth::parse_challenge_message(challenge_data).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid NTLM challenge");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid NTLM challenge")
+        })?;
 
         // ── Step 3: Session Setup (NTLM Auth) ──
         let (ntlm_auth, session_base_key) = auth::build_authenticate_message(
@@ -217,6 +234,7 @@ impl SmbClient {
 
         let (resp_hdr, ..) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
+            crate::serr!("[spiceio] smb auth failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("authentication failed: status=0x{:08X}", resp_hdr.status),
@@ -225,7 +243,7 @@ impl SmbClient {
 
         // Derive the signing key
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
-        eprintln!("[spiceio] authenticated, signing key derived");
+        crate::slog!("[spiceio] authenticated, signing key derived");
 
         self.session_id = resp_hdr.session_id;
         // Cap at 64KB — the maximum reliably supported by common NAS servers.
@@ -250,6 +268,11 @@ impl SmbClient {
         let (resp_hdr, _resp_body) = self.send_recv(&packet).await?;
         let status = NtStatus::from_u32(resp_hdr.status);
         if status.is_error() {
+            crate::serr!(
+                "[spiceio] smb tree connect failed: '{}': 0x{:08X}",
+                share,
+                resp_hdr.status
+            );
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -259,6 +282,11 @@ impl SmbClient {
             ));
         }
 
+        crate::slog!(
+            "[spiceio] smb tree connected: \\\\{}\\{}",
+            self.config.server,
+            share
+        );
         Ok(resp_hdr.tree_id)
     }
 
@@ -294,8 +322,10 @@ impl SmbClient {
             return Err(smb_status_to_io_error(resp_hdr.status, path));
         }
 
-        decode_create_response(&resp_body)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))
+        decode_create_response(&resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid create response: {path}");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid create response")
+        })
     }
 
     /// Close a file handle.
@@ -312,6 +342,7 @@ impl SmbClient {
         let (resp_hdr, _) = self.send_recv(&packet).await?;
         let status = NtStatus::from_u32(resp_hdr.status);
         if status.is_error() {
+            crate::serr!("[spiceio] smb close failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::other(format!(
                 "close failed: 0x{:08X}",
                 resp_hdr.status
@@ -343,14 +374,17 @@ impl SmbClient {
             return Ok(bytes::Bytes::new());
         }
         if status.is_error() {
+            crate::serr!("[spiceio] smb read failed: 0x{:08X}", resp_hdr.status);
             return Err(io::Error::other(format!(
                 "read failed: 0x{:08X}",
                 resp_hdr.status
             )));
         }
 
-        decode_read_response_owned(resp_body)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid read response"))
+        decode_read_response_owned(resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid read response");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
+        })
     }
 
     /// Write to an open file.
@@ -374,6 +408,12 @@ impl SmbClient {
         // Check raw status: high two bits indicate severity
         // 0x00 = success, 0x40 = info, 0x80 = warning, 0xC0 = error
         if resp_hdr.status & 0xC000_0000 == 0xC000_0000 {
+            crate::serr!(
+                "[spiceio] smb write failed: 0x{:08X} offset={} len={}",
+                resp_hdr.status,
+                offset,
+                data.len()
+            );
             return Err(io::Error::other(format!(
                 "write failed: status=0x{:08X} offset={} len={}",
                 resp_hdr.status,
@@ -382,8 +422,10 @@ impl SmbClient {
             )));
         }
 
-        decode_write_response(&resp_body)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid write response"))
+        decode_write_response(&resp_body).ok_or_else(|| {
+            crate::serr!("[spiceio] smb invalid write response");
+            io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
+        })
     }
 
     /// List directory contents.
@@ -422,6 +464,10 @@ impl SmbClient {
                 break;
             }
             if status.is_error() {
+                crate::serr!(
+                    "[spiceio] smb query directory failed: 0x{:08X}",
+                    resp_hdr.status
+                );
                 return Err(io::Error::other(format!(
                     "query directory failed: 0x{:08X}",
                     resp_hdr.status
@@ -506,6 +552,7 @@ impl SmbClient {
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                crate::serr!("[spiceio] smb invalid message length: {msg_len}");
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid SMB2 message length: {msg_len}"),
@@ -797,6 +844,7 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
 }
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
+    crate::serr!("[spiceio] smb error 0x{status:08X}: {path}");
     // Map raw status codes directly to avoid losing info through NtStatus enum
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE

@@ -34,6 +34,7 @@ The binary requires these environment variables:
 - `SPICEIO_SMB_DOMAIN` — SMB domain (default empty)
 - `SPICEIO_BUCKET` — virtual S3 bucket name (defaults to `SPICEIO_SMB_SHARE`)
 - `SPICEIO_REGION` — AWS region to advertise (default `us-east-1`)
+- `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
 
 ## Architecture
 
