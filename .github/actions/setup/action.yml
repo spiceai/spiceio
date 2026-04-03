@@ -160,7 +160,7 @@ runs:
             exit 1
           fi
           ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
-          if [[ -n "$ENDPOINT" ]] && curl -s -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
+          if [[ -n "$ENDPOINT" ]] && curl -s -o /dev/null "$ENDPOINT/" 2>/dev/null; then
             echo "spiceio ready at $ENDPOINT (PID $PID)"
             echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
             exit 0
