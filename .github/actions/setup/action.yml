@@ -82,7 +82,7 @@ runs:
 
         # Check if spiceio is already listening on the requested address
         WANT_VERSION=$(spiceio --version | awk '{print $2}')
-        RUNNING_HEADER=$(curl -sf -I "http://${SPICEIO_BIND}/" 2>/dev/null | grep -i '^server:.*spiceio' | tr -d '\r' || true)
+        RUNNING_HEADER=$(curl -s -I "http://${SPICEIO_BIND}/" 2>/dev/null | grep -i '^server:.*spiceio' | tr -d '\r' || true)
         if [[ -n "$RUNNING_HEADER" ]]; then
           # Extract version from "Server: spiceio/X.Y.Z"; bare "Server: spiceio"
           # (no slash) means a pre-versioned build — treat as outdated.
@@ -160,7 +160,7 @@ runs:
             exit 1
           fi
           ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
-          if [[ -n "$ENDPOINT" ]] && curl -sf -I "$ENDPOINT/" 2>/dev/null | grep -qi "server: spiceio"; then
+          if [[ -n "$ENDPOINT" ]] && curl -fsS -o /dev/null "$ENDPOINT/" 2>/dev/null; then
             echo "spiceio ready at $ENDPOINT (PID $PID)"
             echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
             exit 0
