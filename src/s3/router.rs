@@ -706,15 +706,13 @@ async fn handle_put_object(
         }
     }
 
-    // ── Streaming path for large or unknown-size bodies ──────────
-    let handle = match share.open_write(key).await {
-        Ok(h) => h,
+    // ── Streaming path: buffered WAL write for large or unknown-size bodies ──
+    let mut wal = match share.open_wal_write(key).await {
+        Ok(w) => w,
         Err(e) => return io_to_s3_error(&e),
     };
 
-    let mut offset = 0u64;
     let mut body = req.into_body();
-    let mut total_size = 0u64;
     let mut write_err = None;
 
     while let Some(frame) = body.frame().await {
@@ -722,46 +720,34 @@ async fn handle_put_object(
             Ok(frame) => {
                 if let Ok(data) = frame.into_data()
                     && !data.is_empty()
+                    && let Err(e) = wal.write(&data).await
                 {
-                    let max_w = handle.max_chunk as usize;
-                    for chunk in data.chunks(max_w) {
-                        match handle.write_chunk(offset, chunk).await {
-                            Ok(written) => {
-                                offset += written as u64;
-                                total_size += written as u64;
-                            }
-                            Err(e) => {
-                                write_err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    if write_err.is_some() {
-                        break;
-                    }
+                    write_err = Some(e);
+                    break;
                 }
             }
             Err(e) => {
                 crate::serr!("[spiceio] putobject body read error: {e}");
-                let _ = handle.close().await;
+                wal.abort().await;
                 return io_to_s3_error(&io::Error::other(format!("body read error: {e}")));
             }
         }
     }
 
-    let _ = handle.close().await;
-
     if let Some(e) = write_err {
+        wal.abort().await;
         return io_to_s3_error(&e);
     }
 
-    let etag = match share.head_object(key).await {
-        Ok(meta) => meta.etag,
-        Err(_) => format!("{:016x}", total_size),
+    // Commit: flush remaining buffer, rename WAL temp → final path
+    let meta = match wal.commit(share).await {
+        Ok(m) => m,
+        Err(e) => return io_to_s3_error(&e),
     };
+
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header("ETag", format!("\"{etag}\""));
+        .header("ETag", format!("\"{}\"", meta.etag));
     if let Some(ct) = content_type {
         builder = builder.header("Content-Type", ct);
     }

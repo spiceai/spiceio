@@ -125,6 +125,33 @@ fn bench_build_request(c: &mut Criterion) {
     });
 }
 
+fn bench_encode_set_info_rename(c: &mut Criterion) {
+    let file_id = [0u8; 16];
+    let mut group = c.benchmark_group("encode_set_info_rename");
+    let paths: Vec<(&str, String)> = vec![
+        ("short_5", "a\\b\\c".into()),
+        (
+            "typical_40",
+            "sccache\\us-east-1\\bucket\\abcdef1234567890".into(),
+        ),
+        ("long_255", "a".repeat(255)),
+    ];
+    for (label, path) in &paths {
+        group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(label),
+            path,
+            |b, p| {
+                b.iter(|| {
+                    let mut buf = BytesMut::with_capacity(128 + p.len() * 2);
+                    encode_set_info_rename(&mut buf, black_box(&file_id), black_box(p), true);
+                    buf
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_parse_directory_entries(c: &mut Criterion) {
     // Build 50 entries
     let mut data = Vec::new();
@@ -160,6 +187,7 @@ criterion_group!(
     bench_encode_create_request,
     bench_encode_read_request,
     bench_encode_write_request,
+    bench_encode_set_info_rename,
     bench_decode_create_response,
     bench_decode_read_response,
     bench_decode_read_response_owned,
