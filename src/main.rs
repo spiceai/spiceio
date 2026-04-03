@@ -43,7 +43,7 @@ struct Config {
     bucket_name: String,
     /// AWS region to advertise
     region: String,
-    /// Number of SMB TCP connections in the pool (default 4)
+    /// Number of SMB TCP connections in the pool (default 8)
     smb_connections: usize,
     /// Max I/O size for standalone read/write operations (default 1MB)
     smb_max_io: u32,
@@ -72,7 +72,7 @@ impl Config {
             smb_connections: env::var("SPICEIO_SMB_CONNECTIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(4),
+                .unwrap_or(8),
             smb_max_io: env::var("SPICEIO_SMB_MAX_IO")
                 .ok()
                 .and_then(|s| s.parse().ok())
