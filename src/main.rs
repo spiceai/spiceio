@@ -147,6 +147,9 @@ async fn main() {
             .expect("failed to connect to SMB share"),
     );
 
+    // Clean up orphaned WAL temp files from prior crashes
+    share.cleanup_wal().await;
+
     let state = Arc::new(AppState {
         share,
         bucket: config.bucket_name.clone(),

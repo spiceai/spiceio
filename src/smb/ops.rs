@@ -2,6 +2,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -500,6 +501,132 @@ impl ShareSession {
             .await;
     }
 
+    // ── WAL buffered write operations ─────────────────────────────────────
+
+    /// Open a WAL writer for a streaming PutObject. Writes are buffered in
+    /// memory and flushed to a temp file under `.spiceio-wal/` via pipelined
+    /// SMB writes. Call `commit()` to atomically rename to the final path.
+    pub async fn open_wal_write(&self, key: &str) -> io::Result<WalWriter> {
+        let (client, tree_id) = self.pick();
+        let final_path = to_smb_path(key);
+
+        // Ensure final destination's parent dirs exist (so rename can succeed)
+        self.ensure_parent_dirs_on(client, tree_id, &final_path)
+            .await?;
+
+        // Generate WAL temp path and ensure its parent dir exists
+        let wal_path = wal_temp_path();
+        self.ensure_parent_dirs_on(client, tree_id, &wal_path)
+            .await?;
+
+        // Create the WAL temp file
+        let file = client
+            .create(
+                tree_id,
+                &wal_path,
+                DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                ShareAccess::Read as u32 | ShareAccess::Delete as u32,
+                CreateDisposition::OverwriteIf as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+
+        let chunk_size = self.pool.max_write_size as usize;
+        Ok(WalWriter {
+            client: Arc::clone(client),
+            tree_id,
+            file_id: file.file_id,
+            wal_path,
+            final_path,
+            buf: Vec::with_capacity(chunk_size * WRITE_PIPELINE_DEPTH),
+            chunk_size,
+            offset: 0,
+            total_size: 0,
+        })
+    }
+
+    /// Head object by raw SMB path (no S3 key conversion).
+    async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
+        let (client, tree_id) = self.pick();
+        let (cr, _) = client
+            .create_close(
+                tree_id,
+                smb_path,
+                DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+
+        Ok(ObjectMeta {
+            size: cr.file_size,
+            last_modified: filetime_to_epoch_secs(cr.last_write_time),
+            etag: format!("{:016x}", cr.last_write_time),
+            content_type: String::new(),
+        })
+    }
+
+    /// Clean up orphaned WAL temp files from prior crashes.
+    /// Best-effort — logs errors but does not fail.
+    pub async fn cleanup_wal(&self) {
+        let (client, tree_id) = self.pick();
+
+        // Try to open the WAL directory
+        let dir = match client
+            .create(
+                tree_id,
+                WAL_DIR,
+                DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::DirectoryFile as u32,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(_) => return, // No WAL directory — nothing to clean up
+        };
+
+        let entries = client.query_directory(tree_id, &dir.file_id, "*").await;
+        let _ = client.close(tree_id, &dir.file_id).await;
+
+        let entries = match entries {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut count = 0u32;
+        for entry in &entries {
+            if entry.is_directory() {
+                continue;
+            }
+            let path = format!("{WAL_DIR}\\{}", entry.file_name);
+            if Self::delete_object_path_on(client, tree_id, &path)
+                .await
+                .is_ok()
+            {
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            crate::slog!("[spiceio] wal cleanup: removed {count} orphaned temp file(s)");
+        }
+
+        // Try to remove the now-empty WAL directory (best effort)
+        let _ = client
+            .create_close(
+                tree_id,
+                WAL_DIR,
+                DesiredAccess::Delete as u32,
+                ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::DirectoryFile as u32 | 0x00001000,
+            )
+            .await;
+    }
+
     /// Ensure parent directories exist for a given path on a specific connection.
     async fn ensure_parent_dirs_on(
         &self,
@@ -527,7 +654,7 @@ impl ShareSession {
 }
 
 /// Number of read requests to pipeline in a single batch.
-const PIPELINE_DEPTH: usize = 8;
+const PIPELINE_DEPTH: usize = 64;
 
 impl FileHandle {
     /// Read a chunk at the given offset. Returns empty bytes at EOF.
@@ -563,6 +690,124 @@ impl FileHandle {
     /// Close the file handle.
     pub async fn close(self) -> io::Result<()> {
         self.client.close(self.tree_id, &self.file_id).await
+    }
+}
+
+// ── WAL (Write-Ahead Log) buffered writer ──────────────────────────────────
+
+/// Directory on the SMB share where WAL temp files are stored.
+const WAL_DIR: &str = ".spiceio-wal";
+
+/// Number of write requests to pipeline in a single batch.
+const WRITE_PIPELINE_DEPTH: usize = 64;
+
+/// Monotonic counter for unique WAL file names within this process.
+static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique WAL temp file path on the SMB share.
+fn wal_temp_path() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{WAL_DIR}\\{ts:020}-{seq:04}")
+}
+
+/// A buffered write-ahead-log writer for streaming PutObject.
+///
+/// Data flows: HTTP body chunks → memory buffer → pipelined SMB writes to a
+/// WAL temp file. On commit, the temp file is renamed to the final path.
+/// If the proxy crashes mid-write, the original file is untouched and orphaned
+/// WAL files are cleaned up on next startup.
+pub struct WalWriter {
+    client: Arc<SmbClient>,
+    tree_id: u32,
+    file_id: [u8; 16],
+    wal_path: String,
+    final_path: String,
+    /// In-memory write buffer — flushed when it reaches capacity.
+    buf: Vec<u8>,
+    /// Max bytes per individual SMB Write request.
+    chunk_size: usize,
+    /// Current write offset in the WAL temp file.
+    offset: u64,
+    /// Total bytes accepted (buffered + flushed).
+    pub total_size: u64,
+}
+
+impl WalWriter {
+    /// Append data to the write buffer. Flushes automatically when the buffer
+    /// fills to pipeline capacity (WRITE_PIPELINE_DEPTH * chunk_size).
+    pub async fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        let pipeline_cap = self.chunk_size * WRITE_PIPELINE_DEPTH;
+        let mut pos = 0;
+
+        while pos < data.len() {
+            let space = pipeline_cap - self.buf.len();
+            let take = space.min(data.len() - pos);
+            self.buf.extend_from_slice(&data[pos..pos + take]);
+            pos += take;
+            self.total_size += take as u64;
+
+            if self.buf.len() >= pipeline_cap {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush the memory buffer to the WAL temp file using pipelined writes.
+    async fn flush(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+
+        // Split buffer into chunk_size slices for pipelining
+        let chunks: Vec<&[u8]> = self.buf.chunks(self.chunk_size).collect();
+        let written = self
+            .client
+            .pipelined_write(self.tree_id, &self.file_id, self.offset, &chunks)
+            .await?;
+        self.offset += written;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush remaining data, close the WAL file, and rename it to the final path.
+    /// Returns the object metadata from a head_object on the final path.
+    pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
+        // Flush any remaining buffered data
+        self.flush().await?;
+
+        // Rename the WAL temp file to the final destination
+        self.client
+            .rename(self.tree_id, &self.file_id, &self.final_path, true)
+            .await?;
+
+        // Close the file handle (now at the final path)
+        let _ = self.client.close(self.tree_id, &self.file_id).await;
+
+        // Fetch final metadata
+        let meta = share.head_object_smb(&self.final_path).await?;
+        Ok(meta)
+    }
+
+    /// Abort the WAL write — close and delete the temp file.
+    pub async fn abort(self) {
+        let _ = self.client.close(self.tree_id, &self.file_id).await;
+        // Best-effort delete of the WAL temp file
+        let _ = self
+            .client
+            .create_close(
+                self.tree_id,
+                &self.wal_path,
+                DesiredAccess::Delete as u32,
+                ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+            )
+            .await;
     }
 }
 
@@ -755,5 +1000,78 @@ mod tests {
     #[test]
     fn content_type_nested_path() {
         assert_eq!(guess_content_type("a/b/c.txt"), "text/plain");
+    }
+
+    // ── WAL path generation ─────────────────────────────────────────
+
+    #[test]
+    fn wal_dir_constant() {
+        assert_eq!(WAL_DIR, ".spiceio-wal");
+    }
+
+    #[test]
+    fn wal_pipeline_depth() {
+        // Pipeline depth should match read pipeline for consistency
+        assert_eq!(WRITE_PIPELINE_DEPTH, PIPELINE_DEPTH);
+    }
+
+    #[test]
+    fn wal_temp_path_under_wal_dir() {
+        let path = wal_temp_path();
+        assert!(
+            path.starts_with(".spiceio-wal\\"),
+            "WAL path must start with .spiceio-wal\\, got: {path}"
+        );
+    }
+
+    #[test]
+    fn wal_temp_path_no_nested_dirs() {
+        let path = wal_temp_path();
+        // After the WAL dir prefix, the filename should have no more backslashes
+        let filename = path.strip_prefix(".spiceio-wal\\").unwrap();
+        assert!(
+            !filename.contains('\\'),
+            "WAL filename should be flat, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn wal_temp_path_unique() {
+        let p1 = wal_temp_path();
+        let p2 = wal_temp_path();
+        let p3 = wal_temp_path();
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert_ne!(p1, p3);
+    }
+
+    #[test]
+    fn wal_temp_path_contains_counter() {
+        // The counter portion should differ between consecutive calls
+        let p1 = wal_temp_path();
+        let p2 = wal_temp_path();
+        let f1 = p1.strip_prefix(".spiceio-wal\\").unwrap();
+        let f2 = p2.strip_prefix(".spiceio-wal\\").unwrap();
+        // Format is "{timestamp}-{counter}" — extract counter suffix
+        let c1: &str = f1.rsplit('-').next().unwrap();
+        let c2: &str = f2.rsplit('-').next().unwrap();
+        let n1: u64 = c1.parse().expect("counter should be numeric");
+        let n2: u64 = c2.parse().expect("counter should be numeric");
+        assert_eq!(n2, n1 + 1, "counter should increment monotonically");
+    }
+
+    #[test]
+    fn wal_temp_path_format_dash_separated() {
+        let path = wal_temp_path();
+        let filename = path.strip_prefix(".spiceio-wal\\").unwrap();
+        let parts: Vec<&str> = filename.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "expected timestamp-counter, got: {filename}"
+        );
+        // Timestamp part should be a large number (nanoseconds)
+        let ts: u128 = parts[0].parse().expect("timestamp should be numeric");
+        assert!(ts > 1_000_000_000_000_000_000, "timestamp looks too small");
     }
 }

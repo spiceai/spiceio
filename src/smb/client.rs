@@ -95,7 +95,7 @@ impl SmbClient {
             const SO_RCVBUF: i32 = 0x1002;
 
             let fd = stream.as_raw_fd();
-            let buf_size: i32 = 1024 * 1024;
+            let buf_size: i32 = 4 * 1024 * 1024;
             let ptr = std::ptr::from_ref(&buf_size).cast();
             let len = size_of::<i32>() as u32;
             unsafe {
@@ -453,6 +453,9 @@ impl SmbClient {
     ///
     /// Holds the stream lock for the entire batch, eliminating per-request
     /// round-trip latency. Returns chunks in offset order. Stops early on EOF.
+    ///
+    /// Responses may arrive out of order (SMB2 does not guarantee response
+    /// ordering). Each response is matched to its request slot via message_id.
     pub async fn pipelined_read(
         &self,
         tree_id: u32,
@@ -465,11 +468,14 @@ impl SmbClient {
             return Ok(Vec::new());
         }
 
-        // Build all request packets
+        // Allocate message IDs in a contiguous batch so we can map
+        // response.message_id → slot index via simple subtraction.
+        let base_msg_id = self.message_id.fetch_add(count as u64, Ordering::Relaxed);
+
         let mut packets = Vec::with_capacity(count);
         for i in 0..count {
             let offset = start_offset + (i as u64) * (chunk_size as u64);
-            let msg_id = self.next_message_id();
+            let msg_id = base_msg_id + i as u64;
             let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(chunk_size);
             hdr.session_id = self.session_id;
             hdr.tree_id = tree_id;
@@ -493,55 +499,73 @@ impl SmbClient {
         }
         stream.flush().await?;
 
-        // Receive all responses
-        let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            loop {
-                let mut len_buf = [0u8; 4];
-                stream.read_exact(&mut len_buf).await?;
-                let msg_len = u32::from_be_bytes(len_buf) as usize;
+        // Receive responses into ordered slots (handles out-of-order delivery).
+        let mut slots: Vec<Option<bytes::Bytes>> = (0..count).map(|_| None).collect();
+        let mut received = 0usize;
+        let mut eof_after = count; // trim to this length on EOF
 
-                if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid SMB2 message length: {msg_len}"),
-                    ));
-                }
+        while received < count {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
 
-                let mut msg = vec![0u8; msg_len];
-                stream.read_exact(&mut msg).await?;
-
-                let header = Header::decode(&msg).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
-                })?;
-
-                // Skip STATUS_PENDING interim responses
-                if header.status == 0x0000_0103 {
-                    continue;
-                }
-
-                let status = NtStatus::from_u32(header.status);
-                if status == NtStatus::EndOfFile {
-                    // EOF — no more data, return what we have
-                    return Ok(results);
-                }
-                if status.is_error() {
-                    return Err(io::Error::other(format!(
-                        "pipelined read failed: 0x{:08X}",
-                        header.status
-                    )));
-                }
-
-                let body = msg[SMB2_HEADER_SIZE..].to_vec();
-                let data = decode_read_response_owned(body).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
-                })?;
-                results.push(data);
-                break;
+            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SMB2 message length: {msg_len}"),
+                ));
             }
+
+            let mut msg = vec![0u8; msg_len];
+            stream.read_exact(&mut msg).await?;
+
+            let header = Header::decode(&msg)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+
+            // Skip STATUS_PENDING interim responses
+            if header.status == 0x0000_0103 {
+                continue;
+            }
+
+            let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
+            if slot >= count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected message_id {} (base={}, count={})",
+                        header.message_id, base_msg_id, count
+                    ),
+                ));
+            }
+
+            let status = NtStatus::from_u32(header.status);
+            if status == NtStatus::EndOfFile {
+                // This slot and all later slots are past EOF
+                eof_after = eof_after.min(slot);
+                received += 1;
+                continue;
+            }
+            if status.is_error() {
+                return Err(io::Error::other(format!(
+                    "pipelined read failed: 0x{:08X}",
+                    header.status
+                )));
+            }
+
+            let body = msg[SMB2_HEADER_SIZE..].to_vec();
+            let data = decode_read_response_owned(body).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
+            })?;
+            slots[slot] = Some(data);
+            received += 1;
         }
 
-        Ok(results)
+        // Collect in order, stopping at EOF boundary
+        Ok(slots
+            .into_iter()
+            .take(eof_after)
+            .map(|s| s.unwrap_or_default())
+            .collect())
     }
 
     /// Write to an open file.
@@ -583,6 +607,129 @@ impl SmbClient {
             crate::serr!("[spiceio] smb invalid write response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
         })
+    }
+
+    /// Pipelined write: send `chunks` write requests in a batch, then receive
+    /// all responses. Holds the stream lock for the entire batch, eliminating
+    /// per-request round-trip latency. Returns total bytes written.
+    ///
+    /// Responses may arrive out of order; each is matched by message_id.
+    pub async fn pipelined_write(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        start_offset: u64,
+        chunks: &[&[u8]],
+    ) -> io::Result<u64> {
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+
+        let n = chunks.len();
+        let base_msg_id = self.message_id.fetch_add(n as u64, Ordering::Relaxed);
+
+        let mut packets = Vec::with_capacity(n);
+        let mut offset = start_offset;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let msg_id = base_msg_id + i as u64;
+            let mut hdr =
+                Header::new(Command::Write, msg_id).with_credit_charge(chunk.len() as u32);
+            hdr.session_id = self.session_id;
+            hdr.tree_id = tree_id;
+            let packet = build_request(&hdr, |buf| {
+                encode_write_request(buf, file_id, offset, chunk);
+            });
+            packets.push(packet);
+            offset += chunk.len() as u64;
+        }
+
+        let mut stream = self.stream.lock().await;
+
+        // Send all requests
+        for packet in &packets {
+            if let Some(ref key) = self.signing_key {
+                let mut signed = packet.to_vec();
+                sign_packet(&mut signed, key);
+                stream.write_all(&signed).await?;
+            } else {
+                stream.write_all(packet).await?;
+            }
+        }
+        stream.flush().await?;
+
+        // Receive all responses (handles out-of-order delivery)
+        let mut total_written = 0u64;
+        let mut received = 0usize;
+        while received < n {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid SMB2 message length: {msg_len}"),
+                ));
+            }
+
+            let mut msg = vec![0u8; msg_len];
+            stream.read_exact(&mut msg).await?;
+
+            let header = Header::decode(&msg)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+
+            if header.status == 0x0000_0103 {
+                continue;
+            }
+
+            if header.status & 0xC000_0000 == 0xC000_0000 {
+                return Err(io::Error::other(format!(
+                    "pipelined write failed: 0x{:08X}",
+                    header.status
+                )));
+            }
+
+            let body = &msg[SMB2_HEADER_SIZE..];
+            let written = decode_write_response(body).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
+            })?;
+            total_written += written as u64;
+            received += 1;
+        }
+
+        Ok(total_written)
+    }
+
+    /// Rename a file using SET_INFO with FileRenameInformation.
+    pub async fn rename(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        new_path: &str,
+        replace_if_exists: bool,
+    ) -> io::Result<()> {
+        let msg_id = self.next_message_id();
+        let mut hdr = Header::new(Command::SetInfo, msg_id);
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+
+        let packet = build_request(&hdr, |buf| {
+            encode_set_info_rename(buf, file_id, new_path, replace_if_exists);
+        });
+
+        let (resp_hdr, _) = self.send_recv(&packet).await?;
+        if resp_hdr.status & 0xC000_0000 == 0xC000_0000 {
+            crate::serr!(
+                "[spiceio] smb rename failed: 0x{:08X} -> {}",
+                resp_hdr.status,
+                new_path
+            );
+            return Err(io::Error::other(format!(
+                "rename failed: status=0x{:08X} -> {}",
+                resp_hdr.status, new_path
+            )));
+        }
+        Ok(())
     }
 
     /// List directory contents.

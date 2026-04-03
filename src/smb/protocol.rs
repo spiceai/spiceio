@@ -24,6 +24,7 @@ pub enum Command {
     Read = 0x0008,
     Write = 0x0009,
     QueryDirectory = 0x000E,
+    SetInfo = 0x0011,
 }
 
 // ── NT Status codes we care about ───────────────────────────────────────────
@@ -510,6 +511,55 @@ pub fn decode_write_response(body: &[u8]) -> Option<u32> {
     Some((&body[4..8]).get_u32_le()) // Count (bytes written)
 }
 
+// ── Set Info (rename) ──────────────────────────────────────────────────────
+
+/// SMB2 SET_INFO InfoType for file information.
+const SMB2_0_INFO_FILE: u8 = 0x01;
+
+/// FileRenameInformation class (MS-FSCC 2.4.34.2).
+const FILE_RENAME_INFORMATION: u8 = 0x0A;
+
+/// Encode a SET_INFO request for FileRenameInformation (rename/move a file).
+///
+/// `new_name` is the destination path relative to the share root, using
+/// backslash separators (SMB convention). `replace_if_exists` controls
+/// whether an existing file at the destination is overwritten.
+pub fn encode_set_info_rename(
+    buf: &mut BytesMut,
+    file_id: &[u8; 16],
+    new_name: &str,
+    replace_if_exists: bool,
+) {
+    let name_bytes: Vec<u8> = new_name
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+
+    // FileRenameInformation buffer:
+    //   ReplaceIfExists (1) + Reserved (7) + RootDirectory (8) +
+    //   FileNameLength (4) + FileName (variable)
+    let info_len = 1 + 7 + 8 + 4 + name_bytes.len();
+
+    // SET_INFO request StructureSize = 33 (fixed part = 32 + 1 buffer byte)
+    let buffer_offset = (SMB2_HEADER_SIZE + 32) as u16;
+
+    buf.put_u16_le(33); // StructureSize
+    buf.put_u8(SMB2_0_INFO_FILE); // InfoType: SMB2_0_INFO_FILE
+    buf.put_u8(FILE_RENAME_INFORMATION); // FileInfoClass
+    buf.put_u32_le(info_len as u32); // BufferLength
+    buf.put_u16_le(buffer_offset); // BufferOffset
+    buf.put_u16_le(0); // Reserved
+    buf.put_u32_le(0); // AdditionalInformation
+    buf.put_slice(file_id); // FileId (16 bytes)
+
+    // FileRenameInformation structure
+    buf.put_u8(u8::from(replace_if_exists)); // ReplaceIfExists
+    buf.put_slice(&[0u8; 7]); // Reserved
+    buf.put_u64_le(0); // RootDirectory (0 = relative to share root)
+    buf.put_u32_le(name_bytes.len() as u32); // FileNameLength
+    buf.put_slice(&name_bytes); // FileName (UTF-16LE)
+}
+
 // ── Query Directory ─────────────────────────────────────────────────────────
 
 pub const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
@@ -915,5 +965,128 @@ mod tests {
         let data = b"hello";
         encode_write_request(&mut buf, &[0u8; 16], 0, data);
         assert_eq!(buf.len(), 48 + data.len()); // fixed part + data
+    }
+
+    // ── encode_set_info_rename ──────────────────────────────────────
+
+    #[test]
+    fn set_info_rename_structure_size() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "test", false);
+        assert_eq!(u16::from_le_bytes(buf[0..2].try_into().unwrap()), 33);
+    }
+
+    #[test]
+    fn set_info_rename_info_type_and_class() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "test", false);
+        assert_eq!(buf[2], 0x01); // SMB2_0_INFO_FILE
+        assert_eq!(buf[3], 0x0A); // FILE_RENAME_INFORMATION
+    }
+
+    #[test]
+    fn set_info_rename_buffer_offset() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "test", false);
+        let offset = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        // BufferOffset = SMB2_HEADER_SIZE (64) + fixed part (32)
+        assert_eq!(offset as usize, SMB2_HEADER_SIZE + 32);
+    }
+
+    #[test]
+    fn set_info_rename_file_id() {
+        let file_id = [0xAA; 16];
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &file_id, "x", false);
+        // FileId at offset 16 (after StructureSize+InfoType+Class+BufferLength+BufferOffset+Reserved+AdditionalInfo)
+        assert_eq!(&buf[16..32], &file_id);
+    }
+
+    #[test]
+    fn set_info_rename_buffer_length() {
+        let path = "dir\\file.txt";
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], path, false);
+        let buffer_length = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let name_utf16_len = path.encode_utf16().count() * 2;
+        // info_len = ReplaceIfExists(1) + Reserved(7) + RootDirectory(8) + FileNameLength(4) + FileName
+        assert_eq!(buffer_length as usize, 1 + 7 + 8 + 4 + name_utf16_len);
+    }
+
+    #[test]
+    fn set_info_rename_replace_flag_false() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "test", false);
+        // FileRenameInformation starts at byte 32 (after SetInfo fixed part)
+        assert_eq!(buf[32], 0);
+    }
+
+    #[test]
+    fn set_info_rename_replace_flag_true() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "test", true);
+        assert_eq!(buf[32], 1);
+    }
+
+    #[test]
+    fn set_info_rename_reserved_zeroed() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "test", false);
+        // Reserved (7 bytes) at offset 33..40
+        assert_eq!(&buf[33..40], &[0u8; 7]);
+        // RootDirectory (8 bytes) at offset 40..48
+        assert_eq!(
+            u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            0,
+            "RootDirectory must be zero for share-relative renames"
+        );
+    }
+
+    #[test]
+    fn set_info_rename_file_name_utf16() {
+        let path = "foo\\bar.txt";
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], path, false);
+
+        // FileNameLength at offset 48..52
+        let name_len = u32::from_le_bytes(buf[48..52].try_into().unwrap()) as usize;
+        let expected: Vec<u8> = path.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        assert_eq!(name_len, expected.len());
+
+        // FileName starts at offset 52
+        assert_eq!(&buf[52..52 + name_len], &expected[..]);
+    }
+
+    #[test]
+    fn set_info_rename_empty_path() {
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], "", false);
+        let name_len = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        assert_eq!(name_len, 0);
+        // Total buffer: fixed SetInfo (32) + FileRenameInfo fixed (20) + name (0) = 52
+        assert_eq!(buf.len(), 52);
+    }
+
+    #[test]
+    fn set_info_rename_total_size() {
+        let path = "test";
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], path, false);
+        let name_utf16_len = path.encode_utf16().count() * 2;
+        // SetInfo fixed (32) + ReplaceIfExists(1) + Reserved(7) + RootDirectory(8)
+        // + FileNameLength(4) + FileName
+        assert_eq!(buf.len(), 32 + 1 + 7 + 8 + 4 + name_utf16_len);
+    }
+
+    #[test]
+    fn set_info_rename_unicode_path() {
+        // Test with non-ASCII characters
+        let path = "données\\fichier.txt";
+        let mut buf = BytesMut::new();
+        encode_set_info_rename(&mut buf, &[0u8; 16], path, true);
+        let name_len = u32::from_le_bytes(buf[48..52].try_into().unwrap()) as usize;
+        let expected: Vec<u8> = path.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+        assert_eq!(name_len, expected.len());
+        assert_eq!(&buf[52..52 + name_len], &expected[..]);
     }
 }
