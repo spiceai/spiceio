@@ -34,7 +34,7 @@ The binary requires these environment variables:
 - `SPICEIO_SMB_DOMAIN` — SMB domain (default empty)
 - `SPICEIO_BUCKET` — virtual S3 bucket name (defaults to `SPICEIO_SMB_SHARE`)
 - `SPICEIO_REGION` — AWS region to advertise (default `us-east-1`)
-- `SPICEIO_SMB_CONNECTIONS` — number of SMB TCP connections in the pool (default `4`)
+- `SPICEIO_SMB_CONNECTIONS` — number of SMB TCP connections in the pool (default `8`)
 - `SPICEIO_SMB_MAX_IO` — max standalone read/write I/O size in bytes (default `65536`; raise for servers that handle larger I/O)
 - `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
 
@@ -54,7 +54,7 @@ The codebase has three modules:
 
 - Zero external crypto dependencies — all crypto goes through `crypto::ffi` to CommonCrypto.
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.
-- Connection pool — N TCP connections (default 4) to the same SMB server, round-robin dispatched. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
+- Connection pool — N TCP connections (default 8) to the same SMB server, round-robin dispatched. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
 - Pipelined reads — streaming GetObject sends batches of 8 read requests before collecting responses, hiding per-request round-trip latency.
 - Configurable I/O cap — standalone read/write ops default to 64 KB (safe for commodity NAS); raisable via `SPICEIO_SMB_MAX_IO` for compliant servers. Compound operations always cap at 64 KB.
 - GetObject streams SMB read chunks directly to the HTTP response via `SpiceioBody::channel` — no full-file buffering.

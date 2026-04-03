@@ -35,6 +35,9 @@ outputs:
   endpoint:
     description: The S3-compatible endpoint URL
     value: ${{ steps.start.outputs.endpoint }}
+  pid:
+    description: PID of the spiceio process (use to stop it at the end of your workflow)
+    value: ${{ steps.start.outputs.pid }}
 
 runs:
   using: composite
@@ -79,31 +82,6 @@ runs:
         SPICEIO_BIND: ${{ inputs.bind }}
       run: |
         set -euo pipefail
-
-        # Check if spiceio is already listening on the requested address
-        WANT_VERSION=$(spiceio --version | awk '{print $2}')
-        RUNNING_HEADER=$(curl -s -I "http://${SPICEIO_BIND}/" 2>/dev/null | grep -i '^server:.*spiceio' | tr -d '\r' || true)
-        if [[ -n "$RUNNING_HEADER" ]]; then
-          # Extract version from "Server: spiceio/X.Y.Z"; bare "Server: spiceio"
-          # (no slash) means a pre-versioned build — treat as outdated.
-          RUNNING_VERSION="${RUNNING_HEADER##*/}"
-          RUNNING_VERSION="${RUNNING_VERSION// /}"
-          if [[ "$RUNNING_HEADER" == */* && "$RUNNING_VERSION" == "$WANT_VERSION" ]]; then
-            echo "spiceio $WANT_VERSION already running at http://${SPICEIO_BIND} — skipping start"
-            echo "endpoint=http://${SPICEIO_BIND}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Old or mismatched version — kill it so we can replace it
-          mapfile -t OLD_PIDS < <(lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN 2>/dev/null || true)
-          if (( ${#OLD_PIDS[@]} > 0 )); then
-            echo "replacing spiceio ${RUNNING_VERSION:-unknown} (PID(s) ${OLD_PIDS[*]}) with $WANT_VERSION"
-            kill "${OLD_PIDS[@]}" 2>/dev/null || true
-            for i in $(seq 1 10); do
-              lsof -ti "tcp:${SPICEIO_BIND##*:}" -sTCP:LISTEN >/dev/null 2>&1 || break
-              sleep 1
-            done
-          fi
-        fi
 
         # Parse smb://user:pass@server:port/share
         # Strips the smb:// prefix, then splits on :, @, /
@@ -163,6 +141,7 @@ runs:
           if [[ -n "$ENDPOINT" ]] && curl -fsS -o /dev/null "$ENDPOINT/" 2>/dev/null; then
             echo "spiceio ready at $ENDPOINT (PID $PID)"
             echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+            echo "pid=$PID" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           sleep 1
