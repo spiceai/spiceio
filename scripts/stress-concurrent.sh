@@ -79,10 +79,10 @@ wait_pids() {
 echo "[stress] starting spiceio -> smb://${SPICEIO_SMB_USER}@${SMB_SERVER}:${SMB_PORT}/${SMB_SHARE}"
 
 BIND_PORT="${BIND##*:}"
-mapfile -t STALE_PIDS < <(lsof -i ":${BIND_PORT}" -sTCP:LISTEN -t 2>/dev/null || true)
-if [[ ${#STALE_PIDS[@]} -gt 0 ]]; then
-    echo "[stress] port ${BIND_PORT} in use (pid(s) ${STALE_PIDS[*]}), killing..."
-    kill "${STALE_PIDS[@]}" 2>/dev/null || true
+STALE_PIDS=$(lsof -i ":${BIND_PORT}" -sTCP:LISTEN -t 2>/dev/null || true)
+if [[ -n "$STALE_PIDS" ]]; then
+    echo "[stress] port ${BIND_PORT} in use, killing..."
+    echo "$STALE_PIDS" | xargs kill 2>/dev/null || true
     sleep 1
 fi
 
