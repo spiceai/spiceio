@@ -461,6 +461,61 @@ impl ShareSession {
         Ok(data)
     }
 
+    /// Assemble multipart upload parts into a single file via streaming.
+    ///
+    /// Reads each temp part using pipelined reads and writes through a WalWriter
+    /// (pipelined writes + atomic rename). Never holds more than one pipeline
+    /// buffer in memory — supports arbitrarily large files.
+    pub async fn assemble_parts(
+        &self,
+        key: &str,
+        temp_paths: &[&str],
+    ) -> io::Result<ObjectMeta> {
+        let mut wal = self.open_wal_write(key).await?;
+        let max_read = self.pool.max_read_size;
+
+        for &temp_path in temp_paths {
+            // Open the part file for reading on any pool connection
+            let (client, tree_id) = self.pick();
+            let cr = client
+                .create(
+                    tree_id,
+                    temp_path,
+                    DesiredAccess::GenericRead as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32,
+                )
+                .await?;
+
+            let file_size = cr.file_size;
+            let file_id = cr.file_id;
+
+            // Stream part data to the WalWriter using pipelined reads
+            let mut offset = 0u64;
+            while offset < file_size {
+                let remaining = file_size - offset;
+                let batch = remaining
+                    .div_ceil(max_read as u64)
+                    .min(PIPELINE_DEPTH as u64) as usize;
+                let chunks = client
+                    .pipelined_read(tree_id, &file_id, offset, max_read, batch)
+                    .await?;
+                if chunks.is_empty() {
+                    break;
+                }
+                for chunk in &chunks {
+                    wal.write(chunk).await?;
+                    offset += chunk.len() as u64;
+                }
+            }
+
+            let _ = client.close(tree_id, &file_id).await;
+        }
+
+        wal.commit(self).await
+    }
+
     /// Delete a temp file (best effort).
     pub async fn delete_temp(&self, smb_path: &str) {
         let (client, tree_id) = self.pick();
