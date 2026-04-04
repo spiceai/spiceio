@@ -139,23 +139,29 @@ impl SmbClient {
         self.message_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Send a packet and receive a response, also returning the raw SMB2 response bytes
-    /// (without NetBIOS header) for preauth hash computation.
     /// Read exactly `buf.len()` bytes from the stream with a timeout.
     /// Returns `TimedOut` if the SMB server doesn't respond within the deadline.
+    ///
+    /// A timeout may leave the stream mid-frame, so we shut it down to prevent
+    /// desynchronized reuse.
     async fn read_exact_timeout(
         stream: &mut TcpStream,
         buf: &mut [u8],
     ) -> io::Result<()> {
         match tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
             Ok(result) => result.map(|_| ()),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "SMB server read timed out",
-            )),
+            Err(_) => {
+                let _ = stream.shutdown().await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SMB server read timed out; connection closed",
+                ))
+            }
         }
     }
 
+    /// Send a packet and receive a response, also returning the raw SMB2 response bytes
+    /// (without NetBIOS header) for preauth hash computation.
     async fn send_recv_raw(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
         let (header, body, raw) = self.send_recv_inner(packet).await?;
         Ok((header, body, raw))
