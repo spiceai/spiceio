@@ -66,15 +66,34 @@ impl SmbPool {
         }))
     }
 
-    /// Pick the next connection via round-robin.
+    /// Pick the next healthy connection via round-robin, skipping poisoned ones.
+    /// Falls back to a poisoned connection if all are poisoned (error will
+    /// surface on the first I/O attempt).
     pub fn get(&self) -> &Arc<SmbClient> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len();
-        &self.clients[idx]
+        let n = self.clients.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if !self.clients[idx].is_poisoned() {
+                return &self.clients[idx];
+            }
+        }
+        // All poisoned — return round-robin pick; caller gets BrokenPipe on I/O
+        &self.clients[start % n]
     }
 
-    /// Get the next round-robin index (and advance the counter).
+    /// Get the next round-robin index (and advance the counter), preferring
+    /// healthy connections.
     pub fn next_index(&self) -> usize {
-        self.next.fetch_add(1, Ordering::Relaxed)
+        let n = self.clients.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for i in 0..n {
+            let idx = (start + i) % n;
+            if !self.clients[idx].is_poisoned() {
+                return idx;
+            }
+        }
+        start % n
     }
 
     /// Access a specific connection by index.

@@ -466,11 +466,7 @@ impl ShareSession {
     /// Reads each temp part using pipelined reads and writes through a WalWriter
     /// (pipelined writes + atomic rename). Never holds more than one pipeline
     /// buffer in memory — supports arbitrarily large files.
-    pub async fn assemble_parts(
-        &self,
-        key: &str,
-        temp_paths: &[&str],
-    ) -> io::Result<ObjectMeta> {
+    pub async fn assemble_parts(&self, key: &str, temp_paths: &[&str]) -> io::Result<ObjectMeta> {
         let mut wal = self.open_wal_write(key).await?;
         let max_read = self.pool.max_read_size;
 
@@ -502,7 +498,14 @@ impl ShareSession {
                     .pipelined_read(tree_id, &file_id, offset, max_read, batch)
                     .await?;
                 if chunks.is_empty() {
-                    break;
+                    let _ = client.close(tree_id, &file_id).await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "unexpected EOF assembling part '{}': read {} of {} bytes",
+                            temp_path, offset, file_size
+                        ),
+                    ));
                 }
                 for chunk in &chunks {
                     wal.write(chunk).await?;

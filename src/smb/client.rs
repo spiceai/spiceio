@@ -3,7 +3,7 @@
 use bytes::Buf;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -63,6 +63,8 @@ pub struct SmbClient {
     client_guid: [u8; 16],
     /// SMB 3.1.1 signing key (derived after auth)
     signing_key: Option<[u8; 16]>,
+    /// Set on read timeout — connection framing is desynchronized.
+    poisoned: AtomicBool,
 }
 
 impl SmbClient {
@@ -129,10 +131,16 @@ impl SmbClient {
             compound_max_write_size: 65536,
             client_guid,
             signing_key: None,
+            poisoned: AtomicBool::new(false),
         };
 
         client.negotiate_and_auth().await?;
         Ok(Arc::new(client))
+    }
+
+    /// Whether this connection has been poisoned by a timeout.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Relaxed)
     }
 
     fn next_message_id(&self) -> u64 {
@@ -140,21 +148,26 @@ impl SmbClient {
     }
 
     /// Read exactly `buf.len()` bytes from the stream with a timeout.
-    /// Returns `TimedOut` if the SMB server doesn't respond within the deadline.
     ///
-    /// A timeout may leave the stream mid-frame, so we shut it down to prevent
-    /// desynchronized reuse.
-    async fn read_exact_timeout(
-        stream: &mut TcpStream,
-        buf: &mut [u8],
-    ) -> io::Result<()> {
+    /// On timeout the stream framing is desynchronized, so we poison the
+    /// connection (all future operations fail fast) and drop the underlying
+    /// socket to fully close both halves.
+    async fn read_exact_timeout(&self, stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMB connection poisoned by previous timeout",
+            ));
+        }
         match tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => {
+                self.poisoned.store(true, Ordering::Relaxed);
+                // Drop the socket to fully close both halves.
                 let _ = stream.shutdown().await;
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "SMB server read timed out; connection closed",
+                    "SMB server read timed out; connection poisoned",
                 ))
             }
         }
@@ -188,7 +201,7 @@ impl SmbClient {
         // Read responses, looping past STATUS_PENDING interim responses
         loop {
             let mut len_buf = [0u8; 4];
-            Self::read_exact_timeout(&mut stream, &mut len_buf).await?;
+            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
@@ -200,7 +213,7 @@ impl SmbClient {
             }
 
             let mut msg = vec![0u8; msg_len];
-            Self::read_exact_timeout(&mut stream, &mut msg).await?;
+            self.read_exact_timeout(&mut stream, &mut msg).await?;
 
             let header = Header::decode(&msg).ok_or_else(|| {
                 crate::serr!("[spiceio] smb invalid header");
@@ -532,7 +545,7 @@ impl SmbClient {
 
         while received < count {
             let mut len_buf = [0u8; 4];
-            Self::read_exact_timeout(&mut stream, &mut len_buf).await?;
+            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
@@ -543,7 +556,7 @@ impl SmbClient {
             }
 
             let mut msg = vec![0u8; msg_len];
-            Self::read_exact_timeout(&mut stream, &mut msg).await?;
+            self.read_exact_timeout(&mut stream, &mut msg).await?;
 
             let header = Header::decode(&msg)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
@@ -688,7 +701,7 @@ impl SmbClient {
         let mut received = 0usize;
         while received < n {
             let mut len_buf = [0u8; 4];
-            Self::read_exact_timeout(&mut stream, &mut len_buf).await?;
+            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
@@ -699,7 +712,7 @@ impl SmbClient {
             }
 
             let mut msg = vec![0u8; msg_len];
-            Self::read_exact_timeout(&mut stream, &mut msg).await?;
+            self.read_exact_timeout(&mut stream, &mut msg).await?;
 
             let header = Header::decode(&msg)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
@@ -878,7 +891,7 @@ impl SmbClient {
         // Read response frames, skipping STATUS_PENDING interim responses
         loop {
             let mut len_buf = [0u8; 4];
-            Self::read_exact_timeout(&mut stream, &mut len_buf).await?;
+            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
             let msg_len = u32::from_be_bytes(len_buf) as usize;
 
             if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
@@ -890,7 +903,7 @@ impl SmbClient {
             }
 
             let mut msg = vec![0u8; msg_len];
-            Self::read_exact_timeout(&mut stream, &mut msg).await?;
+            self.read_exact_timeout(&mut stream, &mut msg).await?;
 
             // Single STATUS_PENDING interim — skip
             if let Some(h) = Header::decode(&msg)
