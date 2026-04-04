@@ -96,7 +96,7 @@ impl ShareSession {
                 tree_id,
                 &smb_path,
                 DesiredAccess::GenericRead as u32,
-                ShareAccess::Read as u32,
+                ShareAccess::All as u32,
                 CreateDisposition::Open as u32,
                 CreateOptions::NonDirectoryFile as u32,
             )
@@ -253,7 +253,7 @@ impl ShareSession {
                 tree_id,
                 &smb_path,
                 DesiredAccess::GenericRead as u32,
-                ShareAccess::Read as u32,
+                ShareAccess::All as u32,
                 CreateDisposition::Open as u32,
                 CreateOptions::NonDirectoryFile as u32,
             )
@@ -435,7 +435,7 @@ impl ShareSession {
                 tree_id,
                 smb_path,
                 DesiredAccess::GenericRead as u32,
-                ShareAccess::Read as u32,
+                ShareAccess::All as u32,
                 CreateDisposition::Open as u32,
                 CreateOptions::NonDirectoryFile as u32,
             )
