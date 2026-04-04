@@ -1075,21 +1075,14 @@ async fn handle_complete_multipart_upload(
         }
     }
 
-    // Concatenate parts in order and write the final object
-    let mut final_data = Vec::new();
-    for pn in &part_numbers {
-        if let Some(part) = upload.parts.get(pn) {
-            match state.share.read_temp(&part.temp_path).await {
-                Ok(data) => final_data.extend_from_slice(&data),
-                Err(e) => {
-                    return io_to_s3_error(&e);
-                }
-            }
-        }
-    }
+    // Stream parts through a WAL writer (pipelined reads → pipelined writes
+    // → atomic rename). Never buffers the whole file in memory.
+    let temp_paths: Vec<&str> = part_numbers
+        .iter()
+        .filter_map(|pn| upload.parts.get(pn).map(|p| p.temp_path.as_str()))
+        .collect();
 
-    // Write the assembled object
-    let meta = match state.share.put_object(key, &final_data).await {
+    let meta = match state.share.assemble_parts(key, &temp_paths).await {
         Ok(m) => m,
         Err(e) => return io_to_s3_error(&e),
     };
