@@ -15,6 +15,11 @@ use bytes::{BufMut, BytesMut};
 /// the SMB server is slow or unresponsive under heavy load.
 const SMB_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout for the initial TCP handshake to the SMB server. Without this,
+/// a server that drops SYNs leaves the OS waiting ~75-90s, which stalls
+/// pool initialization past any sensible CI window.
+const SMB_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 use super::auth;
 use super::protocol::*;
 
@@ -71,16 +76,25 @@ impl SmbClient {
     /// Connect to the SMB server and authenticate.
     pub async fn connect(config: SmbConfig) -> io::Result<Arc<Self>> {
         let addr = format!("{}:{}", config.server, config.port);
-        let stream = match TcpStream::connect(&addr).await {
-            Ok(s) => {
-                crate::slog!("[spiceio] smb tcp connected: {addr}");
-                s
-            }
-            Err(e) => {
-                crate::serr!("[spiceio] smb tcp connect failed: {addr}: {e}");
-                return Err(e);
-            }
-        };
+        let stream =
+            match tokio::time::timeout(SMB_CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+                Ok(Ok(s)) => {
+                    crate::slog!("[spiceio] smb tcp connected: {addr}");
+                    s
+                }
+                Ok(Err(e)) => {
+                    crate::serr!("[spiceio] smb tcp connect failed: {addr}: {e}");
+                    return Err(e);
+                }
+                Err(_) => {
+                    let msg = format!(
+                        "smb tcp connect timed out after {}s: {addr}",
+                        SMB_CONNECT_TIMEOUT.as_secs()
+                    );
+                    crate::serr!("[spiceio] {msg}");
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
+                }
+            };
         stream.set_nodelay(true)?;
 
         // Enlarge socket buffers to 1 MB for large read/write throughput.
@@ -1193,8 +1207,12 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
 }
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
-    crate::serr!("[spiceio] smb error 0x{status:08X}: {path}");
-    // Map raw status codes directly to avoid losing info through NtStatus enum
+    // Map raw status codes directly to avoid losing info through NtStatus enum.
+    // We deliberately do NOT log for mapped statuses — many of these are
+    // expected (NotFound on HEAD probes, SharingViolation during cleanup) and
+    // the typed `io::ErrorKind` is enough for callers to handle them. Only the
+    // fallback arm (truly unknown statuses) includes the raw hex code in the
+    // error string and logs at error level.
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE
         | 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
@@ -1212,7 +1230,15 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
             format!("already exists: {path}"),
         ),
 
-        _ => io::Error::other(format!("SMB error 0x{status:08X} for {path}")),
+        0xC000_0043 => io::Error::new( // STATUS_SHARING_VIOLATION
+            io::ErrorKind::ResourceBusy,
+            format!("sharing violation: {path}"),
+        ),
+
+        _ => {
+            crate::serr!("[spiceio] smb error 0x{status:08X}: {path}");
+            io::Error::other(format!("SMB error 0x{status:08X} for {path}"))
+        }
     }
 }
 
@@ -1232,45 +1258,79 @@ fn sign_message(msg: &mut [u8], key: &[u8; 16]) {
     msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
 }
 
-/// Parse a compound response (multiple SMB2 messages in one frame).
-fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
-    let mut results = Vec::new();
-    let mut offset = 0;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    loop {
-        if offset + SMB2_HEADER_SIZE > msg.len() {
-            break;
-        }
-        let header = match Header::decode(&msg[offset..]) {
-            Some(h) => h,
-            None => break,
-        };
-
-        let next = header.next_command as usize;
-        let body_start = offset + SMB2_HEADER_SIZE;
-        let body_end = if next > 0 {
-            let end = offset + next;
-            if end > msg.len() || end < body_start {
-                break;
-            }
-            end
-        } else {
-            msg.len()
-        };
-        if body_start > body_end || body_end > msg.len() {
-            break;
-        }
-
-        let body = msg[body_start..body_end].to_vec();
-        results.push((header, body));
-
-        if next == 0 {
-            break;
-        }
-        offset += next;
+    fn assert_kind_and_path(err: &io::Error, kind: io::ErrorKind, needle: &str) {
+        assert_eq!(err.kind(), kind, "wrong kind for {err}");
+        let s = err.to_string();
+        assert!(s.contains(needle), "expected {needle:?} in {s:?}");
     }
 
-    results
-}
+    #[test]
+    fn maps_no_such_file_to_not_found() {
+        let e = smb_status_to_io_error(0xC000_000F, "a\\b");
+        assert_kind_and_path(&e, io::ErrorKind::NotFound, "a\\b");
+    }
 
-// Need this for from_raw_fd
+    #[test]
+    fn maps_object_name_not_found_to_not_found() {
+        let e = smb_status_to_io_error(0xC000_0034, "missing.txt");
+        assert_kind_and_path(&e, io::ErrorKind::NotFound, "missing.txt");
+    }
+
+    #[test]
+    fn maps_object_path_not_found_to_not_found() {
+        let e = smb_status_to_io_error(0xC000_003A, "dir\\file");
+        assert_kind_and_path(&e, io::ErrorKind::NotFound, "dir\\file");
+    }
+
+    #[test]
+    fn maps_object_name_invalid_to_not_found() {
+        let e = smb_status_to_io_error(0xC000_0033, "bad?name");
+        assert_kind_and_path(&e, io::ErrorKind::NotFound, "bad?name");
+    }
+
+    #[test]
+    fn maps_access_denied_to_permission_denied() {
+        let e = smb_status_to_io_error(0xC000_0022, "secret");
+        assert_kind_and_path(&e, io::ErrorKind::PermissionDenied, "secret");
+    }
+
+    #[test]
+    fn maps_name_collision_to_already_exists() {
+        let e = smb_status_to_io_error(0xC000_0035, "dup");
+        assert_kind_and_path(&e, io::ErrorKind::AlreadyExists, "dup");
+    }
+
+    #[test]
+    fn maps_sharing_violation_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC000_0043, ".spiceio-wal\\01-0000");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, ".spiceio-wal\\01-0000");
+    }
+
+    #[test]
+    fn unknown_status_falls_back_to_other_and_includes_hex() {
+        let e = smb_status_to_io_error(0xC000_00BB, "x");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+        let s = e.to_string();
+        assert!(s.contains("0xC00000BB"), "expected hex in: {s}");
+        assert!(s.contains("x"), "expected path in: {s}");
+    }
+
+    #[test]
+    fn success_status_zero_falls_through_to_other() {
+        // STATUS_SUCCESS is not really an error, but the mapper must never panic.
+        let e = smb_status_to_io_error(0x0000_0000, "ok");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn error_path_is_preserved_verbatim() {
+        // Path containing backslashes, dots, and the WAL prefix must round-trip.
+        let path = ".spiceio-wal\\01778725545751751000-0000";
+        let e = smb_status_to_io_error(0xC000_0043, path);
+        assert!(e.to_string().contains(path));
+    }
+}

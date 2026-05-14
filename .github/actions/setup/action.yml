@@ -132,9 +132,12 @@ runs:
         # auto-increment if the requested port was busy).
         echo "Waiting for spiceio on ${SPICEIO_BIND}..."
         ENDPOINT=""
-        for i in $(seq 1 30); do
+        for i in $(seq 1 60); do
           if ! kill -0 "$PID" 2>/dev/null; then
             echo "::error::spiceio exited unexpectedly"
+            echo "::group::spiceio log"
+            cat "$SPICEIO_LOG" 2>/dev/null || echo "(log file missing)"
+            echo "::endgroup::"
             exit 1
           fi
           ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
@@ -146,6 +149,10 @@ runs:
           fi
           sleep 1
         done
-        echo "::error::spiceio failed to start within 30s"
+        echo "::error::spiceio failed to start within 60s"
+        echo "::group::spiceio log"
+        cat "$SPICEIO_LOG" 2>/dev/null || echo "(log file missing)"
+        echo "::endgroup::"
+        kill "$PID" 2>/dev/null || true
         exit 1
 

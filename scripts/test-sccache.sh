@@ -17,7 +17,9 @@ BIND="${SPICEIO_BIND:-127.0.0.1:18333}"
 SPICEIO_BIN="./target/debug/spiceio"
 TEST_TARGET_DIR="./target/test-sccache"
 ENDPOINT="http://${BIND}"
-AWS="aws --endpoint-url $ENDPOINT --no-sign-request"
+# Pass --region explicitly: AWS CLI errors out without one on some runners
+# (no AWS_DEFAULT_REGION in env, no ~/.aws/config).
+AWS="aws --endpoint-url $ENDPOINT --no-sign-request --region $REGION"
 TEST_PREFIX="spiceio-test-$$"
 PASS=0
 FAIL=0
@@ -143,7 +145,21 @@ echo "======================================="
 
 echo ""
 echo "[s3] ListBuckets"
-BUCKETS=$($AWS s3 ls 2>&1)
+# Surface AWS CLI errors on the very first call so we don't fly blind under set -e.
+BUCKETS=""
+LB_ERR=""
+for attempt in 1 2 3; do
+    if BUCKETS=$($AWS s3 ls 2>&1); then
+        break
+    fi
+    LB_ERR="$BUCKETS"
+    echo "  [s3] ListBuckets attempt ${attempt}/3 failed: ${LB_ERR}"
+    sleep 1
+done
+if [[ -z "$BUCKETS" && -n "$LB_ERR" ]]; then
+    echo "  FAIL: ListBuckets never succeeded — last error: ${LB_ERR}"
+    FAIL=$((FAIL + 1))
+fi
 assert_contains "ListBuckets contains bucket" "$BUCKET" "$BUCKETS"
 
 # ── HeadBucket ──────────────────────────────────────────────────────────────
