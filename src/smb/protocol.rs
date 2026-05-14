@@ -1191,14 +1191,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_compound_response_bad_next_command_stops_cleanly() {
+    fn parse_compound_response_bad_next_command_yields_no_parts() {
         // Forge a next_command that points past end of buffer.
         let mut msg = build_compound(2, 8);
         // next_command field is at byte offset 20 (header offset of next_command).
         msg[20..24].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let parts = parse_compound_response(&msg);
-        // The first message's next_command is broken, so parsing aborts before the second.
-        // The first message should still be returned (callers tolerate partial recovery).
-        assert!(parts.len() <= 1);
+        // When the first message's `next_command` overflows the buffer, the
+        // parser bails before pushing anything — both messages are dropped.
+        // This documents the current behavior rather than implying partial
+        // recovery.
+        assert_eq!(parts.len(), 0);
     }
 }

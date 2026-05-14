@@ -1256,8 +1256,6 @@ fn sign_message(msg: &mut [u8], key: &[u8; 16]) {
     msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
 }
 
-// Need this for from_raw_fd
-
 #[cfg(test)]
 mod tests {
     use super::*;
