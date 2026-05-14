@@ -1208,9 +1208,11 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
 
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
     // Map raw status codes directly to avoid losing info through NtStatus enum.
-    // We deliberately do NOT log here — many of these are expected (NotFound on
-    // HEAD probes, SharingViolation during cleanup) and the io::Error string
-    // carries the status code for any caller that wants to surface it.
+    // We deliberately do NOT log for mapped statuses — many of these are
+    // expected (NotFound on HEAD probes, SharingViolation during cleanup) and
+    // the typed `io::ErrorKind` is enough for callers to handle them. Only the
+    // fallback arm (truly unknown statuses) includes the raw hex code in the
+    // error string and logs at error level.
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE
         | 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND

@@ -22,8 +22,10 @@ const CONNECT_RETRY_BACKOFF: &[Duration] = &[
 /// Generic retry-with-backoff helper. Runs `op` until it succeeds, sleeping
 /// the corresponding `backoff` interval between failures. After `backoff.len()`
 /// retries (i.e. `backoff.len() + 1` total attempts), returns the final error.
-/// `label` is used in the inter-attempt log line so callers can identify what
-/// is being retried.
+///
+/// `op` is responsible for logging the error detail on each failed attempt;
+/// this helper only emits a short retry notice ("retrying in Nms") so the
+/// log isn't doubled up under flaky conditions.
 async fn retry_with_backoff<T, F, Fut>(
     label: &str,
     backoff: &[Duration],
@@ -41,8 +43,9 @@ where
             Err(e) => {
                 if attempt < max_attempts {
                     let delay = backoff[attempt - 1];
-                    crate::serr!(
-                        "[spiceio] {label} attempt {attempt}/{max_attempts} failed: {e}; retrying in {}ms",
+                    let next = attempt + 1;
+                    crate::slog!(
+                        "[spiceio] {label} retrying (attempt {next}/{max_attempts}) in {}ms",
                         delay.as_millis()
                     );
                     tokio::time::sleep(delay).await;
