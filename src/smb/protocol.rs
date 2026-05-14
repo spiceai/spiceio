@@ -454,14 +454,23 @@ pub fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, 
 }
 
 pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
-    if body.len() < 17 {
+    if body.len() < READ_RESPONSE_FIXED_PART + 1 {
         return None;
     }
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = (&body[4..8]).get_u32_le() as usize;
 
-    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + data_length;
+    // Reject offsets that fall inside the SMB2 header or the read response's
+    // fixed fields — same bound as `decode_read_response_from_msg`. The
+    // earlier `saturating_sub(SMB2_HEADER_SIZE)` would otherwise let an
+    // offset of e.g. SMB2_HEADER_SIZE + 4 slice into DataLength and return
+    // those bytes as the file payload.
+    let min_offset = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
+    if data_offset < min_offset {
+        return None;
+    }
+    let start = data_offset - SMB2_HEADER_SIZE;
+    let end = start.checked_add(data_length)?;
     if end > body.len() {
         return None;
     }
@@ -471,14 +480,19 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
 /// Zero-copy variant of `decode_read_response` — takes ownership of the
 /// response body Vec and slices into it without copying the data.
 pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
-    if body.len() < 17 {
+    if body.len() < READ_RESPONSE_FIXED_PART + 1 {
         return None;
     }
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
 
-    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + data_length;
+    // Same bound as `decode_read_response` / `decode_read_response_from_msg`.
+    let min_offset = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
+    if data_offset < min_offset {
+        return None;
+    }
+    let start = data_offset - SMB2_HEADER_SIZE;
+    let end = start.checked_add(data_length)?;
     if end > body.len() {
         return None;
     }
@@ -912,6 +926,38 @@ mod tests {
     #[test]
     fn decode_read_response_too_short() {
         assert!(decode_read_response(&[0u8; 5]).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_rejects_offset_in_response_fixed_fields() {
+        // Same regression as `decode_read_response_from_msg`: an offset
+        // pointing inside the 16-byte read-response fixed fields would
+        // otherwise leak those bytes as the file payload.
+        let mut body = vec![0u8; 32];
+        let bad_offset = (SMB2_HEADER_SIZE + 4) as u16;
+        body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(decode_read_response(&body).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_owned_rejects_offset_in_response_fixed_fields() {
+        let mut body = vec![0u8; 32];
+        let bad_offset = (SMB2_HEADER_SIZE + 4) as u16;
+        body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(decode_read_response_owned(body).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_owned_accepts_minimum_valid_offset() {
+        let mut body = vec![0u8; READ_RESPONSE_FIXED_PART + 4];
+        let min_offset = (SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART) as u16;
+        body[2..4].copy_from_slice(&min_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&4u32.to_le_bytes());
+        body[READ_RESPONSE_FIXED_PART..READ_RESPONSE_FIXED_PART + 4].copy_from_slice(b"data");
+        let data = decode_read_response_owned(body).unwrap();
+        assert_eq!(&data[..], b"data");
     }
 
     #[test]

@@ -354,37 +354,26 @@ impl SmbClient {
         crate::slog!("[spiceio] authenticated, signing key derived");
 
         self.session_id = resp_hdr.session_id;
-        // Cap standalone I/O by: min(server_advertised, max_transact, configured_cap).
-        // Many NAS servers advertise multi-MB limits but fail at much smaller sizes.
-        let transact = neg_resp.max_transact_size;
         let io_cap = if self.config.max_io_size > 0 {
             self.config.max_io_size
         } else {
             DEFAULT_MAX_IO
         };
-        // Substitute io_cap for any negotiated value that's 0. A buggy or
-        // misconfigured server can advertise max_read_size/max_write_size/
-        // max_transact_size = 0; if we let that propagate, every downstream
-        // pipeline call ends up doing `remaining.div_ceil(0)` and panics the
-        // request task — that's the failure mode behind sccache "Connection
-        // refused" against a long-running spiceio.
-        let nonzero = |v: u32, name: &str| -> u32 {
-            if v == 0 {
-                crate::serr!("[spiceio] smb negotiated {name}=0 — substituting io_cap={io_cap}");
-                io_cap
-            } else {
-                v
-            }
-        };
-        let neg_read = nonzero(neg_resp.max_read_size, "max_read_size");
-        let neg_write = nonzero(neg_resp.max_write_size, "max_write_size");
-        let neg_transact = nonzero(transact, "max_transact_size");
-        self.max_read_size = neg_read.min(neg_transact).min(io_cap);
-        self.max_write_size = neg_write.min(neg_transact).min(io_cap);
-        // Cap at 64KB for compound requests — some NAS servers reject larger
-        // payloads inside compound (chained) operations.
-        self.compound_max_read_size = self.max_read_size.min(65536);
-        self.compound_max_write_size = self.max_write_size.min(65536);
+        let sizes = effective_io_sizes(
+            neg_resp.max_read_size,
+            neg_resp.max_write_size,
+            neg_resp.max_transact_size,
+            io_cap,
+            |name, value| {
+                crate::serr!(
+                    "[spiceio] smb negotiated {name}={value} — substituting io_cap={io_cap}"
+                );
+            },
+        );
+        self.max_read_size = sizes.max_read;
+        self.max_write_size = sizes.max_write;
+        self.compound_max_read_size = sizes.compound_max_read;
+        self.compound_max_write_size = sizes.compound_max_write;
         self.signing_key = Some(signing_key);
         Ok(())
     }
@@ -1231,6 +1220,58 @@ impl SmbClient {
     }
 }
 
+/// Effective per-connection I/O sizes derived from the SMB negotiate
+/// response, with any zero fields substituted by the configured `io_cap`.
+///
+/// Returning a struct (rather than a tuple) makes the relationship between
+/// `max_read`/`compound_max_read` self-documenting.
+pub(crate) struct EffectiveIoSizes {
+    pub max_read: u32,
+    pub max_write: u32,
+    pub compound_max_read: u32,
+    pub compound_max_write: u32,
+}
+
+/// Compute the effective I/O sizes for a session given the server's
+/// negotiate response and our configured cap. Any zero negotiated field
+/// is substituted with `io_cap` (and `on_zero` is invoked so the caller
+/// can log it). The result is then capped to `min(value, transact, io_cap)`
+/// for standalone I/O and further to 64 KiB for compound operations.
+///
+/// Extracted as a free function so its zero-handling is unit-testable
+/// without needing a real SMB connection.
+pub(crate) fn effective_io_sizes(
+    neg_max_read: u32,
+    neg_max_write: u32,
+    neg_max_transact: u32,
+    io_cap: u32,
+    mut on_zero: impl FnMut(&'static str, u32),
+) -> EffectiveIoSizes {
+    let nonzero = |name: &'static str, v: u32, on_zero: &mut dyn FnMut(&'static str, u32)| {
+        if v == 0 {
+            on_zero(name, v);
+            io_cap
+        } else {
+            v
+        }
+    };
+    let read = nonzero("max_read_size", neg_max_read, &mut on_zero);
+    let write = nonzero("max_write_size", neg_max_write, &mut on_zero);
+    let transact = nonzero("max_transact_size", neg_max_transact, &mut on_zero);
+    // Cap standalone I/O by: min(server_advertised, max_transact, configured_cap).
+    // Many NAS servers advertise multi-MB limits but fail at much smaller sizes.
+    let max_read = read.min(transact).min(io_cap);
+    let max_write = write.min(transact).min(io_cap);
+    // Cap at 64KB for compound requests — some NAS servers reject larger
+    // payloads inside compound (chained) operations.
+    EffectiveIoSizes {
+        max_read,
+        max_write,
+        compound_max_read: max_read.min(65536),
+        compound_max_write: max_write.min(65536),
+    }
+}
+
 /// Sign an SMB2 packet in-place. `packet` includes the 4-byte NetBIOS header.
 /// Sets the SMB2_FLAGS_SIGNED bit and computes AES-128-CMAC over the SMB2 message.
 fn sign_packet(packet: &mut [u8], key: &[u8; 16]) {
@@ -1390,5 +1431,92 @@ mod tests {
         let path = ".spiceio-wal\\01778725545751751000-0000";
         let e = smb_status_to_io_error(0xC000_0043, path);
         assert!(e.to_string().contains(path));
+    }
+
+    // ── effective_io_sizes ──────────────────────────────────────────────────
+
+    fn no_op_logger() -> impl FnMut(&'static str, u32) {
+        |_name, _value| {}
+    }
+
+    #[test]
+    fn effective_io_sizes_typical_negotiate() {
+        // Server advertises 1 MiB, transact 1 MiB; configured cap 64 KiB
+        // (the default). Result: 64 KiB everywhere, compound also 64 KiB.
+        let s = effective_io_sizes(1_048_576, 1_048_576, 1_048_576, 65536, no_op_logger());
+        assert_eq!(s.max_read, 65536);
+        assert_eq!(s.max_write, 65536);
+        assert_eq!(s.compound_max_read, 65536);
+        assert_eq!(s.compound_max_write, 65536);
+    }
+
+    #[test]
+    fn effective_io_sizes_compound_cap_at_64k_when_max_higher() {
+        // io_cap raised to 1 MiB so the standalone path opens up; compound
+        // must still cap at 64 KiB.
+        let s = effective_io_sizes(1_048_576, 1_048_576, 1_048_576, 1_048_576, no_op_logger());
+        assert_eq!(s.max_read, 1_048_576);
+        assert_eq!(s.max_write, 1_048_576);
+        assert_eq!(s.compound_max_read, 65536);
+        assert_eq!(s.compound_max_write, 65536);
+    }
+
+    #[test]
+    fn effective_io_sizes_floors_zero_max_read() {
+        // The core regression test: a server returning max_read_size = 0
+        // must not propagate as a 0 chunk size to callers.
+        let mut zero_calls: Vec<&'static str> = Vec::new();
+        let s = effective_io_sizes(0, 1_048_576, 1_048_576, 65536, |name, _v| {
+            zero_calls.push(name);
+        });
+        assert_eq!(s.max_read, 65536);
+        assert_eq!(s.max_write, 65536);
+        assert_eq!(zero_calls, vec!["max_read_size"]);
+    }
+
+    #[test]
+    fn effective_io_sizes_floors_zero_max_write() {
+        let mut zero_calls: Vec<&'static str> = Vec::new();
+        let s = effective_io_sizes(1_048_576, 0, 1_048_576, 65536, |name, _v| {
+            zero_calls.push(name);
+        });
+        assert_eq!(s.max_read, 65536);
+        assert_eq!(s.max_write, 65536);
+        assert_eq!(zero_calls, vec!["max_write_size"]);
+    }
+
+    #[test]
+    fn effective_io_sizes_floors_zero_transact() {
+        let mut zero_calls: Vec<&'static str> = Vec::new();
+        let s = effective_io_sizes(1_048_576, 1_048_576, 0, 65536, |name, _v| {
+            zero_calls.push(name);
+        });
+        assert_eq!(s.max_read, 65536);
+        assert_eq!(s.max_write, 65536);
+        assert_eq!(zero_calls, vec!["max_transact_size"]);
+    }
+
+    #[test]
+    fn effective_io_sizes_floors_all_zeros() {
+        // All three zero — every callback fires, and we end up at io_cap.
+        let mut zero_calls: Vec<&'static str> = Vec::new();
+        let s = effective_io_sizes(0, 0, 0, 65536, |name, _v| zero_calls.push(name));
+        assert_eq!(s.max_read, 65536);
+        assert_eq!(s.max_write, 65536);
+        assert_eq!(s.compound_max_read, 65536);
+        assert_eq!(s.compound_max_write, 65536);
+        assert_eq!(
+            zero_calls,
+            vec!["max_read_size", "max_write_size", "max_transact_size"]
+        );
+    }
+
+    #[test]
+    fn effective_io_sizes_transact_clamps_read_and_write() {
+        // Server advertises 1 MiB read/write but only 64 KiB transact —
+        // the smaller transact dominates the min().
+        let s = effective_io_sizes(1_048_576, 1_048_576, 65536, 1_048_576, no_op_logger());
+        assert_eq!(s.max_read, 65536);
+        assert_eq!(s.max_write, 65536);
     }
 }
