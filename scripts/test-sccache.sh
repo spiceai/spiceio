@@ -24,6 +24,10 @@ TEST_PREFIX="spiceio-test-$$"
 PASS=0
 FAIL=0
 
+# Capture spiceio stderr so the post-run guard can flag unexpected
+# `[spiceio] error:` lines. We tee back to stderr so CI still streams live.
+SPICEIO_STDERR=$(mktemp /tmp/spiceio-sccache-stderr.XXXXXX)
+
 # ── Cleanup on exit ─────────────────────────────────────────────────────────
 
 SPICEIO_PID=""
@@ -43,6 +47,7 @@ cleanup() {
         wait "$SPICEIO_PID" 2>/dev/null || true
     fi
     rm -rf /tmp/spiceio-test-*
+    rm -f "$SPICEIO_STDERR"
 }
 trap cleanup EXIT
 
@@ -116,7 +121,7 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
-"$SPICEIO_BIN" &
+"$SPICEIO_BIN" 2> >(tee -a "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
 echo "[test] waiting for spiceio on ${BIND}..."
@@ -281,7 +286,7 @@ SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
 SPICEIO_LOG_FILE="$SPICEIO_LOG2" \
-"$SPICEIO_BIN" &
+"$SPICEIO_BIN" 2> >(tee -a "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID2=$!
 
 echo "[test] waiting for second spiceio instance..."
@@ -402,5 +407,35 @@ if [[ "${CACHE_HITS:-0}" -gt 0 && "${WRITE_ERRORS:-0}" -eq 0 ]]; then
     echo "[test] PASS: warm build got $CACHE_HITS cache hits, 0 write errors"
 else
     echo "[test] FAIL: expected cache hits > 0 (got ${CACHE_HITS:-0}) and write errors == 0 (got ${WRITE_ERRORS:-0})"
+    exit 1
+fi
+
+# ── Stderr guard ────────────────────────────────────────────────────────────
+#
+# Any `[spiceio] error:` line means a code path is leaking through the
+# generic 500 InternalError arm of `io_to_s3_error`. Expected transients
+# (NotFound on HEAD probes, sharing violations, etc.) are mapped to typed
+# `io::ErrorKind`s and logged via `slog!` without the "error:" prefix.
+
+# Stop both spiceio instances *before* grepping the captured stderr. tee in
+# the process substitutions only closes the capture file when each spiceio
+# closes its stderr fd, so we have to kill+wait here rather than rely on
+# the EXIT trap. Clear PIDs so the trap's own kills become no-ops.
+if [[ -n "$SPICEIO_PID2" ]]; then
+    kill "$SPICEIO_PID2" 2>/dev/null || true
+    wait "$SPICEIO_PID2" 2>/dev/null || true
+    SPICEIO_PID2=""
+fi
+if [[ -n "$SPICEIO_PID" ]]; then
+    kill "$SPICEIO_PID" 2>/dev/null || true
+    wait "$SPICEIO_PID" 2>/dev/null || true
+    SPICEIO_PID=""
+fi
+sleep 0.2  # tee in <(...) isn't directly waitable; let it drain.
+
+if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
+    echo ""
+    echo "[test] FAIL: spiceio emitted unexpected error log lines:"
+    grep '\[spiceio\] error:' "$SPICEIO_STDERR" | head -20
     exit 1
 fi
