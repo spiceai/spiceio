@@ -2,11 +2,64 @@
 //! server, round-robin dispatched. Eliminates the single-connection mutex
 //! bottleneck under concurrent S3 requests.
 
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use super::client::{SmbClient, SmbConfig};
+
+/// Backoff schedule for transient connect failures (TCP/negotiate/auth).
+/// A shared NAS under load can flake one connect while the rest succeed —
+/// retry handles that without taking down startup.
+const CONNECT_RETRY_BACKOFF: &[Duration] = &[
+    Duration::from_millis(250),
+    Duration::from_millis(750),
+    Duration::from_millis(2000),
+];
+
+/// Generic retry-with-backoff helper. Runs `op` until it succeeds, sleeping
+/// the corresponding `backoff` interval between failures. After `backoff.len()`
+/// retries (i.e. `backoff.len() + 1` total attempts), returns the final error.
+/// `label` is used in the inter-attempt log line so callers can identify what
+/// is being retried.
+async fn retry_with_backoff<T, F, Fut>(
+    label: &str,
+    backoff: &[Duration],
+    mut op: F,
+) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    let max_attempts = backoff.len() + 1;
+    let mut last_err: Option<io::Error> = None;
+    for attempt in 1..=max_attempts {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < max_attempts {
+                    let delay = backoff[attempt - 1];
+                    crate::serr!(
+                        "[spiceio] {label} attempt {attempt}/{max_attempts} failed: {e}; retrying in {}ms",
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other(format!("{label} failed without error"))))
+}
+
+async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
+    retry_with_backoff("smb connect", CONNECT_RETRY_BACKOFF, || {
+        SmbClient::connect(config.clone())
+    })
+    .await
+}
 
 /// A pool of authenticated SMB connections to the same server.
 ///
@@ -33,7 +86,7 @@ impl SmbPool {
         let mut clients = Vec::with_capacity(n);
 
         // First connection — establishes negotiated parameters
-        let first = SmbClient::connect(config.clone()).await?;
+        let first = connect_with_retry(config.clone()).await?;
         let max_read_size = first.max_read_size;
         let max_write_size = first.max_write_size;
         let compound_max_read_size = first.compound_max_read_size;
@@ -45,7 +98,7 @@ impl SmbPool {
             let mut joins = Vec::with_capacity(n - 1);
             for _ in 1..n {
                 let cfg = config.clone();
-                joins.push(tokio::spawn(async move { SmbClient::connect(cfg).await }));
+                joins.push(tokio::spawn(async move { connect_with_retry(cfg).await }));
             }
             for join in joins {
                 let client = join
@@ -109,5 +162,108 @@ impl SmbPool {
     /// Number of connections in the pool.
     pub fn size(&self) -> usize {
         self.clients.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+    use tokio::time::Instant;
+
+    fn make_io_err(msg: &str) -> io::Error {
+        io::Error::other(msg.to_string())
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_on_first_attempt() {
+        let calls = AtomicU32::new(0);
+        let backoff = &[Duration::from_millis(10), Duration::from_millis(20)];
+        let r: io::Result<u32> = retry_with_backoff("test", backoff, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<u32, io::Error>(42) }
+        })
+        .await;
+        assert!(matches!(r, Ok(42)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        let calls = AtomicU32::new(0);
+        let backoff = &[Duration::from_millis(1), Duration::from_millis(1)];
+        let r: io::Result<&'static str> = retry_with_backoff("test", backoff, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(make_io_err("flake"))
+                } else {
+                    Ok("ok")
+                }
+            }
+        })
+        .await;
+        assert!(matches!(r, Ok("ok")));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_exhausts_attempts_and_returns_last_error() {
+        let calls = AtomicU32::new(0);
+        let backoff = &[
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ];
+        let r: io::Result<u32> = retry_with_backoff("test", backoff, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<u32, _>(make_io_err(&format!("err{n}"))) }
+        })
+        .await;
+        let err = r.unwrap_err();
+        // backoff.len() + 1 = 4 total attempts; last failure is err3
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(err.to_string().contains("err3"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn retry_empty_backoff_runs_exactly_once() {
+        let calls = AtomicU32::new(0);
+        let backoff: &[Duration] = &[];
+        let r: io::Result<u32> = retry_with_backoff("test", backoff, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err::<u32, _>(make_io_err("once")) }
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_honors_backoff_schedule_total_delay() {
+        // Sum of backoff entries is the floor on elapsed time when all attempts fail.
+        let backoff = &[Duration::from_millis(40), Duration::from_millis(60)];
+        let expected_floor = backoff.iter().sum::<Duration>();
+        let start = Instant::now();
+        let r: io::Result<u32> = retry_with_backoff("test", backoff, || async {
+            Err::<u32, _>(make_io_err("nope"))
+        })
+        .await;
+        let elapsed = start.elapsed();
+        assert!(r.is_err());
+        assert!(
+            elapsed >= expected_floor,
+            "elapsed {elapsed:?} < floor {expected_floor:?}"
+        );
+    }
+
+    #[test]
+    fn connect_backoff_schedule_is_monotonic_nondecreasing() {
+        let mut prev = Duration::ZERO;
+        for d in CONNECT_RETRY_BACKOFF {
+            assert!(*d >= prev, "backoff schedule must be nondecreasing");
+            prev = *d;
+        }
+        assert!(!CONNECT_RETRY_BACKOFF.is_empty());
     }
 }

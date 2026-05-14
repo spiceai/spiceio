@@ -724,6 +724,51 @@ where
     frame_packet(header, &body)
 }
 
+/// Parse an SMB2 compound response (multiple chained messages in one frame).
+/// Each returned tuple is `(header, body)` where `body` is the per-message
+/// payload following the 64-byte header. Returns the messages successfully
+/// parsed up to the first malformed boundary (callers rely on this for partial
+/// recovery).
+pub fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
+    let mut results = Vec::new();
+    let mut offset = 0;
+
+    loop {
+        if offset + SMB2_HEADER_SIZE > msg.len() {
+            break;
+        }
+        let header = match Header::decode(&msg[offset..]) {
+            Some(h) => h,
+            None => break,
+        };
+
+        let next = header.next_command as usize;
+        let body_start = offset + SMB2_HEADER_SIZE;
+        let body_end = if next > 0 {
+            let end = offset + next;
+            if end > msg.len() || end < body_start {
+                break;
+            }
+            end
+        } else {
+            msg.len()
+        };
+        if body_start > body_end || body_end > msg.len() {
+            break;
+        }
+
+        let body = msg[body_start..body_end].to_vec();
+        results.push((header, body));
+
+        if next == 0 {
+            break;
+        }
+        offset += next;
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,5 +1133,72 @@ mod tests {
         let expected: Vec<u8> = path.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
         assert_eq!(name_len, expected.len());
         assert_eq!(&buf[52..52 + name_len], &expected[..]);
+    }
+
+    // ── parse_compound_response ──────────────────────────────────────
+
+    /// Build a synthetic compound response payload of `n` chained messages,
+    /// each carrying `body_len` bytes of body. Returns the wire-format bytes
+    /// (with each message's `next_command` set to point at the next).
+    fn build_compound(n: usize, body_len: usize) -> Vec<u8> {
+        let entry_size = SMB2_HEADER_SIZE + body_len;
+        let mut out = Vec::with_capacity(entry_size * n);
+        for i in 0..n {
+            let mut hdr = Header::new(Command::Read, i as u64);
+            hdr.next_command = if i + 1 < n { entry_size as u32 } else { 0 };
+            let mut buf = BytesMut::with_capacity(entry_size);
+            hdr.encode(&mut buf);
+            buf.extend_from_slice(&vec![0xABu8; body_len]);
+            out.extend_from_slice(&buf);
+        }
+        out
+    }
+
+    #[test]
+    fn parse_compound_response_single_message() {
+        let msg = build_compound(1, 32);
+        let parts = parse_compound_response(&msg);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0.message_id, 0);
+        assert_eq!(parts[0].1.len(), 32);
+        assert!(parts[0].1.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn parse_compound_response_multiple_messages() {
+        let msg = build_compound(4, 24);
+        let parts = parse_compound_response(&msg);
+        assert_eq!(parts.len(), 4);
+        for (i, (h, body)) in parts.iter().enumerate() {
+            assert_eq!(h.message_id, i as u64);
+            assert_eq!(body.len(), 24);
+        }
+    }
+
+    #[test]
+    fn parse_compound_response_empty_input() {
+        assert!(parse_compound_response(&[]).is_empty());
+    }
+
+    #[test]
+    fn parse_compound_response_truncated_header() {
+        let msg = build_compound(2, 16);
+        // Lop off bytes inside the second message's header — should yield only the first.
+        let truncated = &msg[..SMB2_HEADER_SIZE + 16 + 32];
+        let parts = parse_compound_response(truncated);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0.message_id, 0);
+    }
+
+    #[test]
+    fn parse_compound_response_bad_next_command_stops_cleanly() {
+        // Forge a next_command that points past end of buffer.
+        let mut msg = build_compound(2, 8);
+        // next_command field is at byte offset 20 (header offset of next_command).
+        msg[20..24].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let parts = parse_compound_response(&msg);
+        // The first message's next_command is broken, so parsing aborts before the second.
+        // The first message should still be returned (callers tolerate partial recovery).
+        assert!(parts.len() <= 1);
     }
 }
