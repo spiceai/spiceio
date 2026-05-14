@@ -28,6 +28,12 @@ FAIL=0
 CONCURRENCY="${SPICEIO_STRESS_CONCURRENCY:-16}"
 CURL_TIMEOUT="${SPICEIO_STRESS_TIMEOUT:-30}"
 
+# Capture spiceio stderr for a post-run guard. We still tee to the script's
+# stderr so CI logs stream live; the file is only used to fail the build if
+# any unexpected `[spiceio] error:` lines slip through (e.g., something we
+# thought was an expected transient turns out to be logged as an error).
+SPICEIO_STDERR="${TMPDIR_BASE}/spiceio-stderr.log"
+
 # ── Cleanup ────────────────────────────────────────────────────────────────
 
 SPICEIO_PID=""
@@ -95,7 +101,7 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
-"$SPICEIO_BIN" &
+"$SPICEIO_BIN" 2> >(tee "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
 for i in $(seq 1 30); do
@@ -393,6 +399,28 @@ for i in $(seq 1 "$LARGE_N"); do
     assert_eq "large-${i} integrity" "$ORIG" "$GOT"
 done
 echo "  integrity: $((PASS - PREV_PASS))/${LARGE_N} verified"
+
+# ════════════════════════════════════════════════════════════════════════════
+# Stderr guard
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Any `[spiceio] error:` lines indicate spiceio surfaced something at error
+# level — that should not happen during a clean stress run. Expected
+# transients (sharing violations, NotFound, etc.) are mapped to typed
+# `io::ErrorKind`s and logged via `slog!` (without the "error:" prefix).
+# A hit here means we regressed: a new failure mode is leaking through the
+# generic 500 InternalError arm of `io_to_s3_error`. Fail the build so
+# someone investigates instead of merging it silently again.
+
+# Give the tee subshell a moment to flush after we killed spiceio in cleanup
+# (which runs on EXIT, so we have to flush sync here, before cleanup fires).
+sync 2>/dev/null || true
+if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
+    echo ""
+    echo "FAIL: spiceio emitted unexpected error log lines during stress run:"
+    grep '\[spiceio\] error:' "$SPICEIO_STDERR" | head -20
+    FAIL=$((FAIL + 1))
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # Summary

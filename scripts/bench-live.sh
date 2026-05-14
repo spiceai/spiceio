@@ -193,18 +193,27 @@ bench_concurrent_read() {
 # and runs the same dd-based write/read tests. Establishes the hard
 # ceiling for what the link can do, so we can attribute spiceio's
 # translation overhead.
+#
+# The mount uses the macOS Keychain for credentials rather than embedding
+# the password in the mount URL — embedded passwords leak via shell
+# history and `ps` argv listings, and shelling out to `perl -MURI::Escape`
+# adds a non-portable dependency. To prep the keychain once:
+#   mount_smbfs //user@server/share /tmp/mnt   # interactive; offers
+#                                                "Remember in keychain"
+#   umount /tmp/mnt
+# If the keychain entry is missing, the baseline is skipped.
 bench_mount_baseline() {
     local user="$SPICEIO_SMB_USER"
-    local pass="$SPICEIO_SMB_PASS"
     local server="$SMB_SERVER"
     local share="$SMB_SHARE"
 
     MOUNT_POINT="/tmp/spiceio-bench-mount-$$"
     mkdir -p "$MOUNT_POINT"
-    local escaped_pass
-    escaped_pass=$(printf '%s' "$pass" | perl -MURI::Escape -ne 'print uri_escape($_)')
-    if ! mount_smbfs -N "//${user}:${escaped_pass}@${server}/${share}" "$MOUNT_POINT" 2>/dev/null; then
-        echo "  (mount_smbfs failed — skipping baseline)"
+    # -N: no interactive password prompt. mount_smbfs will pull credentials
+    # from the macOS Keychain if available; we deliberately do not pass the
+    # password in argv so it doesn't leak via process listings.
+    if ! mount_smbfs -N "//${user}@${server}/${share}" "$MOUNT_POINT" 2>/dev/null; then
+        echo "  (mount_smbfs failed — set up keychain credentials first; skipping baseline)"
         rmdir "$MOUNT_POINT" 2>/dev/null
         MOUNT_POINT=""
         return

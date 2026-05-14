@@ -491,6 +491,11 @@ pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
 /// body) and returns a `Bytes` slice referencing the response payload. Avoids
 /// the extra body-copy that `decode_read_response_owned` would require if the
 /// caller had to split body off first.
+///
+/// Treats `data_offset` as an absolute offset from the start of the SMB2
+/// message and rejects offsets that fall inside the 64-byte header, so a
+/// malformed server response cannot trick us into returning header bytes as
+/// the read payload.
 pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
     if msg.len() < SMB2_HEADER_SIZE + 17 {
         return None;
@@ -499,7 +504,12 @@ pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
 
-    // `data_offset` is from the start of the SMB2 message, not the body.
+    // `data_offset` is from the start of the SMB2 message. It must not point
+    // inside the header (or before it) — a malformed server response with an
+    // offset < SMB2_HEADER_SIZE would otherwise slice into header bytes.
+    if data_offset < SMB2_HEADER_SIZE {
+        return None;
+    }
     let start = data_offset;
     let end = start.checked_add(data_length)?;
     if end > msg.len() {
@@ -923,6 +933,34 @@ mod tests {
         let data_offset = (SMB2_HEADER_SIZE + 16) as u16;
         body[2..4].copy_from_slice(&data_offset.to_le_bytes());
         body[4..8].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(decode_read_response_from_msg(msg).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_from_msg_rejects_offset_inside_header() {
+        // A malformed server response with data_offset < SMB2_HEADER_SIZE
+        // would otherwise have us slice into the SMB2 header bytes and return
+        // them as payload. The decoder must reject that case.
+        let mut msg = vec![0u8; SMB2_HEADER_SIZE + 32];
+        // Seed the header with a sentinel so we'd notice if it ever leaked
+        // back as payload.
+        for (i, b) in msg[..SMB2_HEADER_SIZE].iter_mut().enumerate() {
+            *b = 0xA0 | (i as u8 & 0x0F);
+        }
+        let body = &mut msg[SMB2_HEADER_SIZE..];
+        // data_offset = 16 (inside the header, well before SMB2_HEADER_SIZE).
+        body[2..4].copy_from_slice(&16u16.to_le_bytes());
+        body[4..8].copy_from_slice(&8u32.to_le_bytes());
+        assert!(decode_read_response_from_msg(msg).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_from_msg_rejects_offset_zero() {
+        // data_offset = 0 is also inside the header.
+        let mut msg = vec![0u8; SMB2_HEADER_SIZE + 32];
+        let body = &mut msg[SMB2_HEADER_SIZE..];
+        body[2..4].copy_from_slice(&0u16.to_le_bytes());
+        body[4..8].copy_from_slice(&4u32.to_le_bytes());
         assert!(decode_read_response_from_msg(msg).is_none());
     }
 

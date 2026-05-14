@@ -593,14 +593,23 @@ async fn handle_get_object(
 
     // Build response with streaming body.
     //
-    // Channel capacity is sized to match the SMB pipeline depth so a full
-    // batch of reads can dump into the channel without blocking the producer.
-    // That lets the SMB-reading task immediately issue the next pipelined
-    // batch (incurring its round-trip) while the HTTP-sending task drains
-    // the previous batch into the wire — back-to-back batches overlap, which
-    // is the difference between filling and starving the 10G link.
-    let (body, tx) = SpiceioBody::channel(crate::smb::ops::READ_PIPELINE_DEPTH);
+    // Channel capacity is sized so a full SMB pipeline batch can dump into
+    // the channel without blocking the producer — that lets the SMB-reading
+    // task immediately issue the next pipelined round-trip while the
+    // HTTP-sending task drains the previous batch, overlapping back-to-back
+    // batches.
+    //
+    // But we also cap by a per-request memory budget: with a configured
+    // `SPICEIO_SMB_MAX_IO` of 1 MiB and `READ_PIPELINE_DEPTH = 64`, an
+    // uncapped channel would buffer up to 64 MiB per concurrent GetObject.
+    // The budget keeps per-request memory bounded — at default 64 KiB
+    // chunks it stays at the full pipeline depth (4 MiB), and at 1 MiB
+    // chunks it falls to 8 (still room to overlap).
+    const STREAM_CHANNEL_MAX_BYTES: usize = 8 * 1024 * 1024;
     let chunk_size = handle.max_chunk;
+    let channel_cap = (STREAM_CHANNEL_MAX_BYTES / chunk_size as usize)
+        .clamp(1, crate::smb::ops::READ_PIPELINE_DEPTH);
+    let (body, tx) = SpiceioBody::channel(channel_cap);
 
     // Spawn background task to stream pipelined SMB reads into the channel.
     // Sends batches of read requests to fill the network pipe, then pushes
@@ -1452,6 +1461,19 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
             crate::serr!("[spiceio] access denied: {e}");
             error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied")
         }
+        // Sharing violations are an expected transient under concurrent
+        // writes (the underlying SMB server refused to open a file held by
+        // another handle). Map to 503 SlowDown — the standard S3 retryable
+        // status — and log at info level instead of `serr!`, since these
+        // are not bugs and shouldn't paint CI logs red.
+        io::ErrorKind::ResourceBusy => {
+            crate::slog!("[spiceio] busy (retry): {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SlowDown",
+                "Please reduce your request rate.",
+            )
+        }
         _ => {
             crate::serr!("[spiceio] error: {e}");
             error_response(
@@ -1508,5 +1530,44 @@ async fn collect_body(req: Request<Incoming>) -> Bytes {
             crate::serr!("[spiceio] body collect error: {e}");
             Bytes::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole reason this file exists: unit tests in `smb::client` already
+    /// verify `STATUS_SHARING_VIOLATION → io::ErrorKind::ResourceBusy`. What
+    /// was missing was the next hop — that the HTTP layer maps that kind to
+    /// a retryable S3 status, not 500 InternalError. Without this assertion,
+    /// the prior regression (sharing violations leaking as 500 with noisy
+    /// `error:` logs) had no test to catch it.
+    #[test]
+    fn io_to_s3_error_maps_resource_busy_to_slow_down() {
+        let err = io::Error::new(io::ErrorKind::ResourceBusy, "sharing violation: foo");
+        let resp = io_to_s3_error(&err);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn io_to_s3_error_maps_not_found_to_404() {
+        let err = io::Error::new(io::ErrorKind::NotFound, "missing");
+        let resp = io_to_s3_error(&err);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn io_to_s3_error_maps_permission_denied_to_403() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "nope");
+        let resp = io_to_s3_error(&err);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn io_to_s3_error_other_falls_back_to_500() {
+        let err = io::Error::other("unexpected");
+        let resp = io_to_s3_error(&err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
