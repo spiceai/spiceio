@@ -440,7 +440,17 @@ assert_eq "full GET after cancellation succeeds" "$ORIG_MD5" "$GOT_MD5"
 # A `[spiceio] error:` hit here means a new failure mode is leaking through
 # the generic 500 InternalError arm of `io_to_s3_error` — fail the build.
 
-sync 2>/dev/null || true
+# Stop spiceio *before* grepping the captured stderr. tee in the process
+# substitution only closes the capture file when spiceio's stderr fd closes,
+# so we have to kill+wait here rather than rely on the EXIT trap. Clear
+# SPICEIO_PID so the trap's own kill becomes a no-op.
+if [[ -n "$SPICEIO_PID" ]]; then
+    kill "$SPICEIO_PID" 2>/dev/null || true
+    wait "$SPICEIO_PID" 2>/dev/null || true
+    SPICEIO_PID=""
+fi
+sleep 0.2  # tee in <(...) isn't directly waitable; let it drain.
+
 if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
     echo ""
     echo "FAIL: spiceio emitted unexpected error log lines during extended run:"

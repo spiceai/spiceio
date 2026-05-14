@@ -417,7 +417,22 @@ fi
 # (NotFound on HEAD probes, sharing violations, etc.) are mapped to typed
 # `io::ErrorKind`s and logged via `slog!` without the "error:" prefix.
 
-sync 2>/dev/null || true
+# Stop both spiceio instances *before* grepping the captured stderr. tee in
+# the process substitutions only closes the capture file when each spiceio
+# closes its stderr fd, so we have to kill+wait here rather than rely on
+# the EXIT trap. Clear PIDs so the trap's own kills become no-ops.
+if [[ -n "$SPICEIO_PID2" ]]; then
+    kill "$SPICEIO_PID2" 2>/dev/null || true
+    wait "$SPICEIO_PID2" 2>/dev/null || true
+    SPICEIO_PID2=""
+fi
+if [[ -n "$SPICEIO_PID" ]]; then
+    kill "$SPICEIO_PID" 2>/dev/null || true
+    wait "$SPICEIO_PID" 2>/dev/null || true
+    SPICEIO_PID=""
+fi
+sleep 0.2  # tee in <(...) isn't directly waitable; let it drain.
+
 if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
     echo ""
     echo "[test] FAIL: spiceio emitted unexpected error log lines:"

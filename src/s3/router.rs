@@ -413,6 +413,24 @@ async fn handle_list_objects(
 
 // ── GetObject (streaming, with Range + Conditional) ─────────────────────────
 
+/// Compute the SMB-reads→HTTP-writes channel capacity for a streaming
+/// GetObject given the SMB-negotiated chunk size.
+///
+/// Sized to hold one full SMB read pipeline batch (so back-to-back batches
+/// can overlap) but capped by an 8 MiB per-request memory budget so a
+/// configured `SPICEIO_SMB_MAX_IO` of 1 MiB doesn't blow up to 64 MiB of
+/// buffering per concurrent stream.
+///
+/// Guards against `chunk_size = 0`: `handle.max_chunk` ultimately comes from
+/// the SMB server's `max_read_size` in the negotiate response. If a server
+/// (or a misconfiguration) yields 0, naive `BUDGET / chunk_size` would
+/// divide-by-zero panic and crash the streaming task. We floor at 1 here.
+fn stream_channel_capacity(chunk_size: u32) -> usize {
+    const STREAM_CHANNEL_MAX_BYTES: usize = 8 * 1024 * 1024;
+    let chunk_size_for_cap = (chunk_size as usize).max(1);
+    (STREAM_CHANNEL_MAX_BYTES / chunk_size_for_cap).clamp(1, crate::smb::ops::READ_PIPELINE_DEPTH)
+}
+
 async fn handle_get_object(
     hdrs: &http::HeaderMap,
     share: &ShareSession,
@@ -597,18 +615,13 @@ async fn handle_get_object(
     // the channel without blocking the producer — that lets the SMB-reading
     // task immediately issue the next pipelined round-trip while the
     // HTTP-sending task drains the previous batch, overlapping back-to-back
-    // batches.
-    //
-    // But we also cap by a per-request memory budget: with a configured
+    // batches. We also cap by a per-request memory budget: with a configured
     // `SPICEIO_SMB_MAX_IO` of 1 MiB and `READ_PIPELINE_DEPTH = 64`, an
     // uncapped channel would buffer up to 64 MiB per concurrent GetObject.
-    // The budget keeps per-request memory bounded — at default 64 KiB
-    // chunks it stays at the full pipeline depth (4 MiB), and at 1 MiB
-    // chunks it falls to 8 (still room to overlap).
-    const STREAM_CHANNEL_MAX_BYTES: usize = 8 * 1024 * 1024;
+    // At default 64 KiB chunks the channel stays at the full pipeline depth
+    // (4 MiB); at 1 MiB chunks it falls to 8 (still room to overlap).
     let chunk_size = handle.max_chunk;
-    let channel_cap = (STREAM_CHANNEL_MAX_BYTES / chunk_size as usize)
-        .clamp(1, crate::smb::ops::READ_PIPELINE_DEPTH);
+    let channel_cap = stream_channel_capacity(chunk_size);
     let (body, tx) = SpiceioBody::channel(channel_cap);
 
     // Spawn background task to stream pipelined SMB reads into the channel.
@@ -1569,5 +1582,48 @@ mod tests {
         let err = io::Error::other("unexpected");
         let resp = io_to_s3_error(&err);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── stream_channel_capacity ─────────────────────────────────────────────
+
+    #[test]
+    fn stream_channel_capacity_handles_zero_chunk() {
+        // The SMB negotiate response is the source of `max_chunk`; an
+        // unusual server (or a misconfiguration) could yield 0. The naive
+        // `BUDGET / 0` would panic and crash the streaming task — the
+        // floor-at-1 inside `stream_channel_capacity` keeps it safe. The
+        // exact value doesn't matter (a 0-byte chunk is nonsense anyway);
+        // we only assert (a) we don't panic and (b) the result is a sane
+        // pipeline-depth-bounded slot count.
+        let cap = stream_channel_capacity(0);
+        assert!(
+            (1..=crate::smb::ops::READ_PIPELINE_DEPTH).contains(&cap),
+            "expected 1..={} got {cap}",
+            crate::smb::ops::READ_PIPELINE_DEPTH
+        );
+    }
+
+    #[test]
+    fn stream_channel_capacity_default_chunk_uses_full_pipeline() {
+        // 64 KiB chunks → 8 MiB / 64 KiB = 128, clamped to the pipeline
+        // depth so a full SMB read batch can dump into the channel.
+        assert_eq!(
+            stream_channel_capacity(65536),
+            crate::smb::ops::READ_PIPELINE_DEPTH
+        );
+    }
+
+    #[test]
+    fn stream_channel_capacity_large_chunk_falls_below_pipeline() {
+        // 1 MiB chunks → 8 MiB / 1 MiB = 8, well below pipeline depth.
+        // This is the case the per-request memory budget exists to handle.
+        assert_eq!(stream_channel_capacity(1024 * 1024), 8);
+    }
+
+    #[test]
+    fn stream_channel_capacity_huge_chunk_floors_at_one() {
+        // A chunk bigger than the entire budget still yields a 1-slot
+        // channel, never 0 — the producer can always make progress.
+        assert_eq!(stream_channel_capacity(16 * 1024 * 1024), 1);
     }
 }

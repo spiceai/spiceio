@@ -412,9 +412,21 @@ echo "  integrity: $((PASS - PREV_PASS))/${LARGE_N} verified"
 # generic 500 InternalError arm of `io_to_s3_error`. Fail the build so
 # someone investigates instead of merging it silently again.
 
-# Give the tee subshell a moment to flush after we killed spiceio in cleanup
-# (which runs on EXIT, so we have to flush sync here, before cleanup fires).
-sync 2>/dev/null || true
+# Stop spiceio *before* grepping the captured stderr. spiceio's stderr is
+# piped through `tee` running in a process substitution; the tee process
+# only finishes draining and closes the capture file when spiceio closes its
+# stderr fd. The cleanup trap runs on EXIT, so it would fire too late for
+# the guard below — we have to kill+wait here. Set SPICEIO_PID empty so the
+# trap's own kill becomes a no-op.
+if [[ -n "$SPICEIO_PID" ]]; then
+    kill "$SPICEIO_PID" 2>/dev/null || true
+    wait "$SPICEIO_PID" 2>/dev/null || true
+    SPICEIO_PID=""
+fi
+# tee in process substitution isn't directly waitable from bash, so give it
+# a brief moment to drain after spiceio closed its stderr.
+sleep 0.2
+
 if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
     echo ""
     echo "FAIL: spiceio emitted unexpected error log lines during stress run:"
