@@ -34,7 +34,7 @@ SPICEIO_PID=""
 cleanup() {
     echo ""
     echo "[stress] cleaning up..."
-    aws --endpoint-url "$ENDPOINT" --no-sign-request \
+    aws --endpoint-url "$ENDPOINT" --no-sign-request --region "$REGION" \
         s3 rm "s3://${BUCKET}/${PREFIX}/" --recursive --quiet 2>/dev/null || true
     if [[ -n "$SPICEIO_PID" ]]; then
         kill "$SPICEIO_PID" 2>/dev/null || true
