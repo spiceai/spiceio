@@ -712,7 +712,12 @@ impl ShareSession {
 }
 
 /// Number of read requests to pipeline in a single batch.
-const PIPELINE_DEPTH: usize = 64;
+///
+/// Public so the HTTP streaming path can size its response channel to the
+/// same depth — back-to-back read batches overlap with HTTP draining when
+/// the channel can hold a full batch (see `s3::router::handle_get_object`).
+pub const READ_PIPELINE_DEPTH: usize = 64;
+const PIPELINE_DEPTH: usize = READ_PIPELINE_DEPTH;
 
 impl FileHandle {
     /// Read a chunk at the given offset. Returns empty bytes at EOF.
