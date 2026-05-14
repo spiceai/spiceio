@@ -362,8 +362,25 @@ impl SmbClient {
         } else {
             DEFAULT_MAX_IO
         };
-        self.max_read_size = neg_resp.max_read_size.min(transact).min(io_cap);
-        self.max_write_size = neg_resp.max_write_size.min(transact).min(io_cap);
+        // Substitute io_cap for any negotiated value that's 0. A buggy or
+        // misconfigured server can advertise max_read_size/max_write_size/
+        // max_transact_size = 0; if we let that propagate, every downstream
+        // pipeline call ends up doing `remaining.div_ceil(0)` and panics the
+        // request task — that's the failure mode behind sccache "Connection
+        // refused" against a long-running spiceio.
+        let nonzero = |v: u32, name: &str| -> u32 {
+            if v == 0 {
+                crate::serr!("[spiceio] smb negotiated {name}=0 — substituting io_cap={io_cap}");
+                io_cap
+            } else {
+                v
+            }
+        };
+        let neg_read = nonzero(neg_resp.max_read_size, "max_read_size");
+        let neg_write = nonzero(neg_resp.max_write_size, "max_write_size");
+        let neg_transact = nonzero(transact, "max_transact_size");
+        self.max_read_size = neg_read.min(neg_transact).min(io_cap);
+        self.max_write_size = neg_write.min(neg_transact).min(io_cap);
         // Cap at 64KB for compound requests — some NAS servers reject larger
         // payloads inside compound (chained) operations.
         self.compound_max_read_size = self.max_read_size.min(65536);
@@ -526,6 +543,17 @@ impl SmbClient {
     ) -> io::Result<Vec<bytes::Bytes>> {
         if count == 0 {
             return Ok(Vec::new());
+        }
+        // Defensive guard: a zero `chunk_size` would panic later on
+        // `remaining.div_ceil(chunk_size as u64)` in callers, and would
+        // make this function issue `count` duplicate reads at the same
+        // offset. Callers are expected to have validated already, but
+        // we treat this as a hard error rather than UB.
+        if chunk_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pipelined_read called with chunk_size = 0",
+            ));
         }
 
         // Allocate message IDs in a contiguous batch so we can map

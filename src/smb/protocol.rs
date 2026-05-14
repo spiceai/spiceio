@@ -493,21 +493,27 @@ pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
 /// caller had to split body off first.
 ///
 /// Treats `data_offset` as an absolute offset from the start of the SMB2
-/// message and rejects offsets that fall inside the 64-byte header, so a
-/// malformed server response cannot trick us into returning header bytes as
-/// the read payload.
+/// message and rejects offsets that fall inside the 64-byte header *or*
+/// inside the 16 bytes of fixed read-response fields that precede the data
+/// buffer. A malformed server response with an offset short of
+/// `SMB2_HEADER_SIZE + 16` would otherwise let us return header bytes — or
+/// the response's own StructureSize/DataOffset/DataLength/etc — as the file
+/// payload.
 pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
-    if msg.len() < SMB2_HEADER_SIZE + 17 {
+    if msg.len() < SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART {
         return None;
     }
     let body = &msg[SMB2_HEADER_SIZE..];
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
 
-    // `data_offset` is from the start of the SMB2 message. It must not point
-    // inside the header (or before it) — a malformed server response with an
-    // offset < SMB2_HEADER_SIZE would otherwise slice into header bytes.
-    if data_offset < SMB2_HEADER_SIZE {
+    // `data_offset` is from the start of the SMB2 message. The minimum
+    // legitimate value points at the first byte of the read response's
+    // Buffer field — anything before that overlaps the SMB2 header or the
+    // read response's fixed fields (StructureSize, DataOffset, Reserved,
+    // DataLength, DataRemaining, Flags = 16 bytes).
+    let min_offset = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
+    if data_offset < min_offset {
         return None;
     }
     let start = data_offset;
@@ -518,6 +524,11 @@ pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
     let bytes = Bytes::from(msg);
     Some(bytes.slice(start..end))
 }
+
+/// Size of the read response's fixed fields (preceding the Buffer):
+/// StructureSize(2) + DataOffset(1) + Reserved(1) + DataLength(4)
+/// + DataRemaining(4) + Flags(4) = 16 bytes.
+pub const READ_RESPONSE_FIXED_PART: usize = 16;
 
 // ── Write ───────────────────────────────────────────────────────────────────
 
@@ -962,6 +973,47 @@ mod tests {
         body[2..4].copy_from_slice(&0u16.to_le_bytes());
         body[4..8].copy_from_slice(&4u32.to_le_bytes());
         assert!(decode_read_response_from_msg(msg).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_from_msg_rejects_offset_in_response_fixed_fields() {
+        // data_offset that points inside the read response's fixed fields
+        // (StructureSize/DataOffset/Reserved/DataLength/DataRemaining/Flags
+        // — 16 bytes after the SMB2 header) would otherwise leak the
+        // response's own structural fields back as the file payload.
+        let mut msg = vec![0u8; SMB2_HEADER_SIZE + 32];
+        let body = &mut msg[SMB2_HEADER_SIZE..];
+        // Offset = SMB2_HEADER_SIZE + 4 — points inside DataLength.
+        let bad_offset = (SMB2_HEADER_SIZE + 4) as u16;
+        body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(decode_read_response_from_msg(msg).is_none());
+
+        // Offset = SMB2_HEADER_SIZE + 15 — one byte short of the buffer.
+        let mut msg = vec![0u8; SMB2_HEADER_SIZE + 32];
+        let body = &mut msg[SMB2_HEADER_SIZE..];
+        let bad_offset = (SMB2_HEADER_SIZE + 15) as u16;
+        body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(decode_read_response_from_msg(msg).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_from_msg_accepts_minimum_valid_offset() {
+        // SMB2_HEADER_SIZE + 16 is the first byte of the Buffer field —
+        // the smallest legitimate data_offset. Make sure we don't
+        // over-reject the boundary.
+        let payload = b"data";
+        let mut msg = vec![0u8; SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART + payload.len()];
+        let body = &mut msg[SMB2_HEADER_SIZE..];
+        let min_offset = (SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART) as u16;
+        body[2..4].copy_from_slice(&min_offset.to_le_bytes());
+        body[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let buf_start = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
+        msg[buf_start..buf_start + payload.len()].copy_from_slice(payload);
+
+        let data = decode_read_response_from_msg(msg).unwrap();
+        assert_eq!(&data[..], payload);
     }
 
     #[test]

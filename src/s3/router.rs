@@ -621,6 +621,18 @@ async fn handle_get_object(
     // At default 64 KiB chunks the channel stays at the full pipeline depth
     // (4 MiB); at 1 MiB chunks it falls to 8 (still room to overlap).
     let chunk_size = handle.max_chunk;
+    // Defense in depth: the SMB client floors any zero values from the
+    // server's negotiate response, but if that floor ever regresses we'd
+    // rather return a 500 here than panic the streaming task inside
+    // `handle.read_pipeline(...)` on `remaining.div_ceil(0)`.
+    if chunk_size == 0 {
+        let _ = handle.close().await;
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "SMB server negotiated max_read_size = 0",
+        );
+    }
     let channel_cap = stream_channel_capacity(chunk_size);
     let (body, tx) = SpiceioBody::channel(channel_cap);
 
