@@ -591,8 +591,15 @@ async fn handle_get_object(
 
     let content_length = end - start + 1;
 
-    // Build response with streaming body
-    let (body, tx) = SpiceioBody::channel(4);
+    // Build response with streaming body.
+    //
+    // Channel capacity is sized to match the SMB pipeline depth so a full
+    // batch of reads can dump into the channel without blocking the producer.
+    // That lets the SMB-reading task immediately issue the next pipelined
+    // batch (incurring its round-trip) while the HTTP-sending task drains
+    // the previous batch into the wire — back-to-back batches overlap, which
+    // is the difference between filling and starving the 10G link.
+    let (body, tx) = SpiceioBody::channel(crate::smb::ops::READ_PIPELINE_DEPTH);
     let chunk_size = handle.max_chunk;
 
     // Spawn background task to stream pipelined SMB reads into the channel.
