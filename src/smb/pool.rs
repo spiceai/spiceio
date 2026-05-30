@@ -4,8 +4,8 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use super::client::{SmbClient, SmbConfig};
@@ -69,9 +69,23 @@ async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
 /// Requests are distributed across connections via round-robin. Each connection
 /// is an independently authenticated SMB session with its own TCP stream, so
 /// concurrent operations don't serialize on a single mutex.
+/// One pool connection: an authenticated session and its tree-connect id for
+/// the share. Both are replaced together when the slot is healed.
+struct Slot {
+    client: Arc<SmbClient>,
+    tree_id: u32,
+}
+
 pub struct SmbPool {
-    clients: Vec<Arc<SmbClient>>,
+    /// Swappable slots — a poisoned connection is replaced in place by `heal`.
+    slots: RwLock<Vec<Slot>>,
+    /// Fixed number of slots (never changes; only their contents do).
+    n: usize,
     next: AtomicUsize,
+    /// Config for reconnecting a poisoned slot.
+    config: SmbConfig,
+    /// Share name, set by `connect_share`, needed to re-tree-connect on heal.
+    share: OnceLock<String>,
     /// Cached from the first connection's negotiate response.
     pub max_read_size: u32,
     pub max_write_size: u32,
@@ -112,9 +126,18 @@ impl SmbPool {
             crate::slog!("[spiceio] smb pool: {n} connections ready");
         }
 
+        let slots: Vec<Slot> = clients
+            .into_iter()
+            .map(|client| Slot { client, tree_id: 0 })
+            .collect();
+        let n = slots.len();
+
         Ok(Arc::new(Self {
-            clients,
+            slots: RwLock::new(slots),
+            n,
             next: AtomicUsize::new(0),
+            config,
+            share: OnceLock::new(),
             max_read_size,
             max_write_size,
             compound_max_read_size,
@@ -122,49 +145,73 @@ impl SmbPool {
         }))
     }
 
+    /// Tree-connect every slot to `share` and remember the share name so a
+    /// healed (reconnected) slot can be re-tree-connected.
+    pub async fn connect_share(&self, share: &str) -> io::Result<()> {
+        let clients: Vec<Arc<SmbClient>> = {
+            self.slots
+                .read()
+                .unwrap()
+                .iter()
+                .map(|s| s.client.clone())
+                .collect()
+        };
+        for (idx, client) in clients.iter().enumerate() {
+            let tree_id = client.tree_connect(share).await?;
+            self.slots.write().unwrap()[idx].tree_id = tree_id;
+        }
+        let _ = self.share.set(share.to_string());
+        Ok(())
+    }
+
     /// Pick the next healthy connection via round-robin, skipping poisoned ones.
-    /// Falls back to a poisoned connection if all are poisoned (error will
-    /// surface on the first I/O attempt).
-    pub fn get(&self) -> &Arc<SmbClient> {
-        let n = self.clients.len();
+    /// Returns an owned `Arc` and its tree id. Falls back to a poisoned slot if
+    /// all are poisoned — the I/O fails fast and `heal` reconnects it.
+    pub fn pick(&self) -> (Arc<SmbClient>, u32) {
+        let slots = self.slots.read().unwrap();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        for i in 0..n {
-            let idx = (start + i) % n;
-            if !self.clients[idx].is_poisoned() {
-                return &self.clients[idx];
+        for i in 0..self.n {
+            let idx = (start + i) % self.n;
+            if !slots[idx].client.is_poisoned() {
+                return (slots[idx].client.clone(), slots[idx].tree_id);
             }
         }
-        // All poisoned — return round-robin pick; caller gets BrokenPipe on I/O
-        &self.clients[start % n]
+        // All poisoned — return a round-robin pick; the I/O will fail fast.
+        let idx = start % self.n;
+        (slots[idx].client.clone(), slots[idx].tree_id)
     }
 
-    /// Get the next round-robin index (and advance the counter), preferring
-    /// healthy connections.
-    pub fn next_index(&self) -> usize {
-        let n = self.clients.len();
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
-        for i in 0..n {
-            let idx = (start + i) % n;
-            if !self.clients[idx].is_poisoned() {
-                return idx;
+    /// Reconnect any poisoned slots and re-tree-connect them to the share.
+    /// Best-effort: a slot whose reconnect fails stays poisoned and is retried
+    /// on the next pass. Without this the pool degrades monotonically — every
+    /// timeout would permanently remove a connection until the proxy is wedged.
+    pub async fn heal(&self) {
+        let Some(share) = self.share.get() else {
+            return;
+        };
+        for idx in 0..self.n {
+            let poisoned = self.slots.read().unwrap()[idx].client.is_poisoned();
+            if !poisoned {
+                continue;
+            }
+            match connect_with_retry(self.config.clone()).await {
+                Ok(client) => match client.tree_connect(share).await {
+                    Ok(tree_id) => {
+                        self.slots.write().unwrap()[idx] = Slot { client, tree_id };
+                        crate::slog!("[spiceio] healed poisoned smb connection (slot {idx})");
+                    }
+                    Err(e) => {
+                        crate::serr!("[spiceio] heal tree-connect failed (slot {idx}): {e}")
+                    }
+                },
+                Err(e) => crate::serr!("[spiceio] heal reconnect failed (slot {idx}): {e}"),
             }
         }
-        start % n
-    }
-
-    /// Access a specific connection by index.
-    pub fn client(&self, idx: usize) -> &Arc<SmbClient> {
-        &self.clients[idx]
-    }
-
-    /// Access all connections (for tree-connect setup).
-    pub fn clients(&self) -> &[Arc<SmbClient>] {
-        &self.clients
     }
 
     /// Number of connections in the pool.
     pub fn size(&self) -> usize {
-        self.clients.len()
+        self.n
     }
 }
 

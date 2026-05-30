@@ -8,6 +8,7 @@ use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -52,10 +53,16 @@ struct Config {
 impl Config {
     fn from_env() -> Self {
         Self {
-            bind_addr: env::var("SPICEIO_BIND")
-                .unwrap_or_else(|_| "0.0.0.0:8333".into())
-                .parse()
-                .expect("SPICEIO_BIND must be a valid socket address"),
+            bind_addr: {
+                let raw = env::var("SPICEIO_BIND").unwrap_or_else(|_| "0.0.0.0:8333".into());
+                match raw.parse() {
+                    Ok(addr) => addr,
+                    Err(_) => {
+                        serr!("[spiceio] SPICEIO_BIND is not a valid socket address: {raw}");
+                        std::process::exit(1);
+                    }
+                }
+            },
             smb_server: env::var("SPICEIO_SMB_SERVER").expect("SPICEIO_SMB_SERVER is required"),
             smb_port: env::var("SPICEIO_SMB_PORT")
                 .ok()
@@ -147,8 +154,10 @@ async fn main() {
             .expect("failed to connect to SMB share"),
     );
 
-    // Clean up orphaned WAL temp files from prior crashes
+    // Clean up orphaned WAL temp files and stale multipart upload dirs from
+    // prior crashes (the in-memory upload map does not survive a restart).
     share.cleanup_wal().await;
+    share.cleanup_uploads().await;
 
     let state = Arc::new(AppState {
         share,
@@ -163,6 +172,53 @@ async fn main() {
         config.bucket_name,
         config.region
     );
+
+    // Background pool healer — reconnect SMB connections poisoned by a
+    // transient outage so the pool recovers instead of degrading to a wedge.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                state.share.heal().await;
+            }
+        });
+    }
+
+    // Background reaper — abort multipart uploads abandoned past the TTL,
+    // freeing their in-memory entry and temp files.
+    {
+        let state = Arc::clone(&state);
+        let ttl = env::var("SPICEIO_MULTIPART_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(86_400u64);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let expired = state.multipart.reap_expired(now, ttl).await;
+                for upload in &expired {
+                    for part in upload.parts.values() {
+                        state.share.delete_temp(&part.temp_path).await;
+                    }
+                    state
+                        .share
+                        .remove_dir(&MultipartStore::temp_dir(&upload.upload_id))
+                        .await;
+                }
+                if !expired.is_empty() {
+                    slog!(
+                        "[spiceio] reaped {} abandoned multipart upload(s)",
+                        expired.len()
+                    );
+                }
+            }
+        });
+    }
 
     // Accept loop
     loop {

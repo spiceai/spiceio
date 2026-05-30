@@ -60,27 +60,41 @@ pub fn parse_range(header: &str) -> Option<RangeSpec> {
 
 impl RangeSpec {
     /// Resolve to absolute byte positions given total file size.
-    /// Returns `None` if `total == 0` or `start >= total`.
+    /// Returns `None` (→ 416 Range Not Satisfiable) for any unsatisfiable
+    /// range: empty file, `start >= total`, a zero-length suffix (`bytes=-0`),
+    /// or an inverted range (`bytes=10-5`). Guaranteeing `start <= end <= total-1`
+    /// means callers can compute `end - start + 1` without underflow.
     pub fn resolve(&self, total: u64) -> Option<(u64, u64)> {
         if total == 0 {
             return None;
         }
-        match (self.start, self.end) {
+        let (start, end) = match (self.start, self.end) {
             (Some(s), Some(e)) => {
                 if s >= total {
                     return None;
                 }
-                Some((s, e.min(total - 1)))
+                (s, e.min(total - 1))
             }
             (Some(s), None) => {
                 if s >= total {
                     return None;
                 }
-                Some((s, total - 1))
+                (s, total - 1)
             }
-            (None, Some(suffix)) => Some((total.saturating_sub(suffix), total - 1)),
-            (None, None) => Some((0, total - 1)),
+            (None, Some(suffix)) => {
+                // `bytes=-N` = last N bytes; N == 0 is unsatisfiable.
+                if suffix == 0 {
+                    return None;
+                }
+                (total.saturating_sub(suffix), total - 1)
+            }
+            (None, None) => (0, total - 1),
+        };
+        // Reject inverted ranges so `end - start + 1` never underflows.
+        if end < start {
+            return None;
         }
+        Some((start, end))
     }
 }
 
@@ -176,6 +190,55 @@ pub fn generate_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RangeSpec::resolve edge cases (no underflow) ──────────────────
+
+    #[test]
+    fn range_resolve_rejects_inverted() {
+        let r = RangeSpec {
+            start: Some(10),
+            end: Some(5),
+        };
+        assert_eq!(r.resolve(100), None);
+    }
+
+    #[test]
+    fn range_resolve_rejects_zero_suffix() {
+        let r = RangeSpec {
+            start: None,
+            end: Some(0),
+        };
+        assert_eq!(r.resolve(100), None);
+    }
+
+    #[test]
+    fn range_resolve_start_past_eof() {
+        let r = RangeSpec {
+            start: Some(100),
+            end: None,
+        };
+        assert_eq!(r.resolve(100), None);
+    }
+
+    #[test]
+    fn range_resolve_clamps_end_and_suffix() {
+        assert_eq!(
+            RangeSpec {
+                start: Some(0),
+                end: Some(999)
+            }
+            .resolve(100),
+            Some((0, 99))
+        );
+        assert_eq!(
+            RangeSpec {
+                start: None,
+                end: Some(10)
+            }
+            .resolve(100),
+            Some((90, 99))
+        );
+    }
 
     // ── parse_range ───────────────────────────────────────────────────
 

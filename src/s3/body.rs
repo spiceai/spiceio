@@ -6,17 +6,21 @@
 
 use bytes::Bytes;
 use http_body::{Body, Frame};
-use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
+
+/// Item carried by the streaming channel: a data chunk, or an error that
+/// aborts the transfer mid-stream so the client never mistakes a truncated
+/// body for a complete one.
+pub type StreamItem = Result<Bytes, std::io::Error>;
 
 /// Unified response body — either fully buffered or streamed via channel.
 pub enum SpiceioBody {
     /// Complete body in memory (XML responses, errors, small payloads).
     Full(Option<Bytes>),
     /// Streaming body fed by an mpsc channel (GetObject, large reads).
-    Stream(mpsc::Receiver<Bytes>),
+    Stream(mpsc::Receiver<StreamItem>),
 }
 
 impl SpiceioBody {
@@ -34,8 +38,9 @@ impl SpiceioBody {
         Self::Full(None)
     }
 
-    /// Create a streaming body, returning (body, sender).
-    pub fn channel(buffer: usize) -> (Self, mpsc::Sender<Bytes>) {
+    /// Create a streaming body, returning (body, sender). Send `Ok(chunk)` for
+    /// data and `Err(e)` to abort the transfer (e.g. a mid-stream read error).
+    pub fn channel(buffer: usize) -> (Self, mpsc::Sender<StreamItem>) {
         let (tx, rx) = mpsc::channel(buffer);
         (Self::Stream(rx), tx)
     }
@@ -43,7 +48,7 @@ impl SpiceioBody {
 
 impl Body for SpiceioBody {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = std::io::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -54,7 +59,9 @@ impl Body for SpiceioBody {
                 // Yield the data once, then signal end of stream
                 Poll::Ready(data.take().map(|b| Ok(Frame::data(b))))
             }
-            SpiceioBody::Stream(rx) => rx.poll_recv(cx).map(|opt| opt.map(|b| Ok(Frame::data(b)))),
+            SpiceioBody::Stream(rx) => rx
+                .poll_recv(cx)
+                .map(|opt| opt.map(|res| res.map(Frame::data))),
         }
     }
 

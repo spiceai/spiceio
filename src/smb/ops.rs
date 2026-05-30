@@ -17,7 +17,6 @@ use super::protocol::*;
 /// serializing on a single mutex.
 pub struct ShareSession {
     pool: Arc<SmbPool>,
-    tree_ids: Vec<u32>,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -34,19 +33,19 @@ pub struct FileHandle {
 impl ShareSession {
     /// Connect to a share on every connection in the pool.
     pub async fn connect(pool: Arc<SmbPool>, share: &str) -> io::Result<Self> {
-        let mut tree_ids = Vec::with_capacity(pool.size());
-        for i in 0..pool.size() {
-            let client = &pool.clients()[i];
-            let tree_id = client.tree_connect(share).await?;
-            tree_ids.push(tree_id);
-        }
-        Ok(Self { pool, tree_ids })
+        pool.connect_share(share).await?;
+        Ok(Self { pool })
     }
 
-    /// Pick the next connection + tree_id via round-robin.
-    fn pick(&self) -> (&Arc<SmbClient>, u32) {
-        let idx = self.pool.next_index() % self.pool.size();
-        (self.pool.client(idx), self.tree_ids[idx])
+    /// Reconnect any poisoned pool connections. Run periodically by a
+    /// background task so the pool recovers from transient SMB outages.
+    pub async fn heal(&self) {
+        self.pool.heal().await;
+    }
+
+    /// Pick the next connection + tree_id via round-robin (owned `Arc`).
+    fn pick(&self) -> (Arc<SmbClient>, u32) {
+        self.pool.pick()
     }
 
     /// Max read size for compound operations (64KB cap for compatibility).
@@ -78,7 +77,7 @@ impl ShareSession {
         let meta = ObjectMeta {
             size: cr.file_size,
             last_modified: filetime_to_epoch_secs(cr.last_write_time),
-            etag: format!("{:016x}", cr.last_write_time),
+            etag: etag_for(cr.file_size, cr.last_write_time),
             content_type: guess_content_type(key),
         };
 
@@ -105,12 +104,12 @@ impl ShareSession {
         let meta = ObjectMeta {
             size: file.file_size,
             last_modified: filetime_to_epoch_secs(file.last_write_time),
-            etag: format!("{:016x}", file.last_write_time),
+            etag: etag_for(file.file_size, file.last_write_time),
             content_type: guess_content_type(key),
         };
 
         Ok(FileHandle {
-            client: Arc::clone(client),
+            client: Arc::clone(&client),
             tree_id,
             file_id: file.file_id,
             file_size: file.file_size,
@@ -123,7 +122,7 @@ impl ShareSession {
     pub async fn open_write(&self, key: &str) -> io::Result<FileHandle> {
         let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs_on(client, tree_id, &smb_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &smb_path)
             .await?;
 
         let file = client
@@ -148,7 +147,7 @@ impl ShareSession {
         };
 
         Ok(FileHandle {
-            client: Arc::clone(client),
+            client: Arc::clone(&client),
             tree_id,
             file_id: file.file_id,
             file_size: 0,
@@ -214,7 +213,7 @@ impl ShareSession {
                     key,
                     size: entry.file_size,
                     last_modified: filetime_to_epoch_secs(entry.last_write_time),
-                    etag: format!("{:016x}", entry.last_write_time),
+                    etag: etag_for(entry.file_size, entry.last_write_time),
                 });
             }
         }
@@ -238,7 +237,7 @@ impl ShareSession {
         let meta = ObjectMeta {
             size: cr.file_size,
             last_modified: filetime_to_epoch_secs(cr.last_write_time),
-            etag: format!("{:016x}", cr.last_write_time),
+            etag: etag_for(cr.file_size, cr.last_write_time),
             content_type: guess_content_type(key),
         };
 
@@ -284,7 +283,7 @@ impl ShareSession {
     pub async fn put_object(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
         let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs_on(client, tree_id, &smb_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &smb_path)
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
@@ -296,7 +295,7 @@ impl ShareSession {
             return Ok(ObjectMeta {
                 size: data.len() as u64,
                 last_modified: filetime_to_epoch_secs(cl.last_write_time),
-                etag: format!("{:016x}", cl.last_write_time),
+                etag: etag_for(data.len() as u64, cl.last_write_time),
                 content_type: guess_content_type(key),
             });
         }
@@ -313,13 +312,23 @@ impl ShareSession {
             )
             .await?;
 
-        let mut offset = 0u64;
-        for chunk in data.chunks(chunk_size) {
-            client.write(tree_id, &file.file_id, offset, chunk).await?;
-            offset += chunk.len() as u64;
+        // Write all chunks, then close the handle on every path. On a write
+        // error, also remove the partial/corrupt file rather than leaking the
+        // handle and leaving torn data on the share.
+        let write_result: io::Result<()> = async {
+            let mut offset = 0u64;
+            for chunk in data.chunks(chunk_size) {
+                client.write(tree_id, &file.file_id, offset, chunk).await?;
+                offset += chunk.len() as u64;
+            }
+            Ok(())
         }
-
+        .await;
         let _ = client.close(tree_id, &file.file_id).await;
+        if let Err(e) = write_result {
+            let _ = Self::delete_object_path_on(&client, tree_id, &smb_path).await;
+            return Err(e);
+        }
 
         let meta = self.head_object(key).await?;
         Ok(ObjectMeta {
@@ -365,7 +374,7 @@ impl ShareSession {
         Ok(ObjectMeta {
             size: cr.file_size,
             last_modified: filetime_to_epoch_secs(cr.last_write_time),
-            etag: format!("{:016x}", cr.last_write_time),
+            etag: etag_for(cr.file_size, cr.last_write_time),
             content_type: guess_content_type(key),
         })
     }
@@ -385,7 +394,7 @@ impl ShareSession {
     /// Write a temp part file for multipart upload.
     pub async fn write_temp(&self, smb_path: &str, data: &[u8]) -> io::Result<()> {
         let (client, tree_id) = self.pick();
-        self.ensure_parent_dirs_on(client, tree_id, smb_path)
+        self.ensure_parent_dirs_on(&client, tree_id, smb_path)
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
@@ -406,13 +415,20 @@ impl ShareSession {
             )
             .await?;
 
-        let mut offset = 0u64;
-        for chunk in data.chunks(chunk_size) {
-            client.write(tree_id, &file.file_id, offset, chunk).await?;
-            offset += chunk.len() as u64;
+        let write_result: io::Result<()> = async {
+            let mut offset = 0u64;
+            for chunk in data.chunks(chunk_size) {
+                client.write(tree_id, &file.file_id, offset, chunk).await?;
+                offset += chunk.len() as u64;
+            }
+            Ok(())
         }
-
+        .await;
         let _ = client.close(tree_id, &file.file_id).await;
+        if let Err(e) = write_result {
+            let _ = Self::delete_object_path_on(&client, tree_id, smb_path).await;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -441,24 +457,28 @@ impl ShareSession {
             )
             .await?;
 
-        let mut data = Vec::with_capacity(cr.file_size as usize);
-        let mut offset = 0u64;
-        loop {
-            let chunk = client
-                .read(tree_id, &file.file_id, offset, max_read)
-                .await?;
-            if chunk.is_empty() {
-                break;
+        let read_result: io::Result<Vec<u8>> = async {
+            let mut data = Vec::with_capacity(cr.file_size as usize);
+            let mut offset = 0u64;
+            loop {
+                let chunk = client
+                    .read(tree_id, &file.file_id, offset, max_read)
+                    .await?;
+                if chunk.is_empty() {
+                    break;
+                }
+                offset += chunk.len() as u64;
+                data.extend_from_slice(&chunk);
+                if offset >= cr.file_size {
+                    break;
+                }
             }
-            offset += chunk.len() as u64;
-            data.extend_from_slice(&chunk);
-            if offset >= cr.file_size {
-                break;
-            }
+            Ok(data)
         }
+        .await;
 
         let _ = client.close(tree_id, &file.file_id).await;
-        Ok(data)
+        read_result
     }
 
     /// Assemble multipart upload parts into a single file via streaming.
@@ -468,26 +488,37 @@ impl ShareSession {
     /// buffer in memory — supports arbitrarily large files.
     pub async fn assemble_parts(&self, key: &str, temp_paths: &[&str]) -> io::Result<ObjectMeta> {
         let mut wal = self.open_wal_write(key).await?;
-        let max_read = self.pool.max_read_size;
 
         for &temp_path in temp_paths {
-            // Open the part file for reading on any pool connection
-            let (client, tree_id) = self.pick();
-            let cr = client
-                .create(
-                    tree_id,
-                    temp_path,
-                    DesiredAccess::GenericRead as u32,
-                    ShareAccess::All as u32,
-                    CreateDisposition::Open as u32,
-                    CreateOptions::NonDirectoryFile as u32,
-                )
-                .await?;
+            if let Err(e) = self.stream_part_into_wal(&mut wal, temp_path).await {
+                // Release the WAL handle and delete its temp file before bailing.
+                wal.abort().await;
+                return Err(e);
+            }
+        }
 
-            let file_size = cr.file_size;
-            let file_id = cr.file_id;
+        wal.commit(self).await
+    }
 
-            // Stream part data to the WalWriter using pipelined reads
+    /// Stream one part file into the WAL writer, always closing the part handle
+    /// on every exit path (success, EOF, or read error).
+    async fn stream_part_into_wal(&self, wal: &mut WalWriter, temp_path: &str) -> io::Result<()> {
+        let (client, tree_id) = self.pick();
+        let cr = client
+            .create(
+                tree_id,
+                temp_path,
+                DesiredAccess::GenericRead as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+        let file_id = cr.file_id;
+        let file_size = cr.file_size;
+        let max_read = self.pool.max_read_size;
+
+        let read_result: io::Result<()> = async {
             let mut offset = 0u64;
             while offset < file_size {
                 let remaining = file_size - offset;
@@ -498,7 +529,6 @@ impl ShareSession {
                     .pipelined_read(tree_id, &file_id, offset, max_read, batch)
                     .await?;
                 if chunks.is_empty() {
-                    let _ = client.close(tree_id, &file_id).await;
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!(
@@ -512,17 +542,18 @@ impl ShareSession {
                     offset += chunk.len() as u64;
                 }
             }
-
-            let _ = client.close(tree_id, &file_id).await;
+            Ok(())
         }
+        .await;
 
-        wal.commit(self).await
+        let _ = client.close(tree_id, &file_id).await;
+        read_result
     }
 
     /// Delete a temp file (best effort).
     pub async fn delete_temp(&self, smb_path: &str) {
         let (client, tree_id) = self.pick();
-        let _ = Self::delete_object_path_on(client, tree_id, smb_path).await;
+        let _ = Self::delete_object_path_on(&client, tree_id, smb_path).await;
     }
 
     /// Delete by SMB path directly. Compound Create+Close in 1 round trip.
@@ -569,12 +600,12 @@ impl ShareSession {
         let final_path = to_smb_path(key);
 
         // Ensure final destination's parent dirs exist (so rename can succeed)
-        self.ensure_parent_dirs_on(client, tree_id, &final_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &final_path)
             .await?;
 
         // Generate WAL temp path and ensure its parent dir exists
         let wal_path = wal_temp_path();
-        self.ensure_parent_dirs_on(client, tree_id, &wal_path)
+        self.ensure_parent_dirs_on(&client, tree_id, &wal_path)
             .await?;
 
         // Create the WAL temp file
@@ -591,7 +622,7 @@ impl ShareSession {
 
         let chunk_size = self.pool.max_write_size as usize;
         Ok(WalWriter {
-            client: Arc::clone(client),
+            client: Arc::clone(&client),
             tree_id,
             file_id: file.file_id,
             wal_path,
@@ -620,7 +651,7 @@ impl ShareSession {
         Ok(ObjectMeta {
             size: cr.file_size,
             last_modified: filetime_to_epoch_secs(cr.last_write_time),
-            etag: format!("{:016x}", cr.last_write_time),
+            etag: etag_for(cr.file_size, cr.last_write_time),
             content_type: String::new(),
         })
     }
@@ -660,7 +691,7 @@ impl ShareSession {
                 continue;
             }
             let path = format!("{WAL_DIR}\\{}", entry.file_name);
-            if Self::delete_object_path_on(client, tree_id, &path)
+            if Self::delete_object_path_on(&client, tree_id, &path)
                 .await
                 .is_ok()
             {
@@ -677,6 +708,96 @@ impl ShareSession {
             .create_close(
                 tree_id,
                 WAL_DIR,
+                DesiredAccess::Delete as u32,
+                ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::DirectoryFile as u32 | 0x00001000,
+            )
+            .await;
+    }
+
+    /// Clean up orphaned multipart upload temp dirs from prior runs (best
+    /// effort). Removes `.spiceio-uploads/<id>/part-*` files, each per-upload
+    /// directory, and the parent. Run at startup; logs but never fails.
+    pub async fn cleanup_uploads(&self) {
+        let (client, tree_id) = self.pick();
+
+        let root = match client
+            .create(
+                tree_id,
+                UPLOADS_DIR,
+                DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::DirectoryFile as u32,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(_) => return, // No uploads directory — nothing to clean up
+        };
+        let subdirs = client.query_directory(tree_id, &root.file_id, "*").await;
+        let _ = client.close(tree_id, &root.file_id).await;
+        let subdirs = match subdirs {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut removed = 0u32;
+        for entry in &subdirs {
+            if !entry.is_directory() || entry.file_name == "." || entry.file_name == ".." {
+                continue;
+            }
+            let subpath = format!("{UPLOADS_DIR}\\{}", entry.file_name);
+
+            // Delete the part files inside this upload directory.
+            if let Ok(sub) = client
+                .create(
+                    tree_id,
+                    &subpath,
+                    DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::DirectoryFile as u32,
+                )
+                .await
+            {
+                let files = client.query_directory(tree_id, &sub.file_id, "*").await;
+                let _ = client.close(tree_id, &sub.file_id).await;
+                if let Ok(files) = files {
+                    for f in &files {
+                        if f.is_directory() {
+                            continue;
+                        }
+                        let fpath = format!("{subpath}\\{}", f.file_name);
+                        let _ = Self::delete_object_path_on(&client, tree_id, &fpath).await;
+                    }
+                }
+            }
+
+            // Remove the now-empty upload directory.
+            let _ = client
+                .create_close(
+                    tree_id,
+                    &subpath,
+                    DesiredAccess::Delete as u32,
+                    ShareAccess::Delete as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::DirectoryFile as u32 | 0x00001000,
+                )
+                .await;
+            removed += 1;
+        }
+
+        if removed > 0 {
+            crate::slog!("[spiceio] uploads cleanup: removed {removed} stale upload dir(s)");
+        }
+
+        // Remove the now-empty uploads root.
+        let _ = client
+            .create_close(
+                tree_id,
+                UPLOADS_DIR,
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
@@ -755,6 +876,9 @@ impl FileHandle {
 
 /// Directory on the SMB share where WAL temp files are stored.
 const WAL_DIR: &str = ".spiceio-wal";
+
+/// Directory on the SMB share where multipart upload parts are stored.
+const UPLOADS_DIR: &str = ".spiceio-uploads";
 
 /// Number of write requests to pipeline in a single batch.
 const WRITE_PIPELINE_DEPTH: usize = 64;
@@ -835,18 +959,37 @@ impl WalWriter {
     /// Flush remaining data, close the WAL file, and rename it to the final path.
     /// Returns the object metadata from a head_object on the final path.
     pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
-        // Flush any remaining buffered data
-        self.flush().await?;
+        // Flush remaining data and rename to the final path. On any failure,
+        // close the handle and delete the WAL temp so we never leak a handle or
+        // orphan a temp file — the caller cannot abort() after commit takes self.
+        let staged: io::Result<()> = async {
+            self.flush().await?;
+            self.client
+                .rename(self.tree_id, &self.file_id, &self.final_path, true)
+                .await?;
+            Ok(())
+        }
+        .await;
 
-        // Rename the WAL temp file to the final destination
-        self.client
-            .rename(self.tree_id, &self.file_id, &self.final_path, true)
-            .await?;
+        if let Err(e) = staged {
+            let _ = self.client.close(self.tree_id, &self.file_id).await;
+            // Rename did not complete, so the temp is still at wal_path.
+            let _ = self
+                .client
+                .create_close(
+                    self.tree_id,
+                    &self.wal_path,
+                    DesiredAccess::Delete as u32,
+                    ShareAccess::Delete as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+                )
+                .await;
+            return Err(e);
+        }
 
-        // Close the file handle (now at the final path)
+        // Rename succeeded — close the handle (now at the final path).
         let _ = self.client.close(self.tree_id, &self.file_id).await;
-
-        // Fetch final metadata
         let meta = share.head_object_smb(&self.final_path).await?;
         Ok(meta)
     }
@@ -888,6 +1031,18 @@ pub struct ObjectMeta {
 }
 
 // ── Path conversion ─────────────────────────────────────────────────────────
+
+/// Build an opaque ETag from an object's size and last-write time.
+///
+/// Not a content hash — that would require reading the whole object on every
+/// HEAD/LIST. Combining size with mtime avoids the collisions a bare mtime
+/// suffers when two different-sized objects share a coarse timestamp, and is
+/// stable across GET/HEAD/LIST for the same object. (Multipart parts still use
+/// a real SHA-256 ETag.) Two same-size edits within the backend's mtime
+/// resolution can still collide — documented limitation.
+fn etag_for(size: u64, last_write_time: u64) -> String {
+    format!("{last_write_time:016x}{size:016x}")
+}
 
 /// Convert S3 key (forward-slash) to SMB path (backslash).
 fn to_smb_path(key: &str) -> String {
@@ -1127,6 +1282,18 @@ mod tests {
         // harmless for multi-second thresholds. Verify the floor.
         let ft = epoch_to_filetime(100) + 9_000_000; // +0.9s in 100ns ticks
         assert_eq!(filetime_to_epoch_secs(ft), 100);
+    }
+
+    // ── etag_for ─────────────────────────────────────────────────────
+
+    #[test]
+    fn etag_for_combines_size_and_mtime() {
+        // Different sizes at the same mtime must not collide (the bare-mtime bug).
+        assert_ne!(etag_for(10, 1234), etag_for(20, 1234));
+        // Different mtimes must not collide.
+        assert_ne!(etag_for(10, 1234), etag_for(10, 5678));
+        // Stable for the same inputs.
+        assert_eq!(etag_for(10, 1234), etag_for(10, 1234));
     }
 
     // ── guess_content_type ───────────────────────────────────────────

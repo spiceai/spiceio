@@ -200,6 +200,17 @@ impl SmbClient {
     }
 
     async fn send_recv_inner(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+        // Poison on any transport/framing error so the connection is never
+        // reused with a desynchronized stream (a partial/leftover frame would
+        // otherwise be misread as the next operation's reply).
+        let r = self.send_recv_io(packet).await;
+        if r.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
+    async fn send_recv_io(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
         let mut stream = self.stream.lock().await;
 
         // Sign the packet if we have a signing key
@@ -517,6 +528,25 @@ impl SmbClient {
         chunk_size: u32,
         count: usize,
     ) -> io::Result<Vec<bytes::Bytes>> {
+        // Poison on any error: a batch leaves unread responses in the socket on
+        // an early return, so the connection must not be reused.
+        let r = self
+            .pipelined_read_io(tree_id, file_id, start_offset, chunk_size, count)
+            .await;
+        if r.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
+    async fn pipelined_read_io(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        start_offset: u64,
+        chunk_size: u32,
+        count: usize,
+    ) -> io::Result<Vec<bytes::Bytes>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -668,6 +698,24 @@ impl SmbClient {
     ///
     /// Responses may arrive out of order; each is matched by message_id.
     pub async fn pipelined_write(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        start_offset: u64,
+        chunks: &[&[u8]],
+    ) -> io::Result<u64> {
+        // Poison on any error: an early return leaves unread write responses in
+        // the socket, so the connection must not be reused.
+        let r = self
+            .pipelined_write_io(tree_id, file_id, start_offset, chunks)
+            .await;
+        if r.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
+    async fn pipelined_write_io(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
@@ -854,6 +902,19 @@ impl SmbClient {
     /// Caller sets `SMB2_FLAGS_RELATED` on related-chain requests.
     /// This method handles `NextCommand` offsets, signing, and framing.
     async fn send_compound(
+        &self,
+        requests: Vec<(Header, BytesMut)>,
+    ) -> io::Result<Vec<(Header, Vec<u8>)>> {
+        // Poison on any transport/framing error so a desynchronized compound
+        // stream is never reused.
+        let r = self.send_compound_io(requests).await;
+        if r.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+
+    async fn send_compound_io(
         &self,
         requests: Vec<(Header, BytesMut)>,
     ) -> io::Result<Vec<(Header, Vec<u8>)>> {

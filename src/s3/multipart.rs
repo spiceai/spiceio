@@ -100,6 +100,19 @@ impl MultipartStore {
         self.uploads.write().await.remove(upload_id)
     }
 
+    /// Remove and return uploads initiated more than `ttl_secs` before
+    /// `now_secs`. The background reaper uses this to bound the in-memory map
+    /// and reclaim temp files from uploads a client never completed/aborted.
+    pub async fn reap_expired(&self, now_secs: u64, ttl_secs: u64) -> Vec<UploadState> {
+        let mut uploads = self.uploads.write().await;
+        let expired: Vec<String> = uploads
+            .iter()
+            .filter(|(_, u)| now_secs.saturating_sub(u.initiated) > ttl_secs)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired.iter().filter_map(|id| uploads.remove(id)).collect()
+    }
+
     /// List all active uploads, optionally filtered by key prefix.
     pub async fn list(&self, prefix: Option<&str>) -> Vec<UploadState> {
         let uploads = self.uploads.read().await;
@@ -141,6 +154,23 @@ fn epoch_nanos() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reap_expired_removes_old_keeps_fresh() {
+        let store = MultipartStore::new();
+        let old = store.create("old").await;
+        let fresh = store.create("fresh").await;
+        // Make `old` look like it was initiated long ago.
+        store.uploads.write().await.get_mut(&old).unwrap().initiated = 1;
+
+        // now=1000, ttl=60: old (age ~999) expires; fresh (initiated ~now,
+        // saturating age 0) survives.
+        let reaped = store.reap_expired(1000, 60).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].key, "old");
+        assert!(store.get(&old).await.is_none());
+        assert!(store.get(&fresh).await.is_some());
+    }
 
     #[tokio::test]
     async fn create_and_get_upload() {

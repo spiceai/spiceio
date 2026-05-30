@@ -312,8 +312,11 @@ pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<Ses
     let security_buffer_offset = (&body[4..6]).get_u16_le() as usize;
     let security_buffer_length = (&body[6..8]).get_u16_le() as usize;
 
-    let sec_start = security_buffer_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let sec_end = sec_start + security_buffer_length;
+    // A valid SecurityBufferOffset points at or past the SMB2 header. Reject an
+    // offset inside the header (checked_sub -> None) rather than clamping to 0
+    // and handing the auth layer garbage from the start of the body.
+    let sec_start = security_buffer_offset.checked_sub(SMB2_HEADER_SIZE)?;
+    let sec_end = sec_start.checked_add(security_buffer_length)?;
     let security_buffer = if sec_end <= body.len() {
         Bytes::copy_from_slice(&body[sec_start..sec_end])
     } else {
@@ -470,8 +473,8 @@ pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = (&body[4..8]).get_u32_le() as usize;
 
-    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + data_length;
+    let start = data_offset.checked_sub(SMB2_HEADER_SIZE)?;
+    let end = start.checked_add(data_length)?;
     if end > body.len() {
         return None;
     }
@@ -487,8 +490,8 @@ pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
 
-    let start = data_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let end = start + data_length;
+    let start = data_offset.checked_sub(SMB2_HEADER_SIZE)?;
+    let end = start.checked_add(data_length)?;
     if end > body.len() {
         return None;
     }
@@ -663,6 +666,12 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
         }
 
         if next_entry_offset == 0 {
+            break;
+        }
+        // A real entry is at least the 104-byte fixed header. A smaller nonzero
+        // advance is malformed and would make the loop re-parse overlapping
+        // bytes up to data.len() times (CPU/memory amplification) — stop.
+        if next_entry_offset < 104 {
             break;
         }
         offset += next_entry_offset;
@@ -1007,6 +1016,29 @@ mod tests {
     #[test]
     fn parse_directory_entries_empty() {
         assert!(parse_directory_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn parse_directory_entries_stops_on_sub_entry_advance() {
+        // A nonzero next_entry_offset smaller than the 104-byte fixed header is
+        // malformed; the parser must stop rather than re-parse overlapping
+        // bytes (a CPU/memory amplification vector). With the guard, a single
+        // entry is returned; without it, the small advance would yield more.
+        let mut data = vec![0u8; 300];
+        data[0..4].copy_from_slice(&50u32.to_le_bytes()); // next_entry_offset = 50 (< 104)
+        // file_name_length (offset 60) stays 0.
+        assert_eq!(parse_directory_entries(&data).len(), 1);
+    }
+
+    #[test]
+    fn session_setup_rejects_offset_inside_header() {
+        // A SecurityBufferOffset below the 64-byte SMB2 header is malformed and
+        // must be rejected, not clamped to read garbage as the auth blob.
+        let hdr = Header::new(Command::SessionSetup, 1);
+        let mut body = vec![0u8; 16];
+        body[4..6].copy_from_slice(&10u16.to_le_bytes()); // offset 10 (< 64)
+        body[6..8].copy_from_slice(&4u16.to_le_bytes());
+        assert!(decode_session_setup_response(&hdr, &body).is_none());
     }
 
     #[test]

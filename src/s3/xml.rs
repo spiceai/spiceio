@@ -203,6 +203,55 @@ pub fn extract_element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     Some(&xml[start..end])
 }
 
+/// Decode standard XML entities in request-body text — the inverse of the
+/// escaping `element()` applies. S3 clients escape `&`, `<`, `>`, `"`, `'`
+/// (and may use numeric character references) in object keys; without decoding,
+/// a key like `a&amp;b` would be treated as the literal `a&amp;b` and the wrong
+/// object deleted. Unknown entities are left verbatim.
+pub fn xml_decode(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        if let Some(semi) = after.find(';') {
+            let ent = &after[1..semi];
+            let decoded = match ent {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => decode_numeric_entity(ent),
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        // Not a recognized entity — keep the '&' literally and continue.
+        out.push('&');
+        rest = &after[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_numeric_entity(ent: &str) -> Option<char> {
+    let code = if let Some(hex) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
+        u32::from_str_radix(hex, 16).ok()?
+    } else if let Some(dec) = ent.strip_prefix('#') {
+        dec.parse::<u32>().ok()?
+    } else {
+        return None;
+    };
+    char::from_u32(code)
+}
+
 /// Extract text between two sections — used for parsing Delete requests.
 pub fn extract_sections<'a>(xml: &'a str, open_tag: &str, close_tag: &str) -> Vec<&'a str> {
     let mut results = Vec::new();
@@ -222,6 +271,28 @@ pub fn extract_sections<'a>(xml: &'a str, open_tag: &str, close_tag: &str) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xml_decode_entities() {
+        assert_eq!(
+            xml_decode("a&amp;b&lt;c&gt;d&quot;e&apos;f"),
+            "a&b<c>d\"e'f"
+        );
+        assert_eq!(xml_decode("&#65;&#x42;"), "AB");
+        assert_eq!(xml_decode("plain key"), "plain key");
+        // Unknown entity and a bare ampersand are left verbatim.
+        assert_eq!(xml_decode("a&unknown;b"), "a&unknown;b");
+        assert_eq!(xml_decode("trailing&"), "trailing&");
+    }
+
+    #[test]
+    fn xml_escape_decode_roundtrip() {
+        let mut w = XmlWriter::new();
+        w.element("Key", "a&b<c>\"'");
+        let xml = w.finish();
+        let inner = extract_element(&xml, "Key").unwrap();
+        assert_eq!(xml_decode(inner), "a&b<c>\"'");
+    }
 
     #[test]
     fn xml_writer_basic() {
