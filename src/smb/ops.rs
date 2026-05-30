@@ -1039,6 +1039,96 @@ mod tests {
         assert_eq!(filetime_to_epoch_secs(100), 0);
     }
 
+    // ── delete-older-than (age-based expiry) ─────────────────────────
+    //
+    // spiceio is a pure S3↔SMB proxy and does not expire objects itself.
+    // A client deletes "objects older than N seconds" by reading each
+    // object's LastModified — which the proxy derives from the SMB
+    // last_write_time via `filetime_to_epoch_secs` — and issuing
+    // DeleteObject for the stale ones. These tests verify that the proxy's
+    // timestamp conversion yields epochs that make that age decision
+    // correct, including the boundary, clock-skew, and sub-second cases the
+    // workflow hits in practice.
+
+    /// Inverse of `filetime_to_epoch_secs`, for building fixtures: a
+    /// whole-second Unix epoch as a Windows FILETIME (100ns ticks since 1601).
+    fn epoch_to_filetime(secs: u64) -> u64 {
+        const EPOCH_DIFF: u64 = 116444736000000000;
+        secs * 10_000_000 + EPOCH_DIFF
+    }
+
+    /// The client-side "older than `max_age_secs`" predicate, evaluated
+    /// against proxy-reported epochs. Saturating subtraction means an object
+    /// whose timestamp is ahead of `now` (clock skew) reports age 0 instead of
+    /// underflowing. Expiry is inclusive at the threshold, so `max_age_secs ==
+    /// 0` sweeps everything.
+    fn is_expired(now: u64, last_modified: u64, max_age_secs: u64) -> bool {
+        now.saturating_sub(last_modified) >= max_age_secs
+    }
+
+    /// Run a FILETIME-stamped object through the real conversion and age it.
+    fn aged(now: u64, mtime_secs: u64, max_age: u64) -> bool {
+        let lm = filetime_to_epoch_secs(epoch_to_filetime(mtime_secs));
+        assert_eq!(lm, mtime_secs, "filetime round-trip for {mtime_secs}");
+        is_expired(now, lm, max_age)
+    }
+
+    #[test]
+    fn expiry_deletes_only_aged_objects() {
+        // now = 100s, threshold = 5s. Objects written at 88/90 (ages 12/10)
+        // expire; fresh ones at 98/100 (ages 2/0) survive.
+        let now = 100;
+        let verdicts: Vec<bool> = [88u64, 90, 98, 100]
+            .iter()
+            .map(|&t| aged(now, t, 5))
+            .collect();
+        assert_eq!(verdicts, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn expiry_one_minute_retention_keeps_fresh() {
+        // A 60s policy applied to freshly written objects deletes nothing;
+        // an object 61s old is swept.
+        let now = 100;
+        assert!(!aged(now, 99, 60), "1s old kept");
+        assert!(!aged(now, 100, 60), "0s old kept");
+        assert!(aged(now, 39, 60), "61s old expired");
+    }
+
+    #[test]
+    fn expiry_zero_threshold_sweeps_all() {
+        let now = 100;
+        for t in [0u64, 50, 99, 100] {
+            assert!(aged(now, t, 0), "age-0 threshold should sweep mtime {t}");
+        }
+    }
+
+    #[test]
+    fn expiry_threshold_is_inclusive() {
+        assert!(!is_expired(100, 96, 5)); // age 4 < 5 -> kept
+        assert!(is_expired(100, 95, 5)); // age 5 == 5 -> expired
+        assert!(is_expired(100, 94, 5)); // age 6 > 5 -> expired
+    }
+
+    #[test]
+    fn expiry_tolerates_clock_skew() {
+        // Object timestamp ahead of `now` (server clock ahead): age saturates
+        // to 0 rather than underflowing, so a future-dated file is not expired
+        // by a positive threshold — but a zero threshold still sweeps it.
+        assert_eq!(100u64.saturating_sub(105), 0);
+        assert!(!is_expired(100, 105, 5));
+        assert!(is_expired(100, 105, 0));
+    }
+
+    #[test]
+    fn expiry_subsecond_filetime_floors_down() {
+        // SMB FILETIME has 100ns resolution; the proxy floors to whole seconds.
+        // A file written at T + 0.9s reports T (can look up to ~1s older) —
+        // harmless for multi-second thresholds. Verify the floor.
+        let ft = epoch_to_filetime(100) + 9_000_000; // +0.9s in 100ns ticks
+        assert_eq!(filetime_to_epoch_secs(ft), 100);
+    }
+
     // ── guess_content_type ───────────────────────────────────────────
 
     #[test]

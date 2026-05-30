@@ -398,7 +398,17 @@ pub fn encode_create_request(
     buf.put_u16_le(name_bytes.len() as u16); // NameLength
     buf.put_u32_le(0); // CreateContextsOffset
     buf.put_u32_le(0); // CreateContextsLength
-    buf.put_slice(&name_bytes);
+    if name_bytes.is_empty() {
+        // StructureSize is 57 = 56-byte fixed part + 1 mandatory buffer byte.
+        // The variable-length buffer must always be present, so when opening the
+        // share root (empty name) we still emit a single padding byte. Omitting
+        // it yields a 56-byte body that servers reject with
+        // STATUS_INVALID_PARAMETER (0xC000000D). Mirrors the trailing buffer
+        // byte the Read request always sends.
+        buf.put_u8(0);
+    } else {
+        buf.put_slice(&name_bytes);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -851,6 +861,62 @@ mod tests {
     #[test]
     fn decode_create_response_too_short() {
         assert!(decode_create_response(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn encode_create_request_empty_path_emits_buffer_byte() {
+        // Opening the share root (e.g. ListObjectsV2 with no prefix) uses an
+        // empty name. StructureSize is 57 = 56 fixed bytes + 1 mandatory buffer
+        // byte, so the body must be 57 bytes even with no name. A 56-byte body
+        // is rejected by servers with STATUS_INVALID_PARAMETER (0xC000000D).
+        let mut buf = BytesMut::new();
+        encode_create_request(&mut buf, "", 0, 0, 0, 0);
+        assert_eq!(buf.len(), 57, "empty-name CREATE body must be 57 bytes");
+        assert_eq!((&buf[0..2]).get_u16_le(), 57, "StructureSize"); // StructureSize
+        assert_eq!((&buf[46..48]).get_u16_le(), 0, "NameLength"); // NameLength
+    }
+
+    #[test]
+    fn encode_create_request_named_path() {
+        let mut buf = BytesMut::new();
+        encode_create_request(&mut buf, "x", 0, 0, 0, 0);
+        // 56-byte fixed part + UTF-16 name ("x" = 2 bytes).
+        assert_eq!(buf.len(), 58);
+        assert_eq!((&buf[46..48]).get_u16_le(), 2, "NameLength"); // NameLength
+    }
+
+    #[test]
+    fn encode_create_request_delete_on_close() {
+        // DeleteObject opens the file with FILE_DELETE_ON_CLOSE (0x1000) set in
+        // CreateOptions, alongside NON_DIRECTORY_FILE (0x40) — exactly what
+        // `ShareSession::delete_object` passes so the file is removed when the
+        // handle closes. Verify the delete access, Open disposition, and the
+        // delete-on-close option all land at their wire offsets in the body.
+        const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+        let create_options = CreateOptions::NonDirectoryFile as u32 | FILE_DELETE_ON_CLOSE;
+        let mut buf = BytesMut::new();
+        encode_create_request(
+            &mut buf,
+            "stale.bin",
+            DesiredAccess::Delete as u32,
+            ShareAccess::Delete as u32,
+            CreateDisposition::Open as u32,
+            create_options,
+        );
+        // Field offsets within the CREATE request body (SMB2 header excluded).
+        assert_eq!(
+            (&buf[24..28]).get_u32_le(),
+            DesiredAccess::Delete as u32,
+            "DesiredAccess"
+        );
+        assert_eq!(
+            (&buf[36..40]).get_u32_le(),
+            CreateDisposition::Open as u32,
+            "CreateDisposition"
+        );
+        let opts = (&buf[40..44]).get_u32_le();
+        assert_eq!(opts, create_options, "CreateOptions");
+        assert_ne!(opts & FILE_DELETE_ON_CLOSE, 0, "DELETE_ON_CLOSE bit set");
     }
 
     #[test]

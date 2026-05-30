@@ -271,6 +271,16 @@ mod tests {
     }
 
     #[test]
+    fn epoch_to_iso8601_is_lexically_monotonic() {
+        // LastModified is fixed-width "YYYY-MM-DDTHH:MM:SS.000Z", so lexical
+        // ordering matches chronological ordering. A client that sorts objects
+        // by LastModified to find the oldest relies on this.
+        let earlier = epoch_to_iso8601(1_700_000_000);
+        let later = epoch_to_iso8601(1_700_000_060); // 60s newer
+        assert!(earlier < later, "{earlier} should sort before {later}");
+    }
+
+    #[test]
     fn extract_element_found() {
         let xml = "<Root><Key>my/file.txt</Key><Other>x</Other></Root>";
         assert_eq!(extract_element(xml, "Key"), Some("my/file.txt"));
