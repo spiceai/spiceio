@@ -91,15 +91,18 @@ pub struct SmbPool {
     pub max_write_size: u32,
     pub compound_max_read_size: u32,
     pub compound_max_write_size: u32,
-    /// Adaptive streaming-write I/O size. Starts at `max_write_size` and shrinks
-    /// toward `IO_FLOOR` when the server resets a large write (it can't sustain
-    /// that size under load), then grows back on each healer tick once it
-    /// recovers. Lets large I/O run fast on a healthy server while staying
-    /// robust when it's overloaded.
-    write_io: AtomicU32,
-    /// Adaptive streaming-read I/O size — same AIMD scheme as `write_io`, for
-    /// the GET/read path.
-    read_io: AtomicU32,
+    /// Adaptive streaming-write *in-flight bytes* — the per-flush byte budget.
+    /// Starts at `INFLIGHT_MAX` and shrinks toward `IO_FLOOR` when the server
+    /// resets a write (it can't sustain that burst), then grows back on each
+    /// healer tick once it recovers. The chunk size is `min(max_write_size,
+    /// write_inflight)` and the flush issues `write_inflight / chunk` writes —
+    /// so as this shrinks, the burst shrinks first, then (below the negotiated
+    /// max) the individual write size, down to a single 64 KB write.
+    write_inflight: AtomicU32,
+    /// Adaptive streaming-read in-flight bytes — same scheme for the GET path
+    /// (`min(max_read_size, read_inflight)` chunk, `read_inflight / chunk` reads
+    /// per batch).
+    read_inflight: AtomicU32,
     /// Set whenever a reset backs off an I/O size; gates `grow_io` so recovery
     /// only re-probes a larger size after a full healer interval with no reset.
     /// Without this the healer could grow the size back mid-retry-burst, making
@@ -107,9 +110,17 @@ pub struct SmbPool {
     reset_since_grow: AtomicBool,
 }
 
-/// Floor for the adaptive streaming I/O size — the conservative size that
-/// essentially every SMB server handles even under load.
+/// Floor for the adaptive streaming in-flight size — one conservative op the
+/// server handles even under heavy load (the same size the compound small-file
+/// path uses successfully). At this floor a streaming transfer issues a single
+/// 64 KB write/read at a time (no pipelining) — maximally gentle.
 const IO_FLOOR: u32 = 65536;
+
+/// Ceiling for the adaptive in-flight size — the per-flush / per-read-batch byte
+/// budget on a healthy server. Far above the sub-ms-RTT bandwidth-delay product,
+/// so single-stream throughput saturates; the chunk size (capped separately at
+/// the negotiated max) determines how many ops make up the batch.
+const INFLIGHT_MAX: u32 = 4 * 1024 * 1024;
 
 /// Multiplicative decrease: halve `cur`, never below the floor (and never above
 /// `cur`). Pure for testability.
@@ -172,48 +183,60 @@ impl SmbPool {
             max_write_size,
             compound_max_read_size,
             compound_max_write_size,
-            write_io: AtomicU32::new(max_write_size),
-            read_io: AtomicU32::new(max_read_size),
+            write_inflight: AtomicU32::new(INFLIGHT_MAX),
+            read_inflight: AtomicU32::new(INFLIGHT_MAX),
             reset_since_grow: AtomicBool::new(false),
         }))
     }
 
-    /// Current adaptive streaming-write I/O size (see `write_io`).
-    pub fn write_io_size(&self) -> u32 {
-        self.write_io.load(Ordering::Relaxed)
+    /// Current adaptive streaming-write in-flight bytes (per-flush budget).
+    pub fn write_inflight(&self) -> u32 {
+        self.write_inflight.load(Ordering::Relaxed)
     }
 
-    /// Current adaptive streaming-read I/O size (see `read_io`).
-    pub fn read_io_size(&self) -> u32 {
-        self.read_io.load(Ordering::Relaxed)
+    /// Current adaptive streaming-read in-flight bytes (per-batch budget).
+    pub fn read_inflight(&self) -> u32 {
+        self.read_inflight.load(Ordering::Relaxed)
     }
 
-    /// Note that the server reset/dropped a connection on a large write — halve
-    /// the adaptive write size (down to `IO_FLOOR`) so the next attempt uses a
-    /// size the server can sustain. No-op once already at the floor.
+    /// Per-write chunk size: the negotiated max, but no larger than the current
+    /// in-flight budget (so below the max the writes shrink too). Always ≥ 1.
+    pub fn write_chunk_size(&self) -> u32 {
+        self.max_write_size.min(self.write_inflight()).max(1)
+    }
+
+    /// Per-read chunk size — analogous to `write_chunk_size`.
+    pub fn read_chunk_size(&self) -> u32 {
+        self.max_read_size.min(self.read_inflight()).max(1)
+    }
+
+    /// Note that the server reset/dropped a connection on a write — halve the
+    /// write in-flight budget (down to `IO_FLOOR`) so the next attempt uses a
+    /// smaller burst (and, below the negotiated max, a smaller write). No-op once
+    /// already at the floor.
     pub fn note_write_reset(&self) {
         self.reset_since_grow.store(true, Ordering::Relaxed);
-        let cur = self.write_io.load(Ordering::Relaxed);
+        let cur = self.write_inflight.load(Ordering::Relaxed);
         let next = io_after_reset(cur);
         if next != cur {
-            self.write_io.store(next, Ordering::Relaxed);
+            self.write_inflight.store(next, Ordering::Relaxed);
             crate::slog!(
-                "[spiceio] write I/O backed off to {}K after reset",
+                "[spiceio] write in-flight backed off to {}K after reset",
                 next / 1024
             );
         }
     }
 
-    /// Note that the server reset/dropped a connection on a large read — halve
-    /// the adaptive read size (down to `IO_FLOOR`). No-op once at the floor.
+    /// Note that the server reset/dropped a connection on a read — halve the read
+    /// in-flight budget (down to `IO_FLOOR`). No-op once at the floor.
     pub fn note_read_reset(&self) {
         self.reset_since_grow.store(true, Ordering::Relaxed);
-        let cur = self.read_io.load(Ordering::Relaxed);
+        let cur = self.read_inflight.load(Ordering::Relaxed);
         let next = io_after_reset(cur);
         if next != cur {
-            self.read_io.store(next, Ordering::Relaxed);
+            self.read_inflight.store(next, Ordering::Relaxed);
             crate::slog!(
-                "[spiceio] read I/O backed off to {}K after reset",
+                "[spiceio] read in-flight backed off to {}K after reset",
                 next / 1024
             );
         }
@@ -229,17 +252,17 @@ impl SmbPool {
         if self.reset_since_grow.swap(false, Ordering::Relaxed) {
             return;
         }
-        let w = self.write_io.load(Ordering::Relaxed);
-        let wn = io_after_grow(w, self.max_write_size);
+        let w = self.write_inflight.load(Ordering::Relaxed);
+        let wn = io_after_grow(w, INFLIGHT_MAX);
         if wn != w {
-            self.write_io.store(wn, Ordering::Relaxed);
-            crate::slog!("[spiceio] write I/O recovered to {}K", wn / 1024);
+            self.write_inflight.store(wn, Ordering::Relaxed);
+            crate::slog!("[spiceio] write in-flight recovered to {}K", wn / 1024);
         }
-        let r = self.read_io.load(Ordering::Relaxed);
-        let rn = io_after_grow(r, self.max_read_size);
+        let r = self.read_inflight.load(Ordering::Relaxed);
+        let rn = io_after_grow(r, INFLIGHT_MAX);
         if rn != r {
-            self.read_io.store(rn, Ordering::Relaxed);
-            crate::slog!("[spiceio] read I/O recovered to {}K", rn / 1024);
+            self.read_inflight.store(rn, Ordering::Relaxed);
+            crate::slog!("[spiceio] read in-flight recovered to {}K", rn / 1024);
         }
     }
 
@@ -324,21 +347,25 @@ mod tests {
 
     #[test]
     fn adaptive_io_aimd() {
-        let max = 512 * 1024;
+        let max = INFLIGHT_MAX; // 4 MiB in-flight ceiling
         // Decrease halves toward the floor, never below it.
-        assert_eq!(io_after_reset(512 * 1024), 256 * 1024);
+        assert_eq!(io_after_reset(INFLIGHT_MAX), 2 * 1024 * 1024);
         assert_eq!(io_after_reset(128 * 1024), 64 * 1024);
         assert_eq!(io_after_reset(64 * 1024), 64 * 1024); // at floor, stays
         // Increase doubles toward the max, never above it.
         assert_eq!(io_after_grow(64 * 1024, max), 128 * 1024);
-        assert_eq!(io_after_grow(256 * 1024, max), 512 * 1024);
-        assert_eq!(io_after_grow(512 * 1024, max), 512 * 1024); // at max, stays
-        // A full back-off then recovery round-trips between floor and max.
+        assert_eq!(io_after_grow(2 * 1024 * 1024, max), max);
+        assert_eq!(io_after_grow(max, max), max); // at max, stays
+        // A full back-off (4 MiB → 64 KiB, ~6 halvings) then recovery
+        // round-trips between floor and max.
         let mut io = max;
+        let mut steps = 0;
         while io > IO_FLOOR {
             io = io_after_reset(io);
+            steps += 1;
         }
         assert_eq!(io, IO_FLOOR);
+        assert_eq!(steps, 6); // 4M→2M→1M→512K→256K→128K→64K
         while io < max {
             io = io_after_grow(io, max);
         }

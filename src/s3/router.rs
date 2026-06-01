@@ -690,12 +690,33 @@ async fn handle_get_object(
     let channel_cap = stream_channel_capacity(chunk_size);
     let (body, tx) = SpiceioBody::channel(channel_cap);
 
+    // Owned handles so the streaming task can transparently reconnect after a
+    // mid-stream connection drop (see the resume loop below).
+    let resume_share = share.clone();
+    let resume_key = key.to_string();
+    let expected_size = file_size;
+
     // Spawn background task to stream pipelined SMB reads into the channel.
     // Sends batches of read requests to fill the network pipe, then pushes
     // each chunk to the HTTP response body as it arrives.
+    //
+    // Resilience: once the 200/206 + Content-Length headers are committed we
+    // can no longer fall back to a retryable 503, so a mid-stream connection
+    // drop on an overwhelmed NAS (reset or "early eof") would otherwise
+    // truncate the transfer. Instead we reconnect on a fresh pool connection —
+    // `read_pipeline` has already backed the adaptive read size off — and
+    // resume from the current offset, so the client sees one continuous
+    // transfer rather than a partial one it must retry. Bounded by
+    // MAX_GET_RESUMES; every delivered chunk refreshes the budget so only
+    // sustained failure aborts. The file size is re-verified on each reconnect
+    // so we never splice bytes from a file that changed underneath us.
     tokio::spawn(async move {
+        const MAX_GET_RESUMES: u32 = 16;
+        let mut handle = handle;
+        let mut chunk_size = chunk_size;
         let mut offset = start;
         let stream_end = end + 1;
+        let mut resumes: u32 = 0;
         'outer: while offset < stream_end {
             let remaining = stream_end - offset;
             match handle.read_pipeline(offset, chunk_size, remaining).await {
@@ -706,9 +727,52 @@ async fn handle_get_object(
                             break 'outer;
                         }
                         offset += chunk.len() as u64;
+                        resumes = 0; // forward progress refreshes the resume budget
                         if tx.send(Ok(chunk)).await.is_err() {
                             crate::serr!("[spiceio] getobject client disconnected");
                             break 'outer;
+                        }
+                    }
+                }
+                Err(e) if crate::smb::ops::is_reset(&e) && resumes < MAX_GET_RESUMES => {
+                    // Transient mid-stream drop: reconnect and resume instead of
+                    // truncating. `read_pipeline` already backed off the read size.
+                    resumes += 1;
+                    let _ = handle.close().await; // best-effort; may already be dead
+                    resume_share.heal().await; // reconnect poisoned slots now
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        (resumes as u64 * 100).min(1000),
+                    ))
+                    .await;
+                    match resume_share.open_read(&resume_key).await {
+                        Ok(h) if h.file_size == expected_size => {
+                            chunk_size = h.max_chunk; // adopt the backed-off chunk
+                            handle = h;
+                            crate::slog!(
+                                "[spiceio] getobject resumed at {offset}/{stream_end} (attempt {resumes})"
+                            );
+                            continue 'outer;
+                        }
+                        Ok(h) => {
+                            // File changed underneath us — refuse to splice.
+                            // The old handle was already closed above, so end
+                            // the task rather than fall to the final close.
+                            let got = h.file_size;
+                            let _ = h.close().await;
+                            crate::serr!(
+                                "[spiceio] getobject resume aborted: size changed {expected_size} -> {got}"
+                            );
+                            let _ = tx
+                                .send(Err(io::Error::other(
+                                    "object changed during streaming read",
+                                )))
+                                .await;
+                            return;
+                        }
+                        Err(reopen_err) => {
+                            crate::serr!("[spiceio] getobject reconnect failed: {reopen_err}");
+                            let _ = tx.send(Err(reopen_err)).await;
+                            return;
                         }
                     }
                 }
@@ -1607,12 +1671,16 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
         //     just retry instead of seeing a hard 500.
         //   - TimedOut: a read/write timed out and we poisoned the connection;
         //     a retry lands on a healthy one.
+        //   - UnexpectedEof: an overwhelmed NAS closed the connection with a
+        //     FIN mid-response ("early eof"); the healer reconnects it, so the
+        //     client should back off and retry rather than see a hard 500.
         io::ErrorKind::ResourceBusy
         | io::ErrorKind::BrokenPipe
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::NotConnected
-        | io::ErrorKind::TimedOut => {
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::UnexpectedEof => {
             crate::slog!("[spiceio] transient (retry): {e}");
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1779,6 +1847,8 @@ mod tests {
             io::ErrorKind::ConnectionAborted,
             io::ErrorKind::NotConnected,
             io::ErrorKind::TimedOut,
+            // "early eof": NAS closed the connection mid-response under load.
+            io::ErrorKind::UnexpectedEof,
         ] {
             let resp = io_to_s3_error(&io::Error::new(kind, "dropped"));
             assert_eq!(

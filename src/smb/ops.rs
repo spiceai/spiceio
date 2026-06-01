@@ -15,6 +15,7 @@ use super::protocol::*;
 /// Each operation picks a connection from the pool via round-robin, so
 /// concurrent S3 requests fan out across multiple TCP streams instead of
 /// serializing on a single mutex.
+#[derive(Clone)]
 pub struct ShareSession {
     pool: Arc<SmbPool>,
 }
@@ -30,7 +31,11 @@ pub struct FileHandle {
     file_id: [u8; 16],
     pub meta: ObjectMeta,
     pub file_size: u64,
+    /// Per-op chunk size (adaptive: `min(negotiated max, in-flight budget)`).
     pub max_chunk: u32,
+    /// In-flight byte budget — caps the pipelined read batch to
+    /// `inflight / max_chunk` ops, so the burst shrinks under degradation.
+    inflight: u32,
 }
 
 impl ShareSession {
@@ -117,7 +122,8 @@ impl ShareSession {
             tree_id,
             file_id: file.file_id,
             file_size: file.file_size,
-            max_chunk: self.pool.read_io_size(),
+            max_chunk: self.pool.read_chunk_size(),
+            inflight: self.pool.read_inflight(),
             meta,
         })
     }
@@ -156,7 +162,8 @@ impl ShareSession {
             tree_id,
             file_id: file.file_id,
             file_size: 0,
-            max_chunk: self.pool.write_io_size(),
+            max_chunk: self.pool.write_chunk_size(),
+            inflight: self.pool.write_inflight(),
             meta,
         })
     }
@@ -232,7 +239,7 @@ impl ShareSession {
         let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
         let compound_max = self.pool.compound_max_read_size;
-        let max_read = self.pool.read_io_size();
+        let max_read = self.pool.read_chunk_size();
 
         // Compound: Create+Read+Close in 1 round trip (uses compound cap)
         let (cr, first_chunk) = client
@@ -292,7 +299,7 @@ impl ShareSession {
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
-        let chunk_size = self.pool.write_io_size() as usize;
+        let chunk_size = self.pool.write_chunk_size() as usize;
 
         if data.len() <= compound_max {
             // Compound Create+Write+Close — 1 round trip, metadata from Close
@@ -406,7 +413,7 @@ impl ShareSession {
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
-        let chunk_size = self.pool.write_io_size() as usize;
+        let chunk_size = self.pool.write_chunk_size() as usize;
         if data.len() <= compound_max {
             let _ = client.create_write_close(tree_id, smb_path, data).await?;
             return Ok(());
@@ -447,7 +454,7 @@ impl ShareSession {
     pub async fn read_temp(&self, smb_path: &str) -> io::Result<Vec<u8>> {
         let (client, tree_id) = self.pick();
         let compound_max = self.pool.compound_max_read_size;
-        let max_read = self.pool.read_io_size();
+        let max_read = self.pool.read_chunk_size();
         let (cr, first_chunk) = client
             .create_read_close(tree_id, smb_path, compound_max)
             .await?;
@@ -539,15 +546,17 @@ impl ShareSession {
             .await?;
         let file_id = cr.file_id;
         let file_size = cr.file_size;
-        let max_read = self.pool.read_io_size();
+        let max_read = self.pool.read_chunk_size();
+        // Cap the read burst by the adaptive in-flight budget (shrinks under
+        // degradation), and at the pipeline depth.
+        let read_depth =
+            ((self.pool.read_inflight() / max_read).max(1) as u64).min(PIPELINE_DEPTH as u64);
 
         let read_result: io::Result<()> = async {
             let mut offset = 0u64;
             while offset < file_size {
                 let remaining = file_size - offset;
-                let batch = remaining
-                    .div_ceil(max_read as u64)
-                    .min(PIPELINE_DEPTH as u64) as usize;
+                let batch = remaining.div_ceil(max_read as u64).min(read_depth) as usize;
                 let chunks = match client
                     .pipelined_read(tree_id, &file_id, offset, max_read, batch)
                     .await
@@ -652,7 +661,12 @@ impl ShareSession {
             )
             .await?;
 
-        let chunk_size = self.pool.write_io_size() as usize;
+        // chunk = per-write size; flush_cap = in-flight burst budget. Both come
+        // from the adaptive in-flight value (chunk = min(max, inflight)), so a
+        // flush issues flush_cap/chunk writes — shrinking to a single write when
+        // degraded.
+        let chunk_size = self.pool.write_chunk_size() as usize;
+        let flush_cap = (self.pool.write_inflight() as usize).max(chunk_size);
         Ok(WalWriter {
             client: Arc::clone(&client),
             pool: Arc::clone(&self.pool),
@@ -660,8 +674,9 @@ impl ShareSession {
             file_id: file.file_id,
             wal_path,
             final_path,
-            buf: Vec::with_capacity(wal_flush_cap(chunk_size)),
+            buf: Vec::with_capacity(flush_cap),
             chunk_size,
+            flush_cap,
             offset: 0,
             total_size: 0,
         })
@@ -897,9 +912,11 @@ impl FileHandle {
                 "FileHandle::read_pipeline called with chunk_size = 0",
             ));
         }
-        let count = remaining
-            .div_ceil(chunk_size as u64)
-            .min(PIPELINE_DEPTH as u64) as usize;
+        // Batch size is bounded by the adaptive in-flight budget (and capped at
+        // PIPELINE_DEPTH): under degradation the budget shrinks, so the read
+        // burst shrinks too — down to a single op at the floor.
+        let batch = ((self.inflight / chunk_size).max(1) as u64).min(PIPELINE_DEPTH as u64);
+        let count = remaining.div_ceil(chunk_size as u64).min(batch) as usize;
         let r = self
             .client
             .pipelined_read(self.tree_id, &self.file_id, offset, chunk_size, count)
@@ -935,32 +952,23 @@ const WAL_DIR: &str = ".spiceio-wal";
 /// Directory on the SMB share where multipart upload parts are stored.
 const UPLOADS_DIR: &str = ".spiceio-uploads";
 
-/// Target bytes in flight per WAL flush. The buffer fills to this, then the
-/// whole buffer goes out as one coalesced `write_all`. Kept modest (4 MiB) so
-/// that N concurrent streaming PUTs don't burst N × this at once and overrun
-/// the SMB server's receive window — which stalls writes until they trip the
-/// 30 s write guard and poison the connections. 4 MiB is far above the
-/// ~0.5 ms-RTT bandwidth-delay product, so single-stream throughput is
-/// unaffected. (At the old 64 KB I/O cap this equalled 64 × 64 KB; raising I/O
-/// to 256 KB without decoupling the burst pushed it to 16 MB and overwhelmed
-/// the server under concurrency.)
-const WRITE_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
-
-/// WAL flush buffer size: the in-flight target, but at least one chunk.
-fn wal_flush_cap(chunk_size: usize) -> usize {
-    WRITE_INFLIGHT_BYTES.max(chunk_size)
-}
-
 /// True if the error means the SMB server dropped/reset the connection (or timed
 /// out) on a write — the signal to back off the adaptive write size so the next
 /// attempt uses a smaller, server-sustainable I/O size.
-fn is_reset(e: &io::Error) -> bool {
+pub(crate) fn is_reset(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::TimedOut
+            // An overwhelmed NAS often closes the TCP connection with a FIN
+            // (graceful close) mid-response rather than an RST, so `read_exact`
+            // returns `UnexpectedEof` ("early eof") instead of a reset. In the
+            // length-framed SMB transport an EOF mid-frame is never valid data —
+            // it is always a dropped/overloaded connection, so treat it as a
+            // reset: back the in-flight window off and let the healer reconnect.
+            | io::ErrorKind::UnexpectedEof
     )
 }
 
@@ -992,10 +1000,13 @@ pub struct WalWriter {
     file_id: [u8; 16],
     wal_path: String,
     final_path: String,
-    /// In-memory write buffer — flushed when it reaches capacity.
+    /// In-memory write buffer — flushed when it reaches `flush_cap`.
     buf: Vec<u8>,
     /// Max bytes per individual SMB Write request.
     chunk_size: usize,
+    /// In-flight burst budget: the buffer flushes once it reaches this many
+    /// bytes, issuing `flush_cap / chunk_size` pipelined writes.
+    flush_cap: usize,
     /// Current write offset in the WAL temp file.
     offset: u64,
     /// Total bytes accepted (buffered + flushed).
@@ -1004,9 +1015,9 @@ pub struct WalWriter {
 
 impl WalWriter {
     /// Append data to the write buffer. Flushes automatically when the buffer
-    /// fills to the in-flight target (see `WRITE_INFLIGHT_BYTES`).
+    /// fills to the in-flight burst budget (`flush_cap`).
     pub async fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let pipeline_cap = wal_flush_cap(self.chunk_size);
+        let pipeline_cap = self.flush_cap;
         let mut pos = 0;
 
         while pos < data.len() {
@@ -1417,16 +1428,6 @@ mod tests {
     #[test]
     fn wal_dir_constant() {
         assert_eq!(WAL_DIR, ".spiceio-wal");
-    }
-
-    #[test]
-    fn wal_flush_cap_bounds_burst() {
-        // The flush burst is a fixed in-flight target, independent of chunk
-        // size, so larger I/O does not multiply the per-connection burst.
-        assert_eq!(wal_flush_cap(65536), WRITE_INFLIGHT_BYTES);
-        assert_eq!(wal_flush_cap(262144), WRITE_INFLIGHT_BYTES);
-        // A chunk larger than the target still yields at least one chunk.
-        assert_eq!(wal_flush_cap(8 * 1024 * 1024), 8 * 1024 * 1024);
     }
 
     #[test]
