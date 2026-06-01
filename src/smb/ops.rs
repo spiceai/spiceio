@@ -287,7 +287,7 @@ impl ShareSession {
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
-        let chunk_size = self.pool.max_write_size as usize;
+        let chunk_size = self.pool.write_io_size() as usize;
 
         if data.len() <= compound_max {
             // Compound Create+Write+Close — 1 round trip, metadata from Close
@@ -326,6 +326,9 @@ impl ShareSession {
         .await;
         let _ = client.close(tree_id, &file.file_id).await;
         if let Err(e) = write_result {
+            if is_write_reset(&e) {
+                self.pool.note_write_reset();
+            }
             let _ = Self::delete_object_path_on(&client, tree_id, &smb_path).await;
             return Err(e);
         }
@@ -398,7 +401,7 @@ impl ShareSession {
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
-        let chunk_size = self.pool.max_write_size as usize;
+        let chunk_size = self.pool.write_io_size() as usize;
         if data.len() <= compound_max {
             let _ = client.create_write_close(tree_id, smb_path, data).await?;
             return Ok(());
@@ -426,6 +429,9 @@ impl ShareSession {
         .await;
         let _ = client.close(tree_id, &file.file_id).await;
         if let Err(e) = write_result {
+            if is_write_reset(&e) {
+                self.pool.note_write_reset();
+            }
             let _ = Self::delete_object_path_on(&client, tree_id, smb_path).await;
             return Err(e);
         }
@@ -632,9 +638,10 @@ impl ShareSession {
             )
             .await?;
 
-        let chunk_size = self.pool.max_write_size as usize;
+        let chunk_size = self.pool.write_io_size() as usize;
         Ok(WalWriter {
             client: Arc::clone(&client),
+            pool: Arc::clone(&self.pool),
             tree_id,
             file_id: file.file_id,
             wal_path,
@@ -921,6 +928,19 @@ fn wal_flush_cap(chunk_size: usize) -> usize {
     WRITE_INFLIGHT_BYTES.max(chunk_size)
 }
 
+/// True if the error means the SMB server dropped/reset the connection (or timed
+/// out) on a write — the signal to back off the adaptive write size so the next
+/// attempt uses a smaller, server-sustainable I/O size.
+fn is_write_reset(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+    )
+}
+
 /// Monotonic counter for unique WAL file names within this process.
 static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -942,6 +962,9 @@ fn wal_temp_path() -> String {
 /// WAL files are cleaned up on next startup.
 pub struct WalWriter {
     client: Arc<SmbClient>,
+    /// Pool handle, used to report large-write resets so the adaptive write
+    /// size backs off for subsequent operations.
+    pool: Arc<SmbPool>,
     tree_id: u32,
     file_id: [u8; 16],
     wal_path: String,
@@ -985,10 +1008,21 @@ impl WalWriter {
 
         // Split buffer into chunk_size slices for pipelining
         let chunks: Vec<&[u8]> = self.buf.chunks(self.chunk_size).collect();
-        let written = self
+        let written = match self
             .client
             .pipelined_write(self.tree_id, &self.file_id, self.offset, &chunks)
-            .await?;
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                // Server reset a large write — back off the adaptive write size
+                // so the retry (and other streams) use a sustainable chunk.
+                if is_write_reset(&e) {
+                    self.pool.note_write_reset();
+                }
+                return Err(e);
+            }
+        };
         self.offset += written;
         self.buf.clear();
         Ok(())

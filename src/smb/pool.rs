@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -91,6 +91,28 @@ pub struct SmbPool {
     pub max_write_size: u32,
     pub compound_max_read_size: u32,
     pub compound_max_write_size: u32,
+    /// Adaptive streaming-write I/O size. Starts at `max_write_size` and shrinks
+    /// toward `WRITE_IO_FLOOR` when the server resets a large write (it can't
+    /// sustain that size under load), then grows back on each healer tick once
+    /// it recovers. Lets large I/O run fast on a healthy server while staying
+    /// robust when it's overloaded.
+    write_io: AtomicU32,
+}
+
+/// Floor for the adaptive streaming-write I/O size — the conservative size that
+/// essentially every SMB server handles even under load.
+const WRITE_IO_FLOOR: u32 = 65536;
+
+/// Multiplicative decrease: halve `cur`, never below the floor (and never above
+/// `cur`). Pure for testability.
+fn write_io_after_reset(cur: u32) -> u32 {
+    (cur / 2).max(WRITE_IO_FLOOR).min(cur)
+}
+
+/// Multiplicative increase: double `cur`, capped at `max` (and never below
+/// `cur`). Pure for testability.
+fn write_io_after_grow(cur: u32, max: u32) -> u32 {
+    cur.saturating_mul(2).min(max).max(cur)
 }
 
 impl SmbPool {
@@ -142,7 +164,37 @@ impl SmbPool {
             max_write_size,
             compound_max_read_size,
             compound_max_write_size,
+            write_io: AtomicU32::new(max_write_size),
         }))
+    }
+
+    /// Current adaptive streaming-write I/O size (see `write_io`).
+    pub fn write_io_size(&self) -> u32 {
+        self.write_io.load(Ordering::Relaxed)
+    }
+
+    /// Note that the server reset/dropped a connection on a large write — halve
+    /// the adaptive write size (down to `WRITE_IO_FLOOR`) so the next attempt
+    /// uses a size the server can sustain. No-op once already at the floor.
+    pub fn note_write_reset(&self) {
+        let cur = self.write_io.load(Ordering::Relaxed);
+        let next = write_io_after_reset(cur);
+        if next != cur {
+            self.write_io.store(next, Ordering::Relaxed);
+            crate::slog!("[spiceio] write I/O backed off to {}K after reset", next / 1024);
+        }
+    }
+
+    /// Step the adaptive write size back up toward `max_write_size` (×2) — called
+    /// each healer tick so a transient overload re-probes the larger size once
+    /// the server recovers. No-op once already at the max.
+    fn grow_write_io(&self) {
+        let cur = self.write_io.load(Ordering::Relaxed);
+        let next = write_io_after_grow(cur, self.max_write_size);
+        if next != cur {
+            self.write_io.store(next, Ordering::Relaxed);
+            crate::slog!("[spiceio] write I/O recovered to {}K", next / 1024);
+        }
     }
 
     /// Tree-connect every slot to `share` and remember the share name so a
@@ -207,6 +259,9 @@ impl SmbPool {
                 Err(e) => crate::serr!("[spiceio] heal reconnect failed (slot {idx}): {e}"),
             }
         }
+        // Re-probe a larger write size now the server has had a moment to
+        // recover (AIMD: multiplicative decrease on reset, gradual increase here).
+        self.grow_write_io();
     }
 
     /// Number of connections in the pool.
@@ -220,6 +275,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
     use tokio::time::Instant;
+
+    #[test]
+    fn adaptive_write_io_aimd() {
+        let max = 256 * 1024;
+        // Decrease halves toward the floor, never below it.
+        assert_eq!(write_io_after_reset(256 * 1024), 128 * 1024);
+        assert_eq!(write_io_after_reset(128 * 1024), 64 * 1024);
+        assert_eq!(write_io_after_reset(64 * 1024), 64 * 1024); // at floor, stays
+        // Increase doubles toward the max, never above it.
+        assert_eq!(write_io_after_grow(64 * 1024, max), 128 * 1024);
+        assert_eq!(write_io_after_grow(128 * 1024, max), 256 * 1024);
+        assert_eq!(write_io_after_grow(256 * 1024, max), 256 * 1024); // at max, stays
+        // A full back-off then recovery round-trips between floor and max.
+        let mut io = max;
+        io = write_io_after_reset(io); // 128K
+        io = write_io_after_reset(io); // 64K (floor)
+        assert_eq!(io, WRITE_IO_FLOOR);
+        io = write_io_after_grow(io, max); // 128K
+        io = write_io_after_grow(io, max); // 256K (max)
+        assert_eq!(io, max);
+    }
 
     fn make_io_err(msg: &str) -> io::Error {
         io::Error::other(msg.to_string())
