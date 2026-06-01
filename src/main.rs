@@ -90,14 +90,14 @@ impl Config {
 
 /// Default SMB connection-pool size, scaled with CPU cores so concurrent S3
 /// requests (e.g. a parallel `cargo`/sccache build) fan out across connections
-/// instead of queuing on one connection's stream lock. Floored at 8 (the proven
-/// baseline), capped at 16 to bound NAS session load; override with
-/// `SPICEIO_SMB_CONNECTIONS` on larger machines.
+/// instead of queuing on one connection's stream lock. Floored at 4 (enough
+/// fan-out on small machines), capped at 16 to bound NAS session load; override
+/// with `SPICEIO_SMB_CONNECTIONS`.
 fn default_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(8)
-        .clamp(8, 16)
+        .unwrap_or(4)
+        .clamp(4, 16)
 }
 
 #[tokio::main]
