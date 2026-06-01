@@ -470,6 +470,17 @@ impl ShareSession {
         let mut wal = self.open_wal_write(key).await?;
         let max_read = self.pool.max_read_size;
 
+        // Guard before the per-part `remaining.div_ceil(max_read as u64)` —
+        // a zero-floored pool entry (shouldn't happen post the negotiate
+        // floor, but defense in depth) would otherwise panic this task.
+        if max_read == 0 {
+            wal.abort().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "assemble_parts: pool max_read_size = 0",
+            ));
+        }
+
         for &temp_path in temp_paths {
             // Open the part file for reading on any pool connection
             let (client, tree_id) = self.pick();
@@ -735,6 +746,14 @@ impl FileHandle {
         chunk_size: u32,
         remaining: u64,
     ) -> io::Result<Vec<Bytes>> {
+        // Guard before `div_ceil` — the guard inside `SmbClient::pipelined_read`
+        // is too late, since `remaining.div_ceil(0)` would panic right here.
+        if chunk_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FileHandle::read_pipeline called with chunk_size = 0",
+            ));
+        }
         let count = remaining
             .div_ceil(chunk_size as u64)
             .min(PIPELINE_DEPTH as u64) as usize;
