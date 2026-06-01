@@ -64,11 +64,6 @@ async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
     .await
 }
 
-/// A pool of authenticated SMB connections to the same server.
-///
-/// Requests are distributed across connections via round-robin. Each connection
-/// is an independently authenticated SMB session with its own TCP stream, so
-/// concurrent operations don't serialize on a single mutex.
 /// One pool connection: an authenticated session and its tree-connect id for
 /// the share. Both are replaced together when the slot is healed.
 struct Slot {
@@ -76,6 +71,11 @@ struct Slot {
     tree_id: u32,
 }
 
+/// A pool of authenticated SMB connections to the same server.
+///
+/// Requests are distributed across connections via round-robin. Each connection
+/// is an independently authenticated SMB session with its own TCP stream, so
+/// concurrent operations don't serialize on a single mutex.
 pub struct SmbPool {
     /// Swappable slots — a poisoned connection is replaced in place by `heal`.
     slots: RwLock<Vec<Slot>>,

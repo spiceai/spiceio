@@ -242,6 +242,42 @@ fn bench_pipelined_read_decode(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bench the zero-copy `decode_read_response_from_msg` path used after the
+/// pipelined-read optimization. Compared to `bench_pipelined_read_decode` this
+/// avoids the per-response body `to_vec()` — for a 64-deep 64 KiB batch that's
+/// ~4 MiB of memcpy per batch eliminated.
+fn bench_pipelined_read_decode_zerocopy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipelined_read_decode_zerocopy");
+    let cases = [(8usize, 65536usize), (64, 65536), (64, 8192)];
+    for (depth, chunk_size) in cases {
+        let base_msg_id = 1_000u64;
+        let messages: Vec<Vec<u8>> = (0..depth)
+            .map(|i| build_read_response_msg(base_msg_id + i as u64, chunk_size))
+            .collect();
+        group.throughput(criterion::Throughput::Bytes((depth * chunk_size) as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(format!("d{depth}_c{chunk_size}")),
+            &messages,
+            |b, messages| {
+                b.iter(|| {
+                    let n = messages.len();
+                    let mut slots: Vec<Option<bytes::Bytes>> = (0..n).map(|_| None).collect();
+                    for msg in messages.iter() {
+                        let header = Header::decode(black_box(msg)).unwrap();
+                        let slot = header.message_id.wrapping_sub(base_msg_id) as usize;
+                        // Clone to simulate ownership transfer from the read
+                        // path — the production code reads directly into a
+                        // fresh Vec each response.
+                        slots[slot] = decode_read_response_from_msg(msg.clone());
+                    }
+                    slots
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 /// Bench the CPU-bound per-batch work of `pipelined_write`: header construction
 /// (with credit charge), `encode_write_request`, and `build_request` framing.
 /// This is the inner loop of WAL pipelined writes before any I/O happens.
@@ -272,6 +308,47 @@ fn bench_pipelined_write_encode(c: &mut Criterion) {
                         offset += chunk.len() as u64;
                     }
                     packets
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Bench the coalesced equivalent: build all packets directly into a single
+/// `BytesMut`, the way `pipelined_write` does post-optimization. Comparable
+/// to `bench_pipelined_write_encode` — captures the win from eliminating
+/// per-packet allocations and from a single contiguous buffer.
+fn bench_pipelined_write_encode_coalesced(c: &mut Criterion) {
+    use bytes::BufMut;
+    let mut group = c.benchmark_group("pipelined_write_encode_coalesced");
+    let file_id = [1u8; 16];
+    let cases = [(8usize, 65536usize), (64, 65536), (64, 1024 * 1024)];
+    const WRITE_REQUEST_FIXED: usize = 48;
+    for (depth, chunk_size) in cases {
+        let chunk = vec![0u8; chunk_size];
+        group.throughput(criterion::Throughput::Bytes((depth * chunk_size) as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(format!("d{depth}_c{chunk_size}")),
+            &chunk,
+            |b, chunk| {
+                b.iter(|| {
+                    let total_bytes =
+                        depth * (4 + SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED + chunk.len());
+                    let mut buf = BytesMut::with_capacity(total_bytes);
+                    let mut offset = 0u64;
+                    for i in 0..depth {
+                        let mut hdr = Header::new(Command::Write, i as u64)
+                            .with_credit_charge(chunk.len() as u32);
+                        hdr.tree_id = 42;
+                        hdr.session_id = 0xdead_beef;
+                        let packet_total = SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED + chunk.len();
+                        buf.put_u32((packet_total as u32) & 0x00FF_FFFF);
+                        hdr.encode(&mut buf);
+                        encode_write_request(&mut buf, &file_id, offset, black_box(chunk));
+                        offset += chunk.len() as u64;
+                    }
+                    buf
                 });
             },
         );
@@ -321,7 +398,9 @@ criterion_group!(
     bench_build_request,
     bench_parse_compound_response,
     bench_pipelined_read_decode,
+    bench_pipelined_read_decode_zerocopy,
     bench_pipelined_write_encode,
+    bench_pipelined_write_encode_coalesced,
     bench_parse_directory_entries,
 );
 criterion_main!(benches);

@@ -213,9 +213,12 @@ impl SmbClient {
     async fn send_recv_io(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
         let mut stream = self.stream.lock().await;
 
-        // Sign the packet if we have a signing key
+        // Sign the packet if we have a signing key. We need a writable buffer
+        // to sign in-place; `BytesMut::from(&[u8])` is one alloc + one copy
+        // (same cost as the previous `to_vec`, but expressed as a typed buffer
+        // that mirrors what the pipelined paths do).
         if let Some(ref key) = self.signing_key {
-            let mut signed = packet.to_vec();
+            let mut signed = BytesMut::from(packet);
             sign_packet(&mut signed, key);
             stream.write_all(&signed).await?;
         } else {
@@ -518,6 +521,10 @@ impl SmbClient {
     /// Holds the stream lock for the entire batch, eliminating per-request
     /// round-trip latency. Returns chunks in offset order. Stops early on EOF.
     ///
+    /// Coalesces all request packets into a single contiguous buffer and signs
+    /// each in-place — one allocation, one `write_all` syscall for the whole
+    /// batch of request headers (only the responses carry bulk data).
+    ///
     /// Responses may arrive out of order (SMB2 does not guarantee response
     /// ordering). Each response is matched to its request slot via message_id.
     pub async fn pipelined_read(
@@ -555,31 +562,38 @@ impl SmbClient {
         // response.message_id → slot index via simple subtraction.
         let base_msg_id = self.message_id.fetch_add(count as u64, Ordering::Relaxed);
 
-        let mut packets = Vec::with_capacity(count);
+        // Each request: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 49
+        // (read request fixed part incl. 1-byte buffer pad).
+        const READ_REQUEST_FIXED: usize = 49;
+        let per_packet = 4 + SMB2_HEADER_SIZE + READ_REQUEST_FIXED;
+        let mut buf = BytesMut::with_capacity(per_packet * count);
+        let mut packet_starts: Vec<usize> = Vec::with_capacity(count + 1);
+
         for i in 0..count {
+            packet_starts.push(buf.len());
             let offset = start_offset + (i as u64) * (chunk_size as u64);
             let msg_id = base_msg_id + i as u64;
             let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(chunk_size);
             hdr.session_id = self.session_id;
             hdr.tree_id = tree_id;
-            let packet = build_request(&hdr, |buf| {
-                encode_read_request(buf, file_id, offset, chunk_size);
-            });
-            packets.push(packet);
+
+            let packet_smb_total = SMB2_HEADER_SIZE + READ_REQUEST_FIXED;
+            buf.put_u32((packet_smb_total as u32) & 0x00FF_FFFF);
+            hdr.encode(&mut buf);
+            encode_read_request(&mut buf, file_id, offset, chunk_size);
+        }
+        packet_starts.push(buf.len());
+
+        if let Some(ref key) = self.signing_key {
+            for i in 0..count {
+                let start = packet_starts[i];
+                let end = packet_starts[i + 1];
+                sign_packet(&mut buf[start..end], key);
+            }
         }
 
         let mut stream = self.stream.lock().await;
-
-        // Send all requests
-        for packet in &packets {
-            if let Some(ref key) = self.signing_key {
-                let mut signed = packet.to_vec();
-                sign_packet(&mut signed, key);
-                stream.write_all(&signed).await?;
-            } else {
-                stream.write_all(packet).await?;
-            }
-        }
+        stream.write_all(&buf).await?;
         stream.flush().await?;
 
         // Receive responses into ordered slots (handles out-of-order delivery).
@@ -635,8 +649,10 @@ impl SmbClient {
                 )));
             }
 
-            let body = msg[SMB2_HEADER_SIZE..].to_vec();
-            let data = decode_read_response_owned(body).ok_or_else(|| {
+            // Zero-copy: hand the full `msg` Vec to the decoder, which slices
+            // into it as `Bytes` without an extra body copy. For 64KB chunks
+            // pipelined 64 deep this saves ~4 MiB of memcpy per batch.
+            let data = decode_read_response_from_msg(msg).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
             })?;
             slots[slot] = Some(data);
@@ -696,6 +712,8 @@ impl SmbClient {
     /// all responses. Holds the stream lock for the entire batch, eliminating
     /// per-request round-trip latency. Returns total bytes written.
     ///
+    /// Coalesces all packets into a single contiguous buffer and signs each
+    /// in-place — one allocation, one `write_all` syscall for the whole batch.
     /// Responses may arrive out of order; each is matched by message_id.
     pub async fn pipelined_write(
         &self,
@@ -729,33 +747,45 @@ impl SmbClient {
         let n = chunks.len();
         let base_msg_id = self.message_id.fetch_add(n as u64, Ordering::Relaxed);
 
-        let mut packets = Vec::with_capacity(n);
+        // Each packet: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 48
+        // (write request fixed part) + chunk data.
+        const WRITE_REQUEST_FIXED: usize = 48;
+        let total_bytes: usize = chunks
+            .iter()
+            .map(|c| 4 + SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED + c.len())
+            .sum();
+        let mut buf = BytesMut::with_capacity(total_bytes);
+        let mut packet_starts: Vec<usize> = Vec::with_capacity(n + 1);
+
         let mut offset = start_offset;
         for (i, chunk) in chunks.iter().enumerate() {
+            packet_starts.push(buf.len());
             let msg_id = base_msg_id + i as u64;
             let mut hdr =
                 Header::new(Command::Write, msg_id).with_credit_charge(chunk.len() as u32);
             hdr.session_id = self.session_id;
             hdr.tree_id = tree_id;
-            let packet = build_request(&hdr, |buf| {
-                encode_write_request(buf, file_id, offset, chunk);
-            });
-            packets.push(packet);
+
+            let packet_smb_total = SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED + chunk.len();
+            buf.put_u32((packet_smb_total as u32) & 0x00FF_FFFF);
+            hdr.encode(&mut buf);
+            encode_write_request(&mut buf, file_id, offset, chunk);
             offset += chunk.len() as u64;
+        }
+        packet_starts.push(buf.len());
+
+        // Sign each packet in-place. We pre-allocated exact capacity, so the
+        // earlier slices are still valid (no realloc could have moved them).
+        if let Some(ref key) = self.signing_key {
+            for i in 0..n {
+                let start = packet_starts[i];
+                let end = packet_starts[i + 1];
+                sign_packet(&mut buf[start..end], key);
+            }
         }
 
         let mut stream = self.stream.lock().await;
-
-        // Send all requests
-        for packet in &packets {
-            if let Some(ref key) = self.signing_key {
-                let mut signed = packet.to_vec();
-                sign_packet(&mut signed, key);
-                stream.write_all(&signed).await?;
-            } else {
-                stream.write_all(packet).await?;
-            }
-        }
+        stream.write_all(&buf).await?;
         stream.flush().await?;
 
         // Receive all responses (handles out-of-order delivery)

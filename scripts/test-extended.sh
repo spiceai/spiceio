@@ -31,6 +31,10 @@ FAIL=0
 CONCURRENCY="${SPICEIO_EXT_CONCURRENCY:-8}"
 CURL_TIMEOUT="${SPICEIO_EXT_TIMEOUT:-60}"
 
+# Capture spiceio stderr so the post-run guard can flag unexpected
+# `[spiceio] error:` lines. We tee back to stderr so CI still streams live.
+SPICEIO_STDERR="${TMPDIR_BASE}/spiceio-stderr.log"
+
 # ── Cleanup ────────────────────────────────────────────────────────────────
 
 SPICEIO_PID=""
@@ -113,7 +117,7 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
-"$SPICEIO_BIN" &
+"$SPICEIO_BIN" 2> >(tee "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
 for i in $(seq 1 60); do
@@ -426,6 +430,33 @@ $AWS s3 cp "s3://${BUCKET}/${PREFIX}/cancel-4m" "${SC_DIR}/dl-after" --quiet
 ORIG_MD5=$(md5 -q "${SC_DIR}/src")
 GOT_MD5=$(md5 -q "${SC_DIR}/dl-after")
 assert_eq "full GET after cancellation succeeds" "$ORIG_MD5" "$GOT_MD5"
+
+# ════════════════════════════════════════════════════════════════════════════
+# Stderr guard
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Expected transients (sharing violations, NotFound, etc.) are mapped to
+# typed `io::ErrorKind`s and logged via `slog!` without the "error:" prefix.
+# A `[spiceio] error:` hit here means a new failure mode is leaking through
+# the generic 500 InternalError arm of `io_to_s3_error` — fail the build.
+
+# Stop spiceio *before* grepping the captured stderr. tee in the process
+# substitution only closes the capture file when spiceio's stderr fd closes,
+# so we have to kill+wait here rather than rely on the EXIT trap. Clear
+# SPICEIO_PID so the trap's own kill becomes a no-op.
+if [[ -n "$SPICEIO_PID" ]]; then
+    kill "$SPICEIO_PID" 2>/dev/null || true
+    wait "$SPICEIO_PID" 2>/dev/null || true
+    SPICEIO_PID=""
+fi
+sleep 0.2  # tee in <(...) isn't directly waitable; let it drain.
+
+if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
+    echo ""
+    echo "FAIL: spiceio emitted unexpected error log lines during extended run:"
+    grep '\[spiceio\] error:' "$SPICEIO_STDERR" | head -20
+    FAIL=$((FAIL + 1))
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # Summary

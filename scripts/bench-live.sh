@@ -5,7 +5,15 @@ set -euo pipefail
 #
 # Usage: SPICEIO_SMB_USER=user SPICEIO_SMB_PASS=pass ./scripts/bench-live.sh
 #
-# Runs write and read throughput tests at various file sizes.
+# Runs write and read throughput tests at various file sizes, plus
+# concurrent multi-stream tests intended to saturate a 10G link.
+#
+# Environment knobs:
+#   BENCH_CONCURRENCY    parallel streams in the concurrent tests (default 8)
+#   BENCH_MOUNT_BASELINE 1 to also benchmark a raw mount_smbfs mount of the
+#                          same share — gives a hard ceiling on what the link
+#                          can do, so we can see spiceio's translation overhead
+#
 # Requires: aws cli, dd, curl, bc, perl (Time::HiRes).
 
 SMB_SERVER="${SPICEIO_SMB_SERVER:-192.168.3.148}"
@@ -15,6 +23,8 @@ SMB_DOMAIN="${SPICEIO_SMB_DOMAIN:-}"
 REGION="${SPICEIO_REGION:-us-east-1}"
 BUCKET="${SPICEIO_BUCKET:-bench}"
 BIND="${SPICEIO_BIND:-127.0.0.1:18334}"
+CONCURRENCY="${BENCH_CONCURRENCY:-8}"
+MOUNT_BASELINE="${BENCH_MOUNT_BASELINE:-0}"
 
 : "${SPICEIO_SMB_USER:?SPICEIO_SMB_USER is required}"
 : "${SPICEIO_SMB_PASS:?SPICEIO_SMB_PASS is required}"
@@ -32,6 +42,7 @@ fi
 
 # ── Cleanup ─────────────────────────────────────────────────────────────
 SPICEIO_PID=""
+MOUNT_POINT=""
 cleanup() {
     echo ""
     echo "[bench] cleaning up..."
@@ -39,6 +50,10 @@ cleanup() {
     if [[ -n "$SPICEIO_PID" ]]; then
         kill "$SPICEIO_PID" 2>/dev/null || true
         wait "$SPICEIO_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MOUNT_POINT" && -d "$MOUNT_POINT" ]]; then
+        umount "$MOUNT_POINT" 2>/dev/null || true
+        rmdir "$MOUNT_POINT" 2>/dev/null || true
     fi
     rm -f /tmp/spiceio-bench-*
 }
@@ -122,6 +137,123 @@ bench_multi_write() {
     rm -f "$file"
 }
 
+# Concurrent single-file PUT: N parallel uploads of `size_bytes`-each.
+# Aggregate throughput is what hits the link — this is the test that
+# meaningfully exercises a 10G NAS pipe.
+bench_concurrent_write() {
+    local concurrency=$1 size_bytes=$2 label=$3
+    local total=$((concurrency * size_bytes))
+    local file="/tmp/spiceio-bench-cwrite-${label}"
+    gen_file "$file" "$size_bytes"
+
+    local start end elapsed mbps
+    start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+    local pids=()
+    for i in $(seq 1 "$concurrency"); do
+        $AWS s3 cp "$file" "s3://${BUCKET}/${PREFIX}/cw-${label}-${i}" --quiet 2>/dev/null &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid"
+    done
+    end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+    elapsed=$(echo "$end - $start" | bc -l)
+    mbps=$(echo "$total / $elapsed / 1048576" | bc -l)
+    printf "  PUT x%-3d %-5s  %6.2fs  %7.1f MiB/s  (%.2f Gbit/s)\n" \
+        "$concurrency" "$label" "$elapsed" "$mbps" \
+        "$(echo "$mbps * 8 / 1024" | bc -l)"
+    rm -f "$file"
+}
+
+bench_concurrent_read() {
+    local concurrency=$1 size_bytes=$2 label=$3
+    local total=$((concurrency * size_bytes))
+
+    local start end elapsed mbps
+    start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+    local pids=()
+    for i in $(seq 1 "$concurrency"); do
+        $AWS s3 cp "s3://${BUCKET}/${PREFIX}/cw-${label}-${i}" "/tmp/spiceio-bench-cread-${label}-${i}" \
+            --quiet 2>/dev/null &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid"
+    done
+    end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+    elapsed=$(echo "$end - $start" | bc -l)
+    mbps=$(echo "$total / $elapsed / 1048576" | bc -l)
+    printf "  GET x%-3d %-5s  %6.2fs  %7.1f MiB/s  (%.2f Gbit/s)\n" \
+        "$concurrency" "$label" "$elapsed" "$mbps" \
+        "$(echo "$mbps * 8 / 1024" | bc -l)"
+    rm -f /tmp/spiceio-bench-cread-${label}-*
+}
+
+# Optional raw-SMB baseline via mount_smbfs. Mounts the same share locally
+# and runs the same dd-based write/read tests. Establishes the hard
+# ceiling for what the link can do, so we can attribute spiceio's
+# translation overhead.
+#
+# The mount uses the macOS Keychain for credentials rather than embedding
+# the password in the mount URL — embedded passwords leak via shell
+# history and `ps` argv listings, and shelling out to `perl -MURI::Escape`
+# adds a non-portable dependency. To prep the keychain once:
+#   mount_smbfs //user@server/share /tmp/mnt   # interactive; offers
+#                                                "Remember in keychain"
+#   umount /tmp/mnt
+# If the keychain entry is missing, the baseline is skipped.
+bench_mount_baseline() {
+    local user="$SPICEIO_SMB_USER"
+    local server="$SMB_SERVER"
+    local share="$SMB_SHARE"
+
+    MOUNT_POINT="/tmp/spiceio-bench-mount-$$"
+    mkdir -p "$MOUNT_POINT"
+    # -N: no interactive password prompt. mount_smbfs will pull credentials
+    # from the macOS Keychain if available; we deliberately do not pass the
+    # password in argv so it doesn't leak via process listings.
+    if ! mount_smbfs -N "//${user}@${server}/${share}" "$MOUNT_POINT" 2>/dev/null; then
+        echo "  (mount_smbfs failed — set up keychain credentials first; skipping baseline)"
+        rmdir "$MOUNT_POINT" 2>/dev/null
+        MOUNT_POINT=""
+        return
+    fi
+
+    local target="${MOUNT_POINT}/${PREFIX}-mount-baseline"
+    mkdir -p "$target"
+
+    local label sizes labels
+    sizes=(104857600 524288000)
+    labels=("100M" "500M")
+    for idx in "${!sizes[@]}"; do
+        local size_bytes=${sizes[$idx]}
+        label=${labels[$idx]}
+        local file="/tmp/spiceio-bench-mountin-${label}"
+        gen_file "$file" "$size_bytes"
+
+        local start end elapsed mbps
+        start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+        cp "$file" "${target}/${label}"
+        end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+        elapsed=$(echo "$end - $start" | bc -l)
+        mbps=$(echo "$size_bytes / $elapsed / 1048576" | bc -l)
+        printf "  PUT mount  %-5s  %6.2fs  %7.1f MiB/s\n" "$label" "$elapsed" "$mbps"
+
+        start=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+        cp "${target}/${label}" "${file}.out"
+        end=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
+        elapsed=$(echo "$end - $start" | bc -l)
+        mbps=$(echo "$size_bytes / $elapsed / 1048576" | bc -l)
+        printf "  GET mount  %-5s  %6.2fs  %7.1f MiB/s\n" "$label" "$elapsed" "$mbps"
+        rm -f "$file" "${file}.out"
+    done
+
+    rm -rf "$target" 2>/dev/null
+    umount "$MOUNT_POINT" 2>/dev/null
+    rmdir "$MOUNT_POINT" 2>/dev/null
+    MOUNT_POINT=""
+}
+
 # ── Run benchmarks ──────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -156,11 +288,24 @@ bench_multi_write 100  1048576   "1M"
 bench_multi_write  20 10485760   "10M"
 bench_multi_write  10 52428800   "50M"
 
-# Total: 1685 (write) + 1685 (read) + 800 (multi-write) = 4170 MiB transferred
+# Concurrent single-stream tests. Single-stream uploads top out at one TCP
+# connection's worth of pipe; aggregate concurrent uploads is the test
+# that actually saturates a 10G link.
 echo ""
-echo "── Aggregate ──"
-echo "  Total written: 2485 MiB  (single-file + multi-file)"
-echo "  Total read:    1685 MiB"
-echo "  Total I/O:     4170 MiB"
+echo "── Concurrent write throughput (x${CONCURRENCY} parallel) ──"
+bench_concurrent_write "$CONCURRENCY" 104857600  "100M"
+bench_concurrent_write "$CONCURRENCY" 524288000  "500M"
+
+echo ""
+echo "── Concurrent read throughput (x${CONCURRENCY} parallel) ──"
+bench_concurrent_read "$CONCURRENCY" 104857600  "100M"
+bench_concurrent_read "$CONCURRENCY" 524288000  "500M"
+
+if [[ "$MOUNT_BASELINE" == "1" ]]; then
+    echo ""
+    echo "── Raw mount_smbfs baseline (link ceiling) ──"
+    bench_mount_baseline
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
