@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -100,6 +100,11 @@ pub struct SmbPool {
     /// Adaptive streaming-read I/O size — same AIMD scheme as `write_io`, for
     /// the GET/read path.
     read_io: AtomicU32,
+    /// Set whenever a reset backs off an I/O size; gates `grow_io` so recovery
+    /// only re-probes a larger size after a full healer interval with no reset.
+    /// Without this the healer could grow the size back mid-retry-burst, making
+    /// a client's retry hit a too-large chunk that resets again.
+    reset_since_grow: AtomicBool,
 }
 
 /// Floor for the adaptive streaming I/O size — the conservative size that
@@ -169,6 +174,7 @@ impl SmbPool {
             compound_max_write_size,
             write_io: AtomicU32::new(max_write_size),
             read_io: AtomicU32::new(max_read_size),
+            reset_since_grow: AtomicBool::new(false),
         }))
     }
 
@@ -186,6 +192,7 @@ impl SmbPool {
     /// the adaptive write size (down to `IO_FLOOR`) so the next attempt uses a
     /// size the server can sustain. No-op once already at the floor.
     pub fn note_write_reset(&self) {
+        self.reset_since_grow.store(true, Ordering::Relaxed);
         let cur = self.write_io.load(Ordering::Relaxed);
         let next = io_after_reset(cur);
         if next != cur {
@@ -200,6 +207,7 @@ impl SmbPool {
     /// Note that the server reset/dropped a connection on a large read — halve
     /// the adaptive read size (down to `IO_FLOOR`). No-op once at the floor.
     pub fn note_read_reset(&self) {
+        self.reset_since_grow.store(true, Ordering::Relaxed);
         let cur = self.read_io.load(Ordering::Relaxed);
         let next = io_after_reset(cur);
         if next != cur {
@@ -212,9 +220,15 @@ impl SmbPool {
     }
 
     /// Step both adaptive I/O sizes back up toward their maxes (×2) — called each
-    /// healer tick so a transient overload re-probes the larger size once the
-    /// server recovers. No-op for a dimension already at its max.
+    /// healer tick. Only re-probes a larger size after a full interval with *no*
+    /// reset, so recovery never inflates the size into an active overload (which
+    /// would make a client's in-flight retries hit a too-large chunk).
     fn grow_io(&self) {
+        // Cooldown: if any reset happened since the last tick, skip growing this
+        // round and clear the flag so a quiet interval next time lets us re-probe.
+        if self.reset_since_grow.swap(false, Ordering::Relaxed) {
+            return;
+        }
         let w = self.write_io.load(Ordering::Relaxed);
         let wn = io_after_grow(w, self.max_write_size);
         if wn != w {
