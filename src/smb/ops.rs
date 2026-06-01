@@ -489,6 +489,18 @@ impl ShareSession {
     pub async fn assemble_parts(&self, key: &str, temp_paths: &[&str]) -> io::Result<ObjectMeta> {
         let mut wal = self.open_wal_write(key).await?;
 
+        // Guard before the per-part `remaining.div_ceil(max_read as u64)` in
+        // stream_part_into_wal — a zero-floored pool entry (shouldn't happen
+        // post the negotiate floor, but defense in depth) would otherwise
+        // panic the task.
+        if self.pool.max_read_size == 0 {
+            wal.abort().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "assemble_parts: pool max_read_size = 0",
+            ));
+        }
+
         for &temp_path in temp_paths {
             if let Err(e) = self.stream_part_into_wal(&mut wal, temp_path).await {
                 // Release the WAL handle and delete its temp file before bailing.
@@ -856,6 +868,14 @@ impl FileHandle {
         chunk_size: u32,
         remaining: u64,
     ) -> io::Result<Vec<Bytes>> {
+        // Guard before `div_ceil` — the guard inside `SmbClient::pipelined_read`
+        // is too late, since `remaining.div_ceil(0)` would panic right here.
+        if chunk_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FileHandle::read_pipeline called with chunk_size = 0",
+            ));
+        }
         let count = remaining
             .div_ceil(chunk_size as u64)
             .min(PIPELINE_DEPTH as u64) as usize;
