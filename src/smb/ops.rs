@@ -1064,8 +1064,19 @@ impl WalWriter {
                 .await
             {
                 Ok(written) => {
+                    let w = written as usize;
+                    if w == 0 {
+                        // A "success" that wrote nothing would spin the loop
+                        // forever — treat it as a transport fault instead.
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "pipelined write reported 0 bytes written",
+                        ));
+                    }
+                    // Advance by the bytes actually written (normally the whole
+                    // window); a short write just re-sends the remainder.
                     self.offset += written;
-                    sent = end;
+                    sent += w;
                     attempt = 0; // forward progress refreshes the retry budget
                 }
                 Err(e) => {
