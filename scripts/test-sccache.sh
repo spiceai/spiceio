@@ -364,6 +364,14 @@ echo "======================================="
 
 sccache --stop-server 2>/dev/null || true
 
+# Neutralize any ambient sccache backend config so this test exercises spiceio's
+# S3 endpoint, not a leaked local-disk/other cache. sccache prefers SCCACHE_DIR
+# (local disk) over SCCACHE_BUCKET when both are set, so an inherited
+# SCCACHE_DIR (e.g. from another project's build env) would silently bypass
+# spiceio entirely.
+unset SCCACHE_DIR SCCACHE_GCS_BUCKET SCCACHE_AZURE_CONNECTION_STRING \
+    SCCACHE_REDIS SCCACHE_MEMCACHED SCCACHE_WEBDAV_ENDPOINT 2>/dev/null || true
+
 export SCCACHE_BUCKET="$BUCKET"
 export SCCACHE_ENDPOINT="$ENDPOINT"
 export SCCACHE_REGION="$REGION"
