@@ -639,7 +639,7 @@ impl ShareSession {
             file_id: file.file_id,
             wal_path,
             final_path,
-            buf: Vec::with_capacity(chunk_size * WRITE_PIPELINE_DEPTH),
+            buf: Vec::with_capacity(wal_flush_cap(chunk_size)),
             chunk_size,
             offset: 0,
             total_size: 0,
@@ -905,8 +905,21 @@ const WAL_DIR: &str = ".spiceio-wal";
 /// Directory on the SMB share where multipart upload parts are stored.
 const UPLOADS_DIR: &str = ".spiceio-uploads";
 
-/// Number of write requests to pipeline in a single batch.
-const WRITE_PIPELINE_DEPTH: usize = 64;
+/// Target bytes in flight per WAL flush. The buffer fills to this, then the
+/// whole buffer goes out as one coalesced `write_all`. Kept modest (4 MiB) so
+/// that N concurrent streaming PUTs don't burst N × this at once and overrun
+/// the SMB server's receive window — which stalls writes until they trip the
+/// 30 s write guard and poison the connections. 4 MiB is far above the
+/// ~0.5 ms-RTT bandwidth-delay product, so single-stream throughput is
+/// unaffected. (At the old 64 KB I/O cap this equalled 64 × 64 KB; raising I/O
+/// to 256 KB without decoupling the burst pushed it to 16 MB and overwhelmed
+/// the server under concurrency.)
+const WRITE_INFLIGHT_BYTES: usize = 4 * 1024 * 1024;
+
+/// WAL flush buffer size: the in-flight target, but at least one chunk.
+fn wal_flush_cap(chunk_size: usize) -> usize {
+    WRITE_INFLIGHT_BYTES.max(chunk_size)
+}
 
 /// Monotonic counter for unique WAL file names within this process.
 static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -945,9 +958,9 @@ pub struct WalWriter {
 
 impl WalWriter {
     /// Append data to the write buffer. Flushes automatically when the buffer
-    /// fills to pipeline capacity (WRITE_PIPELINE_DEPTH * chunk_size).
+    /// fills to the in-flight target (see `WRITE_INFLIGHT_BYTES`).
     pub async fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let pipeline_cap = self.chunk_size * WRITE_PIPELINE_DEPTH;
+        let pipeline_cap = wal_flush_cap(self.chunk_size);
         let mut pos = 0;
 
         while pos < data.len() {
@@ -1350,9 +1363,13 @@ mod tests {
     }
 
     #[test]
-    fn wal_pipeline_depth() {
-        // Pipeline depth should match read pipeline for consistency
-        assert_eq!(WRITE_PIPELINE_DEPTH, PIPELINE_DEPTH);
+    fn wal_flush_cap_bounds_burst() {
+        // The flush burst is a fixed in-flight target, independent of chunk
+        // size, so larger I/O does not multiply the per-connection burst.
+        assert_eq!(wal_flush_cap(65536), WRITE_INFLIGHT_BYTES);
+        assert_eq!(wal_flush_cap(262144), WRITE_INFLIGHT_BYTES);
+        // A chunk larger than the target still yields at least one chunk.
+        assert_eq!(wal_flush_cap(8 * 1024 * 1024), 8 * 1024 * 1024);
     }
 
     #[test]

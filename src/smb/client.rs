@@ -15,6 +15,12 @@ use bytes::{BufMut, BytesMut};
 /// the SMB server is slow or unresponsive under heavy load.
 const SMB_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout for a socket write. There is no OS-level write timeout, so a server
+/// that stops draining its receive window under heavy concurrent write load
+/// would otherwise block `write_all` forever (hanging the request). On timeout
+/// we poison the connection — the pool healer reconnects it.
+const SMB_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Timeout for the initial TCP handshake to the SMB server. Without this,
 /// a server that drops SYNs leaves the OS waiting ~75-90s, which stalls
 /// pool initialization past any sensible CI window.
@@ -192,6 +198,31 @@ impl SmbClient {
         }
     }
 
+    /// Write all of `buf` to the stream with a timeout. A server that stops
+    /// draining its receive window under heavy concurrent write load would
+    /// otherwise block `write_all` indefinitely (there is no OS write timeout),
+    /// hanging the request. On timeout we poison the connection and drop the
+    /// socket, mirroring the read path; the pool healer reconnects it.
+    async fn write_all_timeout(&self, stream: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMB connection poisoned by previous timeout",
+            ));
+        }
+        match tokio::time::timeout(SMB_WRITE_TIMEOUT, stream.write_all(buf)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.poisoned.store(true, Ordering::Relaxed);
+                let _ = stream.shutdown().await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SMB server write timed out; connection poisoned",
+                ))
+            }
+        }
+    }
+
     /// Send a packet and receive a response, also returning the raw SMB2 response bytes
     /// (without NetBIOS header) for preauth hash computation.
     async fn send_recv_raw(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
@@ -225,9 +256,9 @@ impl SmbClient {
         if let Some(ref key) = self.signing_key {
             let mut signed = BytesMut::from(packet);
             sign_packet(&mut signed, key);
-            stream.write_all(&signed).await?;
+            self.write_all_timeout(&mut stream, &signed).await?;
         } else {
-            stream.write_all(packet).await?;
+            self.write_all_timeout(&mut stream, packet).await?;
         }
         stream.flush().await?;
 
@@ -615,7 +646,7 @@ impl SmbClient {
         }
 
         let mut stream = self.stream.lock().await;
-        stream.write_all(&buf).await?;
+        self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Receive responses into ordered slots (handles out-of-order delivery).
@@ -807,7 +838,7 @@ impl SmbClient {
         }
 
         let mut stream = self.stream.lock().await;
-        stream.write_all(&buf).await?;
+        self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Receive all responses (handles out-of-order delivery)
@@ -1012,7 +1043,7 @@ impl SmbClient {
 
         // Send and receive under the stream lock
         let mut stream = self.stream.lock().await;
-        stream.write_all(&buf).await?;
+        self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Read response frames, skipping STATUS_PENDING interim responses

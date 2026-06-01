@@ -179,7 +179,7 @@ async fn main() {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 state.share.heal().await;
             }
         });

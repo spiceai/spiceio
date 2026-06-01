@@ -1577,17 +1577,27 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
             crate::serr!("[spiceio] access denied: {e}");
             error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied")
         }
-        // Sharing violations are an expected transient under concurrent
-        // writes (the underlying SMB server refused to open a file held by
-        // another handle). Map to 503 SlowDown — the standard S3 retryable
-        // status — and log at info level instead of `serr!`, since these
-        // are not bugs and shouldn't paint CI logs red.
-        io::ErrorKind::ResourceBusy => {
-            crate::slog!("[spiceio] busy (retry): {e}");
+        // Transient, retryable conditions → 503 SlowDown (the standard S3
+        // retryable status), logged at info level (not `serr!`) since they
+        // are not bugs:
+        //   - ResourceBusy: sharing violation under concurrent access.
+        //   - BrokenPipe/ConnectionReset/ConnectionAborted/NotConnected: the
+        //     SMB server dropped a pool connection (common under heavy
+        //     concurrent load); the healer reconnects it, so the client should
+        //     just retry instead of seeing a hard 500.
+        //   - TimedOut: a read/write timed out and we poisoned the connection;
+        //     a retry lands on a healthy one.
+        io::ErrorKind::ResourceBusy
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::TimedOut => {
+            crate::slog!("[spiceio] transient (retry): {e}");
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SlowDown",
-                "Please reduce your request rate.",
+                "The request could not be completed; please retry.",
             )
         }
         _ => {
@@ -1737,6 +1747,26 @@ mod tests {
         let err = io::Error::new(io::ErrorKind::ResourceBusy, "sharing violation: foo");
         let resp = io_to_s3_error(&err);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn io_to_s3_error_maps_dropped_connection_to_retryable() {
+        // A pool connection the SMB server dropped under load must surface as a
+        // retryable 503, not a hard 500, so clients back off and retry.
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::TimedOut,
+        ] {
+            let resp = io_to_s3_error(&io::Error::new(kind, "dropped"));
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{kind:?} should map to 503"
+            );
+        }
     }
 
     #[test]
