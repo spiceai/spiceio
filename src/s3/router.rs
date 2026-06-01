@@ -1127,7 +1127,27 @@ async fn handle_upload_part(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let etag = crate::crypto::hex_encode(&crate::crypto::sha256(&body));
+    // Hashing a multi-hundred-MB part is CPU-bound; run it on the blocking pool
+    // so it doesn't tie up an async worker (which would starve other requests on
+    // a busy multi-core box). `Bytes::clone` is a cheap refcount bump.
+    let etag = {
+        let b = body.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::crypto::hex_encode(&crate::crypto::sha256(&b))
+        })
+        .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                crate::serr!("[spiceio] upload-part hash task failed: {e}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "hash failed",
+                );
+            }
+        }
+    };
     let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
 
     if let Err(e) = state.share.write_temp(&temp_path, &body).await {
