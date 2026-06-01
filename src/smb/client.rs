@@ -43,12 +43,17 @@ impl SmbConfig {
 }
 
 /// Default I/O cap for standalone (non-compound) read/write operations.
-/// Many NAS servers advertise multi-MB maximums in negotiate but fail at sizes
-/// well below the advertised limit. 64 KB is the safe conservative default;
-/// override via `SPICEIO_SMB_MAX_IO` for servers that handle larger I/O
-/// (e.g., Windows Server, enterprise NAS). Even at 64 KB the connection pool
-/// and pipelined reads still deliver major throughput gains.
-const DEFAULT_MAX_IO: u32 = 65536;
+///
+/// 256 KB is the measured sweet spot for streaming throughput: on a 10G link a
+/// single-stream PutObject rises from ~31 MiB/s at 64 KB to ~744 MiB/s at
+/// 256 KB. Larger sizes actually regress with the current WAL flush buffer
+/// (`chunk_size * WRITE_PIPELINE_DEPTH`) — at 1 MB it buffers 64 MB before
+/// flushing, which serializes the transfer. 256 KB stays well within what
+/// essentially every SMB server handles, and small files keep using the 64 KB
+/// compound cap (so per-op latency is unchanged). Override via
+/// `SPICEIO_SMB_MAX_IO`; the effective size is always clamped to the server's
+/// negotiated maximum.
+const DEFAULT_MAX_IO: u32 = 262144;
 
 /// An authenticated SMB2 session.
 pub struct SmbClient {
