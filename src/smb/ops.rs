@@ -1035,30 +1035,80 @@ impl WalWriter {
     }
 
     /// Flush the memory buffer to the WAL temp file using pipelined writes.
+    ///
+    /// The buffer is sent in in-flight-sized windows so the write burst shrinks
+    /// with the adaptive size. On a mid-flush reset (an overwhelmed NAS closing
+    /// or dropping the connection), back off, reconnect on a fresh pool
+    /// connection, and retry the same window at the smaller size — so a single
+    /// PUT rides the back-off ladder down to a sustainable burst internally
+    /// rather than failing back to the client and burning its limited retry
+    /// budget. Bounded by MAX_FLUSH_RETRIES; every window that lands resets the
+    /// budget so only sustained failure aborts.
     async fn flush(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-
-        // Split buffer into chunk_size slices for pipelining
-        let chunks: Vec<&[u8]> = self.buf.chunks(self.chunk_size).collect();
-        let written = match self
-            .client
-            .pipelined_write(self.tree_id, &self.file_id, self.offset, &chunks)
-            .await
-        {
-            Ok(w) => w,
-            Err(e) => {
-                // Server reset a large write — back off the adaptive write size
-                // so the retry (and other streams) use a sustainable chunk.
-                if is_reset(&e) {
-                    self.pool.note_write_reset();
+        const MAX_FLUSH_RETRIES: u32 = 16;
+        let mut sent = 0usize;
+        let mut attempt = 0u32;
+        while sent < self.buf.len() {
+            // Re-read the adaptive size each window so the burst shrinks under
+            // degradation (and recovers as the server does).
+            self.chunk_size = (self.pool.write_chunk_size() as usize).max(1);
+            let budget = (self.pool.write_inflight() as usize).max(self.chunk_size);
+            let end = (sent + budget).min(self.buf.len());
+            let window: Vec<&[u8]> = self.buf[sent..end].chunks(self.chunk_size).collect();
+            match self
+                .client
+                .pipelined_write(self.tree_id, &self.file_id, self.offset, &window)
+                .await
+            {
+                Ok(written) => {
+                    self.offset += written;
+                    sent = end;
+                    attempt = 0; // forward progress refreshes the retry budget
                 }
-                return Err(e);
+                Err(e) => {
+                    // Server reset a large write — back off the adaptive write
+                    // size so this retry (and other streams) use a sustainable
+                    // burst.
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_FLUSH_RETRIES {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    self.reopen().await?;
+                }
             }
-        };
-        self.offset += written;
+        }
         self.buf.clear();
+        Ok(())
+    }
+
+    /// Reconnect the WAL writer on a fresh pool connection after a mid-flush
+    /// reset. Re-opens the temp file with `Open` (never `OverwriteIf`) so the
+    /// bytes already flushed are preserved — `self.offset` is unchanged, and the
+    /// caller re-sends the same window at the backed-off size.
+    async fn reopen(&mut self) -> io::Result<()> {
+        let _ = self.client.close(self.tree_id, &self.file_id).await; // best-effort
+        self.pool.heal().await; // reconnect poisoned slots so pick() lands live
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let the NAS breathe
+        let (client, tree_id) = self.pool.pick();
+        let file = client
+            .create(
+                tree_id,
+                &self.wal_path,
+                DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                ShareAccess::Read as u32 | ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+        self.client = client;
+        self.tree_id = tree_id;
+        self.file_id = file.file_id;
         Ok(())
     }
 
