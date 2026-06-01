@@ -190,7 +190,10 @@ impl SmbPool {
         let next = io_after_reset(cur);
         if next != cur {
             self.write_io.store(next, Ordering::Relaxed);
-            crate::slog!("[spiceio] write I/O backed off to {}K after reset", next / 1024);
+            crate::slog!(
+                "[spiceio] write I/O backed off to {}K after reset",
+                next / 1024
+            );
         }
     }
 
@@ -201,7 +204,10 @@ impl SmbPool {
         let next = io_after_reset(cur);
         if next != cur {
             self.read_io.store(next, Ordering::Relaxed);
-            crate::slog!("[spiceio] read I/O backed off to {}K after reset", next / 1024);
+            crate::slog!(
+                "[spiceio] read I/O backed off to {}K after reset",
+                next / 1024
+            );
         }
     }
 
