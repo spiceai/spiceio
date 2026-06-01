@@ -23,6 +23,9 @@ pub struct ShareSession {
 /// Pinned to the specific connection that opened the file.
 pub struct FileHandle {
     client: Arc<SmbClient>,
+    /// Pool handle, used to report large-read resets so the adaptive read size
+    /// backs off for subsequent operations.
+    pool: Arc<SmbPool>,
     tree_id: u32,
     file_id: [u8; 16],
     pub meta: ObjectMeta,
@@ -110,10 +113,11 @@ impl ShareSession {
 
         Ok(FileHandle {
             client: Arc::clone(&client),
+            pool: Arc::clone(&self.pool),
             tree_id,
             file_id: file.file_id,
             file_size: file.file_size,
-            max_chunk: self.pool.max_read_size,
+            max_chunk: self.pool.read_io_size(),
             meta,
         })
     }
@@ -148,10 +152,11 @@ impl ShareSession {
 
         Ok(FileHandle {
             client: Arc::clone(&client),
+            pool: Arc::clone(&self.pool),
             tree_id,
             file_id: file.file_id,
             file_size: 0,
-            max_chunk: self.pool.max_write_size,
+            max_chunk: self.pool.write_io_size(),
             meta,
         })
     }
@@ -227,7 +232,7 @@ impl ShareSession {
         let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
         let compound_max = self.pool.compound_max_read_size;
-        let max_read = self.pool.max_read_size;
+        let max_read = self.pool.read_io_size();
 
         // Compound: Create+Read+Close in 1 round trip (uses compound cap)
         let (cr, first_chunk) = client
@@ -326,7 +331,7 @@ impl ShareSession {
         .await;
         let _ = client.close(tree_id, &file.file_id).await;
         if let Err(e) = write_result {
-            if is_write_reset(&e) {
+            if is_reset(&e) {
                 self.pool.note_write_reset();
             }
             let _ = Self::delete_object_path_on(&client, tree_id, &smb_path).await;
@@ -429,7 +434,7 @@ impl ShareSession {
         .await;
         let _ = client.close(tree_id, &file.file_id).await;
         if let Err(e) = write_result {
-            if is_write_reset(&e) {
+            if is_reset(&e) {
                 self.pool.note_write_reset();
             }
             let _ = Self::delete_object_path_on(&client, tree_id, smb_path).await;
@@ -442,7 +447,7 @@ impl ShareSession {
     pub async fn read_temp(&self, smb_path: &str) -> io::Result<Vec<u8>> {
         let (client, tree_id) = self.pick();
         let compound_max = self.pool.compound_max_read_size;
-        let max_read = self.pool.max_read_size;
+        let max_read = self.pool.read_io_size();
         let (cr, first_chunk) = client
             .create_read_close(tree_id, smb_path, compound_max)
             .await?;
@@ -534,7 +539,7 @@ impl ShareSession {
             .await?;
         let file_id = cr.file_id;
         let file_size = cr.file_size;
-        let max_read = self.pool.max_read_size;
+        let max_read = self.pool.read_io_size();
 
         let read_result: io::Result<()> = async {
             let mut offset = 0u64;
@@ -543,9 +548,18 @@ impl ShareSession {
                 let batch = remaining
                     .div_ceil(max_read as u64)
                     .min(PIPELINE_DEPTH as u64) as usize;
-                let chunks = client
+                let chunks = match client
                     .pipelined_read(tree_id, &file_id, offset, max_read, batch)
-                    .await?;
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if is_reset(&e) {
+                            self.pool.note_read_reset();
+                        }
+                        return Err(e);
+                    }
+                };
                 if chunks.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -886,9 +900,18 @@ impl FileHandle {
         let count = remaining
             .div_ceil(chunk_size as u64)
             .min(PIPELINE_DEPTH as u64) as usize;
-        self.client
+        let r = self
+            .client
             .pipelined_read(self.tree_id, &self.file_id, offset, chunk_size, count)
-            .await
+            .await;
+        if let Err(e) = &r
+            && is_reset(e)
+        {
+            // Server reset a large read — back off the adaptive read size so the
+            // retry (and other GET streams) use a sustainable chunk.
+            self.pool.note_read_reset();
+        }
+        r
     }
 
     /// Write a chunk at the given offset. Returns bytes written.
@@ -931,7 +954,7 @@ fn wal_flush_cap(chunk_size: usize) -> usize {
 /// True if the error means the SMB server dropped/reset the connection (or timed
 /// out) on a write — the signal to back off the adaptive write size so the next
 /// attempt uses a smaller, server-sustainable I/O size.
-fn is_write_reset(e: &io::Error) -> bool {
+fn is_reset(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::ConnectionReset
@@ -1017,7 +1040,7 @@ impl WalWriter {
             Err(e) => {
                 // Server reset a large write — back off the adaptive write size
                 // so the retry (and other streams) use a sustainable chunk.
-                if is_write_reset(&e) {
+                if is_reset(&e) {
                     self.pool.note_write_reset();
                 }
                 return Err(e);
