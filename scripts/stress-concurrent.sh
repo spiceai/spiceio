@@ -353,13 +353,13 @@ echo "  integrity: $((PASS - PREV_PASS)) checks passed, reads=${READ_OK}/${READ_
 # ════════════════════════════════════════════════════════════════════════════
 
 echo ""
+LARGE_N="${SPICEIO_STRESS_LARGE_N:-8}"
 echo "═══════════════════════════════════════════════════════════════"
-echo " 5. Concurrent large-file I/O (8 x 1MB — pipelined reads)"
+echo " 5. Concurrent large-file I/O (${LARGE_N} x 1MB — pipelined reads)"
 echo "═══════════════════════════════════════════════════════════════"
 
 LARGE_DIR="${TMPDIR_BASE}/large"
 mkdir -p "$LARGE_DIR"
-LARGE_N=8
 
 for i in $(seq 1 "$LARGE_N"); do
     dd if=/dev/urandom of="${LARGE_DIR}/src-${i}" bs=1024 count=1024 2>/dev/null
