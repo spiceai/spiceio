@@ -309,6 +309,20 @@ impl SmbPool {
         (slots[idx].client.clone(), slots[idx].tree_id)
     }
 
+    /// Pick a connection that is not poisoned. `pick` already skips poisoned
+    /// slots, so the common case (one connection dropped, the rest healthy)
+    /// costs nothing; only when every connection is down do we pay for a heal
+    /// and a brief pause before re-picking.
+    pub async fn pick_live(&self) -> (Arc<SmbClient>, u32) {
+        let (client, tree_id) = self.pick();
+        if client.is_poisoned() {
+            self.heal().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return self.pick();
+        }
+        (client, tree_id)
+    }
+
     /// Reconnect any poisoned slots and re-tree-connect them to the share.
     /// Best-effort: a slot whose reconnect fails stays poisoned and is retried
     /// on the next pass. Without this the pool degrades monotonically — every
