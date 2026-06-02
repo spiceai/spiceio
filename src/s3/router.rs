@@ -50,7 +50,11 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Parse bucket and key from path-style: /{bucket}/{key...}
-    let (req_bucket, key) = parse_path(&path);
+    // Percent-decode the key so encoded characters (spaces, Unicode, `%`, …)
+    // map to the real object name instead of a literal `%XX` filename.
+    let (req_bucket, raw_key) = parse_path(&path);
+    let key_decoded = percent_decode(raw_key);
+    let key: &str = &key_decoded;
 
     // Service-level operations (no bucket)
     if req_bucket.is_empty() {
@@ -91,31 +95,44 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
 
     let share = &state.share;
 
+    // Reject keys that could escape the share via `..` path traversal.
+    if !key.is_empty() && key_has_traversal(key) {
+        return with_common_headers(
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Object key contains invalid path segments",
+            ),
+            &request_id,
+            &state.region,
+        );
+    }
+
     // ── Bucket-level operations (no key) ────────────────────────────────
     if key.is_empty() {
         let resp = match method {
-            Method::GET | Method::HEAD if query.contains("location") => {
+            Method::GET | Method::HEAD if has_query_flag(&query, "location") => {
                 handle_get_bucket_location(&state.region)
             }
-            Method::GET if query.contains("versioning") => handle_get_bucket_versioning(),
-            Method::GET if query.contains("acl") => handle_get_bucket_acl(),
-            Method::PUT if query.contains("acl") => ok_empty(),
-            Method::GET if query.contains("tagging") => handle_get_bucket_tagging(),
-            Method::PUT if query.contains("tagging") => ok_empty(),
-            Method::DELETE if query.contains("tagging") => ok_no_content(),
-            Method::GET if query.contains("cors") => handle_get_bucket_cors(),
-            Method::PUT if query.contains("cors") => ok_empty(),
-            Method::DELETE if query.contains("cors") => ok_no_content(),
-            Method::GET if query.contains("lifecycle") => handle_get_bucket_lifecycle(),
-            Method::GET if query.contains("policy") => handle_get_bucket_policy(),
-            Method::GET if query.contains("encryption") => handle_get_bucket_encryption(),
-            Method::GET if query.contains("uploads") => {
+            Method::GET if has_query_flag(&query, "versioning") => handle_get_bucket_versioning(),
+            Method::GET if has_query_flag(&query, "acl") => handle_get_bucket_acl(),
+            Method::PUT if has_query_flag(&query, "acl") => ok_empty(),
+            Method::GET if has_query_flag(&query, "tagging") => handle_get_bucket_tagging(),
+            Method::PUT if has_query_flag(&query, "tagging") => ok_empty(),
+            Method::DELETE if has_query_flag(&query, "tagging") => ok_no_content(),
+            Method::GET if has_query_flag(&query, "cors") => handle_get_bucket_cors(),
+            Method::PUT if has_query_flag(&query, "cors") => ok_empty(),
+            Method::DELETE if has_query_flag(&query, "cors") => ok_no_content(),
+            Method::GET if has_query_flag(&query, "lifecycle") => handle_get_bucket_lifecycle(),
+            Method::GET if has_query_flag(&query, "policy") => handle_get_bucket_policy(),
+            Method::GET if has_query_flag(&query, "encryption") => handle_get_bucket_encryption(),
+            Method::GET if has_query_flag(&query, "uploads") => {
                 handle_list_multipart_uploads(state, &query).await
             }
-            Method::POST if query.contains("delete") => {
-                let body = collect_body(req).await;
-                handle_delete_objects(body, share).await
-            }
+            Method::POST if has_query_flag(&query, "delete") => match collect_body(req).await {
+                Ok(body) => handle_delete_objects(body, share).await,
+                Err(resp) => resp,
+            },
             Method::GET => handle_list_objects(share, &state.bucket, &query).await,
             Method::HEAD => head_bucket_response(&state.region),
             Method::PUT => ok_empty(),         // CreateBucket — noop
@@ -133,11 +150,13 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
 
     // Multipart: POST with ?uploads (initiate) or ?uploadId=... (complete)
     if method == Method::POST {
-        let resp = if query.contains("uploads") && !query.contains("uploadId") {
+        let resp = if has_query_flag(&query, "uploads") && !has_query_flag(&query, "uploadId") {
             handle_create_multipart_upload(&hdrs, state, key).await
         } else if let Some(upload_id) = extract_query_param(&query, "uploadId") {
-            let body = collect_body(req).await;
-            handle_complete_multipart_upload(body, state, key, &upload_id).await
+            match collect_body(req).await {
+                Ok(body) => handle_complete_multipart_upload(body, state, key, &upload_id).await,
+                Err(resp) => resp,
+            }
         } else {
             error_response(
                 StatusCode::BAD_REQUEST,
@@ -149,7 +168,10 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Multipart: PUT with ?partNumber=...&uploadId=...
-    if method == Method::PUT && query.contains("partNumber") && query.contains("uploadId") {
+    if method == Method::PUT
+        && has_query_flag(&query, "partNumber")
+        && has_query_flag(&query, "uploadId")
+    {
         let part_number: u32 = extract_query_param(&query, "partNumber")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -159,21 +181,21 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Multipart: GET with ?uploadId=... (list parts)
-    if method == Method::GET && query.contains("uploadId") {
+    if method == Method::GET && has_query_flag(&query, "uploadId") {
         let upload_id = extract_query_param(&query, "uploadId").unwrap_or_default();
         let resp = handle_list_parts(state, key, &upload_id).await;
         return with_common_headers(resp, &request_id, &state.region);
     }
 
     // Multipart: DELETE with ?uploadId=... (abort)
-    if method == Method::DELETE && query.contains("uploadId") {
+    if method == Method::DELETE && has_query_flag(&query, "uploadId") {
         let upload_id = extract_query_param(&query, "uploadId").unwrap_or_default();
         let resp = handle_abort_multipart_upload(state, key, &upload_id).await;
         return with_common_headers(resp, &request_id, &state.region);
     }
 
     // Object ACL
-    if query.contains("acl") {
+    if has_query_flag(&query, "acl") {
         let resp = match method {
             Method::GET => handle_get_object_acl(),
             Method::PUT => ok_empty(),
@@ -183,7 +205,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Object tagging
-    if query.contains("tagging") {
+    if has_query_flag(&query, "tagging") {
         let resp = match method {
             Method::GET => handle_get_object_tagging(),
             Method::PUT => ok_empty(),
@@ -194,7 +216,10 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Object legal-hold, retention, torrent — stubs
-    if query.contains("legal-hold") || query.contains("retention") || query.contains("torrent") {
+    if has_query_flag(&query, "legal-hold")
+        || has_query_flag(&query, "retention")
+        || has_query_flag(&query, "torrent")
+    {
         let resp = match method {
             Method::GET | Method::PUT => ok_empty(),
             _ => error_response(StatusCode::NOT_IMPLEMENTED, "NotImplemented", ""),
@@ -203,7 +228,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Object restore — stub
-    if method == Method::POST && query.contains("restore") {
+    if method == Method::POST && has_query_flag(&query, "restore") {
         return with_common_headers(
             Response::builder()
                 .status(StatusCode::ACCEPTED)
@@ -215,7 +240,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // SelectObjectContent — not supported
-    if method == Method::POST && query.contains("select") {
+    if method == Method::POST && has_query_flag(&query, "select") {
         return with_common_headers(
             error_response(
                 StatusCode::NOT_IMPLEMENTED,
@@ -271,9 +296,11 @@ async fn handle_list_objects(
     let list_type = extract_query_param(query, "list-type").unwrap_or_default();
     let prefix = extract_query_param(query, "prefix").unwrap_or_default();
     let delimiter = extract_query_param(query, "delimiter");
+    // S3 caps max-keys at 1000; honor any client value but never exceed it.
     let max_keys: usize = extract_query_param(query, "max-keys")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
+        .unwrap_or(1000)
+        .min(1000);
     let marker = extract_query_param(query, "marker").unwrap_or_default();
     let start_after = extract_query_param(query, "start-after").unwrap_or_default();
     let continuation_token = extract_query_param(query, "continuation-token");
@@ -291,24 +318,44 @@ async fn handle_list_objects(
     };
 
     match result {
-        Ok((mut objects, common_prefixes)) => {
-            // Apply marker/start-after/continuation-token filtering
+        Ok((mut objects, mut common_prefixes)) => {
+            // SMB QueryDirectory does not guarantee order, but S3 returns keys
+            // (and common prefixes) lexicographically. Sort before any marker
+            // filtering / truncation — otherwise paginating with a marker drops
+            // or duplicates keys across pages.
+            objects.sort_by(|a, b| a.key.cmp(&b.key));
+            common_prefixes.sort();
+
+            // Apply marker / start-after / continuation-token filtering.
             if !skip_marker.is_empty() {
                 objects.retain(|o| o.key.as_str() > skip_marker);
+                common_prefixes.retain(|p| p.as_str() > skip_marker);
             }
 
-            let truncated = objects.len() > max_keys;
-            let display_objects = if truncated {
-                &objects[..max_keys]
-            } else {
-                &objects
-            };
+            // Merge keys + common prefixes into one lexicographic order and
+            // truncate the combined set at max_keys (S3 counts both toward
+            // max-keys and KeyCount). Track original indices so each group can
+            // be emitted in order.
+            let mut merged: Vec<(&str, bool, usize)> = Vec::new();
+            for (i, o) in objects.iter().enumerate() {
+                merged.push((o.key.as_str(), false, i));
+            }
+            for (i, p) in common_prefixes.iter().enumerate() {
+                merged.push((p.as_str(), true, i));
+            }
+            merged.sort_by(|a, b| a.0.cmp(b.0));
 
+            let total = merged.len();
+            let truncated = total > max_keys;
+            let shown = &merged[..total.min(max_keys)];
             let next_marker = if truncated {
-                display_objects.last().map(|o| o.key.clone())
+                shown.last().map(|e| e.0.to_string())
             } else {
                 None
             };
+            let key_count = shown.len();
+            let shown_obj_idx: Vec<usize> = shown.iter().filter(|e| !e.1).map(|e| e.2).collect();
+            let shown_pref_idx: Vec<usize> = shown.iter().filter(|e| e.1).map(|e| e.2).collect();
 
             let mut w = XmlWriter::new();
             w.declaration();
@@ -325,7 +372,7 @@ async fn handle_list_objects(
                 if let Some(et) = &encoding_type {
                     w.element("EncodingType", et);
                 }
-                w.element("KeyCount", &display_objects.len().to_string());
+                w.element("KeyCount", &key_count.to_string());
                 w.element("IsTruncated", if truncated { "true" } else { "false" });
                 if let Some(ct) = &continuation_token {
                     w.element("ContinuationToken", ct);
@@ -337,7 +384,8 @@ async fn handle_list_objects(
                     w.element("StartAfter", &start_after);
                 }
 
-                for obj in display_objects {
+                for &oi in &shown_obj_idx {
+                    let obj = &objects[oi];
                     w.open("Contents");
                     w.element("Key", &obj.key);
                     w.element("LastModified", &xml::epoch_to_iso8601(obj.last_modified));
@@ -372,7 +420,8 @@ async fn handle_list_objects(
                     w.element("NextMarker", nm);
                 }
 
-                for obj in display_objects {
+                for &oi in &shown_obj_idx {
+                    let obj = &objects[oi];
                     w.open("Contents");
                     w.element("Key", &obj.key);
                     w.element("LastModified", &xml::epoch_to_iso8601(obj.last_modified));
@@ -387,7 +436,8 @@ async fn handle_list_objects(
                 }
             }
 
-            for cp in &common_prefixes {
+            for &pi in &shown_pref_idx {
+                let cp = &common_prefixes[pi];
                 w.open("CommonPrefixes");
                 w.element("Prefix", cp);
                 w.close("CommonPrefixes");
@@ -472,7 +522,8 @@ async fn handle_get_object(
                         .body(SpiceioBody::empty())
                         .unwrap();
                 }
-                if let Some(ref ims) = if_modified_since
+                if if_none_match.is_none()
+                    && let Some(ref ims) = if_modified_since
                     && let Some(since) = parse_http_date(ims)
                     && meta.last_modified <= since
                 {
@@ -482,7 +533,8 @@ async fn handle_get_object(
                         .body(SpiceioBody::empty())
                         .unwrap();
                 }
-                if let Some(ref ius) = if_unmodified_since
+                if if_match.is_none()
+                    && let Some(ref ius) = if_unmodified_since
                     && let Some(since) = parse_http_date(ius)
                     && meta.last_modified > since
                 {
@@ -511,6 +563,10 @@ async fn handle_get_object(
                     "The specified key does not exist.",
                 );
             }
+            // A transient reset on the one-shot compound probe falls through to
+            // the streaming path, which reconnects and retries the open rather
+            // than surfacing a 503 the client must absorb.
+            Err(e) if crate::smb::ops::is_reset(&e) => {}
             Err(e) => return io_to_s3_error(&e),
             _ => {} // Large file — fall through to streaming
         }
@@ -557,7 +613,8 @@ async fn handle_get_object(
     }
 
     // Conditional: If-Modified-Since → 304
-    if let Some(ref ims) = if_modified_since
+    if if_none_match.is_none()
+        && let Some(ref ims) = if_modified_since
         && let Some(since) = parse_http_date(ims)
         && meta.last_modified <= since
     {
@@ -570,7 +627,8 @@ async fn handle_get_object(
     }
 
     // Conditional: If-Unmodified-Since
-    if let Some(ref ius) = if_unmodified_since
+    if if_match.is_none()
+        && let Some(ref ius) = if_unmodified_since
         && let Some(since) = parse_http_date(ius)
         && meta.last_modified > since
     {
@@ -636,31 +694,147 @@ async fn handle_get_object(
     let channel_cap = stream_channel_capacity(chunk_size);
     let (body, tx) = SpiceioBody::channel(channel_cap);
 
+    // Owned handles so the streaming task can transparently reconnect after a
+    // mid-stream connection drop (see the resume loop below).
+    let resume_share = share.clone();
+    let resume_key = key.to_string();
+    let expected_size = file_size;
+
     // Spawn background task to stream pipelined SMB reads into the channel.
     // Sends batches of read requests to fill the network pipe, then pushes
     // each chunk to the HTTP response body as it arrives.
+    //
+    // Resilience: once the 200/206 + Content-Length headers are committed we
+    // can no longer fall back to a retryable 503, so a mid-stream connection
+    // drop on an overwhelmed NAS (reset or "early eof") would otherwise
+    // truncate the transfer. Instead we reconnect on a fresh pool connection —
+    // `read_pipeline` has already backed the adaptive read size off — and
+    // resume from the current offset, so the client sees one continuous
+    // transfer rather than a partial one it must retry. Bounded by
+    // MAX_GET_RESUMES; every delivered chunk refreshes the budget so only
+    // sustained failure aborts. The file size is re-verified on each reconnect
+    // so we never splice bytes from a file that changed underneath us.
     tokio::spawn(async move {
+        const MAX_GET_RESUMES: u32 = 16;
+        // Heavy concurrent load can poison every pool connection at once, so a
+        // single reconnect attempt may find nothing live. Retry the re-open
+        // (each heals + briefly waits) so a GET rides out a transient
+        // all-connections-down window instead of aborting — symmetric with the
+        // write paths, and bounded to stay within the client's request timeout.
+        const MAX_GET_REOPEN_TRIES: u32 = 12;
+        let mut handle = handle;
+        let mut chunk_size = chunk_size;
         let mut offset = start;
         let stream_end = end + 1;
+        let mut resumes: u32 = 0;
         'outer: while offset < stream_end {
             let remaining = stream_end - offset;
             match handle.read_pipeline(offset, chunk_size, remaining).await {
-                Ok(chunks) if chunks.is_empty() => break,
+                // An empty read while offset < stream_end means the object ended
+                // before its reported length. With a fixed Content-Length a clean
+                // break would emit a silently short body, so surface it as an
+                // aborted transfer instead.
+                Ok(chunks) if chunks.is_empty() => {
+                    crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
+                    let _ = tx
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "object ended before the expected length",
+                        )))
+                        .await;
+                    break 'outer;
+                }
                 Ok(chunks) => {
                     for chunk in chunks {
                         if chunk.is_empty() {
+                            crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
+                            let _ = tx
+                                .send(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "object ended before the expected length",
+                                )))
+                                .await;
                             break 'outer;
                         }
                         offset += chunk.len() as u64;
-                        if tx.send(chunk).await.is_err() {
+                        resumes = 0; // forward progress refreshes the resume budget
+                        if tx.send(Ok(chunk)).await.is_err() {
                             crate::serr!("[spiceio] getobject client disconnected");
                             break 'outer;
                         }
                     }
                 }
+                Err(e) if crate::smb::ops::is_reset(&e) && resumes < MAX_GET_RESUMES => {
+                    // Transient mid-stream drop: reconnect and resume instead of
+                    // truncating. `read_pipeline` already backed off the read size.
+                    resumes += 1;
+                    // Pace consecutive resumes that aren't making progress so the
+                    // budget spreads across the client timeout window (catching a
+                    // recovery window) instead of spinning through all attempts in
+                    // well under a second. The first resume is immediate (a lone
+                    // transient drop recovers at once); forward progress resets
+                    // `resumes`, so an advancing transfer is never paced.
+                    if resumes > 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            ((resumes as u64) * 50).min(500),
+                        ))
+                        .await;
+                    }
+                    let _ = handle.close().await; // best-effort; may already be dead
+                    // open_read picks a non-poisoned connection, so the common
+                    // case (this connection dropped, the rest healthy) succeeds
+                    // on the first try. Under heavy contention the whole pool can
+                    // be momentarily poisoned, so retry with a heal + brief pause
+                    // until a connection comes back (bounded).
+                    let mut reopened = resume_share.open_read(&resume_key).await;
+                    let mut rtry = 0u32;
+                    while reopened.is_err() && rtry < MAX_GET_REOPEN_TRIES {
+                        rtry += 1;
+                        resume_share.heal().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            (rtry as u64 * 150).min(750),
+                        ))
+                        .await;
+                        reopened = resume_share.open_read(&resume_key).await;
+                    }
+                    match reopened {
+                        Ok(h) if h.file_size == expected_size => {
+                            chunk_size = h.max_chunk; // adopt the backed-off chunk
+                            handle = h;
+                            crate::slog!(
+                                "[spiceio] getobject resumed at {offset}/{stream_end} (attempt {resumes})"
+                            );
+                            continue 'outer;
+                        }
+                        Ok(h) => {
+                            // File changed underneath us — refuse to splice.
+                            // The old handle was already closed above, so end
+                            // the task rather than fall to the final close.
+                            let got = h.file_size;
+                            let _ = h.close().await;
+                            crate::serr!(
+                                "[spiceio] getobject resume aborted: size changed {expected_size} -> {got}"
+                            );
+                            let _ = tx
+                                .send(Err(io::Error::other(
+                                    "object changed during streaming read",
+                                )))
+                                .await;
+                            return;
+                        }
+                        Err(reopen_err) => {
+                            crate::serr!("[spiceio] getobject reconnect failed: {reopen_err}");
+                            let _ = tx.send(Err(reopen_err)).await;
+                            return;
+                        }
+                    }
+                }
                 Err(e) => {
                     crate::serr!("[spiceio] getobject read error: {e}");
-                    break;
+                    // Propagate into the body so the client sees an aborted
+                    // transfer, not a silently truncated one.
+                    let _ = tx.send(Err(e)).await;
+                    break 'outer;
                 }
             }
         }
@@ -855,13 +1029,15 @@ async fn handle_copy_object(
     {
         return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
     }
-    if let Some(ref ims) = if_modified_since
+    if if_none_match.is_none()
+        && let Some(ref ims) = if_modified_since
         && let Some(since) = parse_http_date(ims)
         && src_meta.last_modified <= since
     {
         return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
     }
-    if let Some(ref ius) = if_unmodified_since
+    if if_match.is_none()
+        && let Some(ref ius) = if_unmodified_since
         && let Some(since) = parse_http_date(ius)
         && src_meta.last_modified > since
     {
@@ -886,13 +1062,12 @@ async fn handle_copy_object(
 
 async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<SpiceioBody> {
     match share.delete_object(key).await {
-        Ok(()) | Err(_) => {
-            // S3 returns 204 even if not found
-            Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(SpiceioBody::empty())
-                .unwrap()
-        }
+        // DeleteObject is idempotent: 204 for a successful delete and for a
+        // missing object. Other errors (access denied, I/O) must surface so a
+        // client never assumes a still-present object was deleted.
+        Ok(()) => ok_no_content(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ok_no_content(),
+        Err(e) => io_to_s3_error(&e),
     }
 }
 
@@ -926,7 +1101,8 @@ async fn handle_head_object(
                     .body(SpiceioBody::empty())
                     .unwrap();
             }
-            if let Some(ref ims) = if_modified_since
+            if if_none_match.is_none()
+                && let Some(ref ims) = if_modified_since
                 && let Some(since) = parse_http_date(ims)
                 && meta.last_modified <= since
             {
@@ -936,7 +1112,8 @@ async fn handle_head_object(
                     .body(SpiceioBody::empty())
                     .unwrap();
             }
-            if let Some(ref ius) = if_unmodified_since
+            if if_match.is_none()
+                && let Some(ref ius) = if_unmodified_since
                 && let Some(since) = parse_http_date(ius)
                 && meta.last_modified > since
             {
@@ -967,10 +1144,12 @@ async fn handle_head_object(
 async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<SpiceioBody> {
     let body_str = String::from_utf8_lossy(&body);
 
+    // XML-entity-decode keys (a client escapes `&`,`<`,… in the request body);
+    // without this a key like `a&amp;b` would target the literal `a&amp;b`.
     let keys: Vec<String> = xml::extract_sections(&body_str, "<Object>", "</Object>")
         .iter()
         .filter_map(|section| xml::extract_element(section, "Key"))
-        .map(|s| s.to_string())
+        .map(xml::xml_decode)
         .collect();
 
     let quiet = xml::extract_element(&body_str, "Quiet")
@@ -982,6 +1161,14 @@ async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<Sp
     w.open_ns("DeleteResult", S3_XMLNS);
 
     for key in &keys {
+        if key_has_traversal(key) {
+            w.open("Error");
+            w.element("Key", key);
+            w.element("Code", "InvalidArgument");
+            w.element("Message", "Object key contains invalid path segments");
+            w.close("Error");
+            continue;
+        }
         match share.delete_object(key).await {
             Ok(()) => {
                 if !quiet {
@@ -1053,8 +1240,31 @@ async fn handle_upload_part(
         );
     }
 
-    let body = collect_body(req).await;
-    let etag = crate::crypto::hex_encode(&crate::crypto::sha256(&body));
+    let body = match collect_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    // Hashing a multi-hundred-MB part is CPU-bound; run it on the blocking pool
+    // so it doesn't tie up an async worker (which would starve other requests on
+    // a busy multi-core box). `Bytes::clone` is a cheap refcount bump.
+    let etag = {
+        let b = body.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::crypto::hex_encode(&crate::crypto::sha256(&b))
+        })
+        .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                crate::serr!("[spiceio] upload-part hash task failed: {e}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "hash failed",
+                );
+            }
+        }
+    };
     let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
 
     if let Err(e) = state.share.write_temp(&temp_path, &body).await {
@@ -1104,6 +1314,17 @@ async fn handle_complete_multipart_upload(
             xml::extract_element(section, "PartNumber").and_then(|s| s.parse().ok())
         })
         .collect();
+
+    // S3 requires PartNumbers to be strictly ascending and unique; otherwise
+    // assembling in the client-supplied order would silently produce a
+    // byte-reordered or duplicated object.
+    if part_numbers.windows(2).any(|w| w[0] >= w[1]) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidPartOrder",
+            "The list of parts was not in ascending order. Parts must be ordered by part number.",
+        );
+    }
 
     // Validate all requested parts exist before assembly
     for pn in &part_numbers {
@@ -1421,7 +1642,14 @@ fn with_common_headers(
         headers.insert(X_AMZ_REQUEST_ID, request_id.parse().unwrap());
     }
     headers.insert(X_AMZ_ID_2, request_id.parse().unwrap());
-    headers.insert(X_AMZ_BUCKET_REGION, region.parse().unwrap());
+    // `region` is operator-configured; fall back rather than panic on every
+    // response if it contains bytes invalid in a header value.
+    headers.insert(
+        X_AMZ_BUCKET_REGION,
+        region
+            .parse()
+            .unwrap_or_else(|_| http::HeaderValue::from_static("us-east-1")),
+    );
     headers.insert(
         "Server",
         concat!("spiceio/", env!("CARGO_PKG_VERSION"))
@@ -1486,17 +1714,31 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
             crate::serr!("[spiceio] access denied: {e}");
             error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied")
         }
-        // Sharing violations are an expected transient under concurrent
-        // writes (the underlying SMB server refused to open a file held by
-        // another handle). Map to 503 SlowDown — the standard S3 retryable
-        // status — and log at info level instead of `serr!`, since these
-        // are not bugs and shouldn't paint CI logs red.
-        io::ErrorKind::ResourceBusy => {
-            crate::slog!("[spiceio] busy (retry): {e}");
+        // Transient, retryable conditions → 503 SlowDown (the standard S3
+        // retryable status), logged at info level (not `serr!`) since they
+        // are not bugs:
+        //   - ResourceBusy: sharing violation under concurrent access.
+        //   - BrokenPipe/ConnectionReset/ConnectionAborted/NotConnected: the
+        //     SMB server dropped a pool connection (common under heavy
+        //     concurrent load); the healer reconnects it, so the client should
+        //     just retry instead of seeing a hard 500.
+        //   - TimedOut: a read/write timed out and we poisoned the connection;
+        //     a retry lands on a healthy one.
+        //   - UnexpectedEof: an overwhelmed NAS closed the connection with a
+        //     FIN mid-response ("early eof"); the healer reconnects it, so the
+        //     client should back off and retry rather than see a hard 500.
+        io::ErrorKind::ResourceBusy
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::UnexpectedEof => {
+            crate::slog!("[spiceio] transient (retry): {e}");
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "SlowDown",
-                "Please reduce your request rate.",
+                "The request could not be completed; please retry.",
             )
         }
         _ => {
@@ -1511,6 +1753,23 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// True if `key` is present as a query-parameter *name* (`?key`, `?key=…`, at a
+/// `&` boundary) — not merely a substring of some value. Used for sub-resource
+/// routing so e.g. `?response-content-disposition=acl.txt` doesn't route to the
+/// ACL handler.
+fn has_query_flag(query: &str, key: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split('=').next() == Some(key))
+}
+
+/// Reject object keys that could escape the share via `..` path traversal.
+/// Splits on both `/` (S3 separator) and `\` (SMB separator — `to_smb_path`
+/// maps one to the other) so neither form slips through.
+fn key_has_traversal(key: &str) -> bool {
+    key.split(['/', '\\']).any(|seg| seg == "..")
+}
 
 fn extract_query_param(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
@@ -1535,9 +1794,11 @@ fn etag_matches(condition: &str, etag: &str) -> bool {
     if condition == "*" {
         return true;
     }
-    // May be comma-separated
+    // May be comma-separated; tolerate the weak-validator prefix `W/`.
     for part in condition.split(',') {
-        let part = part.trim().trim_matches('"');
+        let part = part.trim();
+        let part = part.strip_prefix("W/").unwrap_or(part);
+        let part = part.trim_matches('"');
         let etag_inner = etag.trim_matches('"');
         if part == etag_inner {
             return true;
@@ -1546,21 +1807,83 @@ fn etag_matches(condition: &str, etag: &str) -> bool {
     false
 }
 
-/// Collect an `Incoming` body into `Bytes`, for operations that need the full
-/// payload (multi-delete, multipart complete, upload-part).
-async fn collect_body(req: Request<Incoming>) -> Bytes {
-    match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            crate::serr!("[spiceio] body collect error: {e}");
-            Bytes::new()
+/// Max size of a request body buffered fully in memory (UploadPart,
+/// multi-delete, multipart-complete). Bounds memory against a client streaming
+/// a huge body. Streaming PutObject is not affected (it never buffers).
+const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
+
+/// Collect an `Incoming` body into `Bytes` for operations that need the full
+/// payload, rejecting bodies over [`MAX_BUFFERED_BODY`] with `EntityTooLarge`
+/// instead of buffering them unbounded.
+async fn collect_body(req: Request<Incoming>) -> Result<Bytes, Response<SpiceioBody>> {
+    let mut body = req.into_body();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    if buf.len().saturating_add(data.len()) > MAX_BUFFERED_BODY {
+                        return Err(error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "EntityTooLarge",
+                            "Request body exceeds the maximum buffered size",
+                        ));
+                    }
+                    buf.extend_from_slice(&data);
+                }
+            }
+            Err(e) => {
+                // A failed body read must not be treated as an empty body —
+                // that would let mutating ops (UploadPart, CompleteMultipartUpload,
+                // multi-delete) silently proceed on a truncated request and
+                // return success. Surface it as an incomplete-body error.
+                crate::serr!("[spiceio] body collect error: {e}");
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "IncompleteBody",
+                    "The request body could not be read completely.",
+                ));
+            }
         }
     }
+    Ok(Bytes::from(buf))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_flag_matches_name_not_value_substring() {
+        assert!(has_query_flag("acl", "acl"));
+        assert!(has_query_flag("foo=1&acl&bar=2", "acl"));
+        assert!(has_query_flag("acl=", "acl"));
+        // A substring inside a value must NOT route to the sub-resource.
+        assert!(!has_query_flag("prefix=my-acl-doc", "acl"));
+        assert!(!has_query_flag(
+            "response-content-disposition=acl.txt",
+            "acl"
+        ));
+    }
+
+    #[test]
+    fn key_traversal_detection() {
+        assert!(key_has_traversal("../etc/passwd"));
+        assert!(key_has_traversal("a/../../b"));
+        assert!(key_has_traversal("a\\..\\b"));
+        assert!(!key_has_traversal("a/b/c.txt"));
+        // ".." only as a full path segment, not a prefix.
+        assert!(!key_has_traversal("..foo/bar"));
+    }
+
+    #[test]
+    fn etag_matches_handles_weak_and_star() {
+        assert!(etag_matches("W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("\"abc\"", "abc"));
+        assert!(etag_matches("*", "anything"));
+        assert!(etag_matches("\"x\", W/\"abc\"", "\"abc\""));
+        assert!(!etag_matches("\"xyz\"", "\"abc\""));
+    }
 
     /// The whole reason this file exists: unit tests in `smb::client` already
     /// verify `STATUS_SHARING_VIOLATION → io::ErrorKind::ResourceBusy`. What
@@ -1573,6 +1896,28 @@ mod tests {
         let err = io::Error::new(io::ErrorKind::ResourceBusy, "sharing violation: foo");
         let resp = io_to_s3_error(&err);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn io_to_s3_error_maps_dropped_connection_to_retryable() {
+        // A pool connection the SMB server dropped under load must surface as a
+        // retryable 503, not a hard 500, so clients back off and retry.
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::TimedOut,
+            // "early eof": NAS closed the connection mid-response under load.
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let resp = io_to_s3_error(&io::Error::new(kind, "dropped"));
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{kind:?} should map to 503"
+            );
+        }
     }
 
     #[test]

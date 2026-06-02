@@ -1,14 +1,15 @@
-//! Non-blocking file logger backed by a dedicated OS thread.
+//! Non-blocking logger backed by a dedicated OS thread.
 //!
 //! Design: a bounded `mpsc::sync_channel` feeds a background thread that owns
-//! the file descriptor and writes through a 64 KB `BufWriter`. The hot path
-//! (`emit` / `emit_err`) does a single `try_send` — if the channel is full
-//! the message is silently dropped, so logging never blocks the proxy.
+//! the console streams (and, when configured, the log file). The hot path
+//! (`emit` / `emit_err`) does a single `try_send` — if the channel is full the
+//! message is silently dropped, so logging *never blocks the proxy*, even when
+//! stdout/stderr is piped to a slow or stalled reader.
 //!
-//! Two entry points: `emit` (stdout) and `emit_err` (stderr). Both prepend
-//! an ISO-8601 timestamp and write to the log file when configured. When no
-//! log file is configured only the console stream is written (zero overhead
-//! from the file path — no channel, no allocation, no thread).
+//! Two entry points: `emit` (stdout) and `emit_err` (stderr). Both prepend an
+//! ISO-8601 timestamp. Before `init` runs (or if the channel cannot be set up)
+//! they fall back to a direct synchronous write so early-startup logs are never
+//! lost.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -22,41 +23,75 @@ const CHANNEL_CAP: usize = 4096;
 /// BufWriter capacity — bytes buffered before a syscall write.
 const BUF_CAP: usize = 64 * 1024;
 
-static FILE_TX: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
-
-/// Initialise file logging.  Call once at startup.
-/// If `path` is `None`, only console logging is active (the default).
-pub fn init(path: Option<&str>) {
-    let Some(p) = path else { return };
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(p)
-        .unwrap_or_else(|e| panic!("[spiceio] failed to open log file {p}: {e}"));
-
-    let (tx, rx) = mpsc::sync_channel::<String>(CHANNEL_CAP);
-
-    std::thread::Builder::new()
-        .name("spiceio-log".into())
-        .spawn(move || writer_loop(rx, file))
-        .expect("[spiceio] failed to spawn log thread");
-
-    FILE_TX.set(tx).ok();
+/// A queued log line and which console stream it targets.
+enum LogMsg {
+    Stdout(String),
+    Stderr(String),
 }
 
-/// Background writer — drains the channel and flushes in batches.
-fn writer_loop(rx: mpsc::Receiver<String>, file: std::fs::File) {
-    let mut w = BufWriter::with_capacity(BUF_CAP, file);
-    while let Ok(line) = rx.recv() {
-        let _ = w.write_all(line.as_bytes());
-        let _ = w.write_all(b"\n");
-        // Drain any queued messages before issuing the syscall flush.
-        while let Ok(line) = rx.try_recv() {
+static LOG_TX: OnceLock<mpsc::SyncSender<LogMsg>> = OnceLock::new();
+
+/// Initialise logging. Call once at startup. Spawns the background writer
+/// thread that owns stdout/stderr and, if `path` is `Some`, the log file too.
+/// All console output is routed through this thread so the request path never
+/// blocks on a stalled console pipe.
+pub fn init(path: Option<&str>) {
+    let file = path.map(|p| {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .unwrap_or_else(|e| panic!("[spiceio] failed to open log file {p}: {e}"))
+    });
+
+    let (tx, rx) = mpsc::sync_channel::<LogMsg>(CHANNEL_CAP);
+
+    let spawned = std::thread::Builder::new()
+        .name("spiceio-log".into())
+        .spawn(move || writer_loop(rx, file))
+        .is_ok();
+
+    if spawned {
+        LOG_TX.set(tx).ok();
+    }
+}
+
+/// Background writer — drains the channel, fans out to the console stream and
+/// optional log file, and flushes in batches.
+fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
+    let mut fw = file.map(|f| BufWriter::with_capacity(BUF_CAP, f));
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+
+    let handle = |msg: LogMsg, fw: &mut Option<BufWriter<std::fs::File>>| {
+        let line = match &msg {
+            LogMsg::Stdout(s) | LogMsg::Stderr(s) => s.as_str(),
+        };
+        match &msg {
+            LogMsg::Stdout(_) => {
+                let mut o = stdout.lock();
+                let _ = writeln!(o, "{line}");
+            }
+            LogMsg::Stderr(_) => {
+                let mut e = stderr.lock();
+                let _ = writeln!(e, "{line}");
+            }
+        }
+        if let Some(w) = fw.as_mut() {
             let _ = w.write_all(line.as_bytes());
             let _ = w.write_all(b"\n");
         }
-        let _ = w.flush();
+    };
+
+    while let Ok(msg) = rx.recv() {
+        handle(msg, &mut fw);
+        // Drain any queued messages before issuing the syscall flush.
+        while let Ok(msg) = rx.try_recv() {
+            handle(msg, &mut fw);
+        }
+        if let Some(w) = fw.as_mut() {
+            let _ = w.flush();
+        }
     }
 }
 
@@ -129,26 +164,34 @@ fn timestamp(buf: &mut [u8; 24]) {
     buf[23] = b'Z';
 }
 
-/// Write a formatted message to **stdout** and (if configured) to the log file.
+/// Write a formatted message to **stdout** (and the log file when configured),
+/// routed through the background thread so it never blocks the caller.
 #[inline]
 pub fn emit(args: fmt::Arguments<'_>) {
     let mut ts = [0u8; 24];
     timestamp(&mut ts);
     let ts = unsafe { std::str::from_utf8_unchecked(&ts) };
-    println!("{ts} {args}");
-    if let Some(tx) = FILE_TX.get() {
-        let _ = tx.try_send(format!("{ts} {args}"));
+    let line = format!("{ts} {args}");
+    if let Some(tx) = LOG_TX.get() {
+        // Drop on full — logging must never stall request handling.
+        let _ = tx.try_send(LogMsg::Stdout(line));
+    } else {
+        // Pre-init fallback (startup only).
+        println!("{line}");
     }
 }
 
-/// Write a formatted message to **stderr** and (if configured) to the log file.
+/// Write a formatted message to **stderr** (and the log file when configured),
+/// routed through the background thread so it never blocks the caller.
 #[inline]
 pub fn emit_err(args: fmt::Arguments<'_>) {
     let mut ts = [0u8; 24];
     timestamp(&mut ts);
     let ts = unsafe { std::str::from_utf8_unchecked(&ts) };
-    eprintln!("{ts} {args}");
-    if let Some(tx) = FILE_TX.get() {
-        let _ = tx.try_send(format!("{ts} {args}"));
+    let line = format!("{ts} {args}");
+    if let Some(tx) = LOG_TX.get() {
+        let _ = tx.try_send(LogMsg::Stderr(line));
+    } else {
+        eprintln!("{line}");
     }
 }

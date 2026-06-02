@@ -19,6 +19,16 @@ const K_CC_OPTION_ECB_MODE: u32 = 2;
 
 const AES_BLOCK_SIZE: usize = 16;
 
+/// Opaque CommonCrypto SHA-256 streaming context (`CC_SHA256_CTX`):
+/// `count[2] + hash[8] + wbuf[16]` 32-bit words. Declared with `u32` fields so
+/// the layout/alignment matches the C struct exactly.
+#[repr(C)]
+struct CcSha256Ctx {
+    count: [u32; 2],
+    hash: [u32; 8],
+    wbuf: [u32; 16],
+}
+
 unsafe extern "C" {
     // CC_MD4
     fn CC_MD4(data: *const c_void, len: c_uint, md: *mut u8) -> *mut u8;
@@ -27,8 +37,10 @@ unsafe extern "C" {
     #[cfg(test)]
     fn CC_MD5(data: *const c_void, len: c_uint, md: *mut u8) -> *mut u8;
 
-    // CC_SHA256
-    fn CC_SHA256(data: *const c_void, len: c_uint, md: *mut u8) -> *mut u8;
+    // CC_SHA256 streaming API — used for inputs that may exceed u32 bytes.
+    fn CC_SHA256_Init(ctx: *mut CcSha256Ctx) -> i32;
+    fn CC_SHA256_Update(ctx: *mut CcSha256Ctx, data: *const c_void, len: c_uint) -> i32;
+    fn CC_SHA256_Final(md: *mut u8, ctx: *mut CcSha256Ctx) -> i32;
 
     // CC_SHA512
     fn CC_SHA512(data: *const c_void, len: c_uint, md: *mut u8) -> *mut u8;
@@ -59,8 +71,10 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-/// Compute MD4 digest. Used in NTLM password hashing.
+/// Compute MD4 digest. Used in NTLM password hashing (always small inputs).
 pub fn md4(data: &[u8]) -> [u8; 16] {
+    // CommonCrypto takes a 32-bit length; callers only ever pass small buffers.
+    debug_assert!(data.len() <= u32::MAX as usize, "md4 input exceeds u32");
     let mut out = [0u8; CC_MD4_DIGEST_LENGTH];
     unsafe {
         CC_MD4(
@@ -102,21 +116,69 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     out
 }
 
-/// Compute SHA-256 digest. Used in AWS Signature V4.
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; CC_SHA256_DIGEST_LENGTH];
-    unsafe {
-        CC_SHA256(
-            data.as_ptr() as *const c_void,
-            data.len() as c_uint,
-            out.as_mut_ptr(),
-        );
-    }
-    out
+/// Incremental SHA-256 hasher (CommonCrypto streaming API).
+///
+/// `update` chunks its input so the 32-bit length CommonCrypto expects is never
+/// exceeded — correct for inputs larger than 4 GiB (e.g. a 5 GiB UploadPart),
+/// which the one-shot `sha256` could otherwise silently truncate. Also lets
+/// callers hash a body incrementally while streaming it, without buffering.
+pub struct Sha256 {
+    ctx: CcSha256Ctx,
 }
 
-/// Compute SHA-512 digest. Used for SMB 3.1.1 preauth integrity hash.
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        let mut ctx = CcSha256Ctx {
+            count: [0; 2],
+            hash: [0; 8],
+            wbuf: [0; 16],
+        };
+        unsafe {
+            CC_SHA256_Init(&mut ctx);
+        }
+        Self { ctx }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        // Feed in <= u32::MAX slices so the length cast never truncates.
+        const MAX: usize = u32::MAX as usize;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let n = rest.len().min(MAX);
+            unsafe {
+                CC_SHA256_Update(&mut self.ctx, rest.as_ptr() as *const c_void, n as c_uint);
+            }
+            rest = &rest[n..];
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let mut out = [0u8; CC_SHA256_DIGEST_LENGTH];
+        unsafe {
+            CC_SHA256_Final(out.as_mut_ptr(), &mut self.ctx);
+        }
+        out
+    }
+}
+
+/// Compute SHA-256 digest. Used for ETags and AWS Signature V4. Handles inputs
+/// of any size (chunks internally via the streaming API).
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
+}
+
+/// Compute SHA-512 digest. Used for SMB 3.1.1 preauth integrity hash (bounded
+/// by the 16 MiB SMB message cap, so always within u32).
 pub fn sha512(data: &[u8]) -> [u8; 64] {
+    debug_assert!(data.len() <= u32::MAX as usize, "sha512 input exceeds u32");
     let mut out = [0u8; CC_SHA512_DIGEST_LENGTH];
     unsafe {
         CC_SHA512(
@@ -247,6 +309,24 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_incremental_matches_oneshot() {
+        let data = b"the quick brown fox jumps over the lazy dog";
+        let oneshot = sha256(data);
+        let mut h = Sha256::new();
+        h.update(&data[..10]);
+        h.update(&data[10..]);
+        assert_eq!(h.finalize(), oneshot);
+    }
+
+    #[test]
+    fn sha256_empty_vector() {
+        assert_eq!(
+            hex_encode(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 
     fn decode_hex_vec(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0);

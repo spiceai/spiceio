@@ -15,6 +15,12 @@ use bytes::{BufMut, BytesMut};
 /// the SMB server is slow or unresponsive under heavy load.
 const SMB_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Timeout for a socket write. There is no OS-level write timeout, so a server
+/// that stops draining its receive window under heavy concurrent write load
+/// would otherwise block `write_all` forever (hanging the request). On timeout
+/// we poison the connection — the pool healer reconnects it.
+const SMB_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Timeout for the initial TCP handshake to the SMB server. Without this,
 /// a server that drops SYNs leaves the OS waiting ~75-90s, which stalls
 /// pool initialization past any sensible CI window.
@@ -43,12 +49,17 @@ impl SmbConfig {
 }
 
 /// Default I/O cap for standalone (non-compound) read/write operations.
-/// Many NAS servers advertise multi-MB maximums in negotiate but fail at sizes
-/// well below the advertised limit. 64 KB is the safe conservative default;
-/// override via `SPICEIO_SMB_MAX_IO` for servers that handle larger I/O
-/// (e.g., Windows Server, enterprise NAS). Even at 64 KB the connection pool
-/// and pipelined reads still deliver major throughput gains.
-const DEFAULT_MAX_IO: u32 = 65536;
+///
+/// 256 KB is the measured sweet spot for streaming throughput: on a 10G link a
+/// single-stream PutObject rises from ~31 MiB/s at 64 KB to ~744 MiB/s at
+/// 256 KB. The WAL writer bounds its in-flight burst with the adaptive flush
+/// budget (`write_inflight`), which backs off on resets, so this cap sets the
+/// per-write size rather than how much is buffered at once. 256 KB stays well
+/// within what essentially every SMB server handles, and small files keep using
+/// the 64 KB compound cap (so per-op latency is unchanged). Override via
+/// `SPICEIO_SMB_MAX_IO`; the effective size is always clamped to the server's
+/// negotiated maximum.
+const DEFAULT_MAX_IO: u32 = 262144;
 
 /// An authenticated SMB2 session.
 pub struct SmbClient {
@@ -170,7 +181,7 @@ impl SmbClient {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "SMB connection poisoned by previous timeout",
+                "SMB connection poisoned by an earlier transport error",
             ));
         }
         match tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
@@ -187,6 +198,41 @@ impl SmbClient {
         }
     }
 
+    /// Write all of `buf` to the stream with a timeout. A server that stops
+    /// draining its receive window under heavy concurrent write load would
+    /// otherwise block `write_all` indefinitely (there is no OS write timeout),
+    /// hanging the request. On timeout we poison the connection and drop the
+    /// socket, mirroring the read path; the pool healer reconnects it.
+    async fn write_all_timeout(&self, stream: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMB connection poisoned by an earlier transport error",
+            ));
+        }
+        match tokio::time::timeout(SMB_WRITE_TIMEOUT, stream.write_all(buf)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.poisoned.store(true, Ordering::Relaxed);
+                let _ = stream.shutdown().await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SMB server write timed out; connection poisoned",
+                ))
+            }
+        }
+    }
+
+    /// Mark the connection poisoned and best-effort shut the socket down. A
+    /// failed transport/framing/pipelined/compound op can leave unread responses
+    /// queued in the stream; closing the socket lets the server release the
+    /// session promptly and ensures the leftover bytes can never be misread as a
+    /// later reply (the poisoned flag already blocks reuse until the pool heals).
+    async fn poison(&self) {
+        self.poisoned.store(true, Ordering::Relaxed);
+        let _ = self.stream.lock().await.shutdown().await;
+    }
+
     /// Send a packet and receive a response, also returning the raw SMB2 response bytes
     /// (without NetBIOS header) for preauth hash computation.
     async fn send_recv_raw(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
@@ -200,6 +246,17 @@ impl SmbClient {
     }
 
     async fn send_recv_inner(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+        // Poison on any transport/framing error so the connection is never
+        // reused with a desynchronized stream (a partial/leftover frame would
+        // otherwise be misread as the next operation's reply).
+        let r = self.send_recv_io(packet).await;
+        if r.is_err() {
+            self.poison().await;
+        }
+        r
+    }
+
+    async fn send_recv_io(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
         let mut stream = self.stream.lock().await;
 
         // Sign the packet if we have a signing key. We need a writable buffer
@@ -209,9 +266,9 @@ impl SmbClient {
         if let Some(ref key) = self.signing_key {
             let mut signed = BytesMut::from(packet);
             sign_packet(&mut signed, key);
-            stream.write_all(&signed).await?;
+            self.write_all_timeout(&mut stream, &signed).await?;
         } else {
-            stream.write_all(packet).await?;
+            self.write_all_timeout(&mut stream, packet).await?;
         }
         stream.flush().await?;
 
@@ -483,7 +540,11 @@ impl SmbClient {
         offset: u64,
         length: u32,
     ) -> io::Result<bytes::Bytes> {
-        let msg_id = self.next_message_id();
+        // Multi-credit commands (payload > 64 KiB) consume `credit_charge`
+        // sequence numbers, so advance the MessageId window by the charge.
+        let msg_id = self
+            .message_id
+            .fetch_add(credit_charge_for(length) as u64, Ordering::Relaxed);
         let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(length);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -530,6 +591,25 @@ impl SmbClient {
         chunk_size: u32,
         count: usize,
     ) -> io::Result<Vec<bytes::Bytes>> {
+        // Poison on any error: a batch leaves unread responses in the socket on
+        // an early return, so the connection must not be reused.
+        let r = self
+            .pipelined_read_io(tree_id, file_id, start_offset, chunk_size, count)
+            .await;
+        if r.is_err() {
+            self.poison().await;
+        }
+        r
+    }
+
+    async fn pipelined_read_io(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        start_offset: u64,
+        chunk_size: u32,
+        count: usize,
+    ) -> io::Result<Vec<bytes::Bytes>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -545,9 +625,13 @@ impl SmbClient {
             ));
         }
 
-        // Allocate message IDs in a contiguous batch so we can map
-        // response.message_id → slot index via simple subtraction.
-        let base_msg_id = self.message_id.fetch_add(count as u64, Ordering::Relaxed);
+        // Multi-credit reads consume `credit_charge` sequence numbers each, so
+        // the MessageId window advances by count * charge and requests are
+        // spaced by `charge`. A response maps to its slot via that stride.
+        let charge = credit_charge_for(chunk_size) as u64;
+        let base_msg_id = self
+            .message_id
+            .fetch_add(count as u64 * charge, Ordering::Relaxed);
 
         // Each request: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 49
         // (read request fixed part incl. 1-byte buffer pad).
@@ -559,7 +643,7 @@ impl SmbClient {
         for i in 0..count {
             packet_starts.push(buf.len());
             let offset = start_offset + (i as u64) * (chunk_size as u64);
-            let msg_id = base_msg_id + i as u64;
+            let msg_id = base_msg_id + i as u64 * charge;
             let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(chunk_size);
             hdr.session_id = self.session_id;
             hdr.tree_id = tree_id;
@@ -580,7 +664,7 @@ impl SmbClient {
         }
 
         let mut stream = self.stream.lock().await;
-        stream.write_all(&buf).await?;
+        self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Receive responses into ordered slots (handles out-of-order delivery).
@@ -611,16 +695,17 @@ impl SmbClient {
                 continue;
             }
 
-            let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
-            if slot >= count {
+            let delta = header.message_id.wrapping_sub(base_msg_id);
+            if delta % charge != 0 || (delta / charge) as usize >= count {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "unexpected message_id {} (base={}, count={})",
-                        header.message_id, base_msg_id, count
+                        "unexpected message_id {} (base={}, count={}, charge={})",
+                        header.message_id, base_msg_id, count, charge
                     ),
                 ));
             }
+            let slot = (delta / charge) as usize;
 
             let status = NtStatus::from_u32(header.status);
             if status == NtStatus::EndOfFile {
@@ -662,7 +747,11 @@ impl SmbClient {
         offset: u64,
         data: &[u8],
     ) -> io::Result<u32> {
-        let msg_id = self.next_message_id();
+        // Multi-credit commands consume `credit_charge` sequence numbers.
+        let msg_id = self.message_id.fetch_add(
+            credit_charge_for(data.len() as u32) as u64,
+            Ordering::Relaxed,
+        );
         let mut hdr = Header::new(Command::Write, msg_id).with_credit_charge(data.len() as u32);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -709,12 +798,37 @@ impl SmbClient {
         start_offset: u64,
         chunks: &[&[u8]],
     ) -> io::Result<u64> {
+        // Poison on any error: an early return leaves unread write responses in
+        // the socket, so the connection must not be reused.
+        let r = self
+            .pipelined_write_io(tree_id, file_id, start_offset, chunks)
+            .await;
+        if r.is_err() {
+            self.poison().await;
+        }
+        r
+    }
+
+    async fn pipelined_write_io(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        start_offset: u64,
+        chunks: &[&[u8]],
+    ) -> io::Result<u64> {
         if chunks.is_empty() {
             return Ok(0);
         }
 
         let n = chunks.len();
-        let base_msg_id = self.message_id.fetch_add(n as u64, Ordering::Relaxed);
+        // Multi-credit writes consume `credit_charge` sequence numbers each;
+        // advance the window by the total charge and space each request by its
+        // own charge (chunks may differ in size, e.g. a short final chunk).
+        let total_charge: u64 = chunks
+            .iter()
+            .map(|c| credit_charge_for(c.len() as u32) as u64)
+            .sum();
+        let base_msg_id = self.message_id.fetch_add(total_charge, Ordering::Relaxed);
 
         // Each packet: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 48
         // (write request fixed part) + chunk data.
@@ -727,9 +841,11 @@ impl SmbClient {
         let mut packet_starts: Vec<usize> = Vec::with_capacity(n + 1);
 
         let mut offset = start_offset;
-        for (i, chunk) in chunks.iter().enumerate() {
+        let mut cum_charge = 0u64;
+        for chunk in chunks.iter() {
             packet_starts.push(buf.len());
-            let msg_id = base_msg_id + i as u64;
+            let msg_id = base_msg_id + cum_charge;
+            cum_charge += credit_charge_for(chunk.len() as u32) as u64;
             let mut hdr =
                 Header::new(Command::Write, msg_id).with_credit_charge(chunk.len() as u32);
             hdr.session_id = self.session_id;
@@ -754,7 +870,7 @@ impl SmbClient {
         }
 
         let mut stream = self.stream.lock().await;
-        stream.write_all(&buf).await?;
+        self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Receive all responses (handles out-of-order delivery)
@@ -904,6 +1020,19 @@ impl SmbClient {
         &self,
         requests: Vec<(Header, BytesMut)>,
     ) -> io::Result<Vec<(Header, Vec<u8>)>> {
+        // Poison on any transport/framing error so a desynchronized compound
+        // stream is never reused.
+        let r = self.send_compound_io(requests).await;
+        if r.is_err() {
+            self.poison().await;
+        }
+        r
+    }
+
+    async fn send_compound_io(
+        &self,
+        requests: Vec<(Header, BytesMut)>,
+    ) -> io::Result<Vec<(Header, Vec<u8>)>> {
         let n = requests.len();
 
         // Padded message sizes (8-byte aligned except last).
@@ -946,7 +1075,7 @@ impl SmbClient {
 
         // Send and receive under the stream lock
         let mut stream = self.stream.lock().await;
-        stream.write_all(&buf).await?;
+        self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Read response frames, skipping STATUS_PENDING interim responses

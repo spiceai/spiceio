@@ -232,7 +232,11 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     buf.put_u16_le(dialect_count);
     buf.put_u16_le(0x0001); // SecurityMode: signing enabled
     buf.put_u16_le(0); // Reserved
-    buf.put_u32_le(0x00000041); // Capabilities: DFS | Leasing
+    // Capabilities: DFS (0x01) | LARGE_MTU (0x04) | ENCRYPTION (0x40).
+    // LARGE_MTU is required to use multi-credit reads/writes (>64 KiB in one
+    // request); without it, multi-credit I/O violates the credit/sequence
+    // window and the server resets the connection under load.
+    buf.put_u32_le(0x00000045);
     buf.put_slice(client_guid);
     buf.put_u32_le(ctx_offset); // NegotiateContextOffset
     buf.put_u16_le(2); // NegotiateContextCount
@@ -312,8 +316,11 @@ pub fn decode_session_setup_response(header: &Header, body: &[u8]) -> Option<Ses
     let security_buffer_offset = (&body[4..6]).get_u16_le() as usize;
     let security_buffer_length = (&body[6..8]).get_u16_le() as usize;
 
-    let sec_start = security_buffer_offset.saturating_sub(SMB2_HEADER_SIZE);
-    let sec_end = sec_start + security_buffer_length;
+    // A valid SecurityBufferOffset points at or past the SMB2 header. Reject an
+    // offset inside the header (checked_sub -> None) rather than clamping to 0
+    // and handing the auth layer garbage from the start of the body.
+    let sec_start = security_buffer_offset.checked_sub(SMB2_HEADER_SIZE)?;
+    let sec_end = sec_start.checked_add(security_buffer_length)?;
     let security_buffer = if sec_end <= body.len() {
         Bytes::copy_from_slice(&body[sec_start..sec_end])
     } else {
@@ -370,6 +377,9 @@ pub enum CreateDisposition {
 pub enum CreateOptions {
     DirectoryFile = 0x00000001,
     NonDirectoryFile = 0x00000040,
+    /// FILE_DELETE_ON_CLOSE — the file/dir is deleted when its last handle
+    /// closes. OR with `DirectoryFile`/`NonDirectoryFile` for a delete-on-close.
+    DeleteOnClose = 0x00001000,
 }
 
 pub fn encode_create_request(
@@ -398,7 +408,17 @@ pub fn encode_create_request(
     buf.put_u16_le(name_bytes.len() as u16); // NameLength
     buf.put_u32_le(0); // CreateContextsOffset
     buf.put_u32_le(0); // CreateContextsLength
-    buf.put_slice(&name_bytes);
+    if name_bytes.is_empty() {
+        // StructureSize is 57 = 56-byte fixed part + 1 mandatory buffer byte.
+        // The variable-length buffer must always be present, so when opening the
+        // share root (empty name) we still emit a single padding byte. Omitting
+        // it yields a 56-byte body that servers reject with
+        // STATUS_INVALID_PARAMETER (0xC000000D). Mirrors the trailing buffer
+        // byte the Read request always sends.
+        buf.put_u8(0);
+    } else {
+        buf.put_slice(&name_bytes);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -712,6 +732,12 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
         if next_entry_offset == 0 {
             break;
         }
+        // A real entry is at least the 104-byte fixed header. A smaller nonzero
+        // advance is malformed and would make the loop re-parse overlapping
+        // bytes up to data.len() times (CPU/memory amplification) — stop.
+        if next_entry_offset < 104 {
+            break;
+        }
         offset += next_entry_offset;
     }
 
@@ -830,6 +856,23 @@ pub fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
 mod tests {
     use super::*;
 
+    // ── Multi-credit charge ──────────────────────────────────────────
+
+    #[test]
+    fn credit_charge_matches_smb2_rule() {
+        // CreditCharge = max(1, ceil(payload / 65536)). Single-credit up to and
+        // including 64 KiB; multi-credit above. These charges are also the
+        // MessageId stride the send paths must advance by.
+        assert_eq!(credit_charge_for(0), 1);
+        assert_eq!(credit_charge_for(1), 1);
+        assert_eq!(credit_charge_for(65536), 1); // exactly 64 KiB = 1 credit
+        assert_eq!(credit_charge_for(65537), 2);
+        assert_eq!(credit_charge_for(131072), 2); // 128 KiB
+        assert_eq!(credit_charge_for(262144), 4); // 256 KiB (default I/O)
+        assert_eq!(credit_charge_for(1048576), 16); // 1 MiB
+        assert_eq!(credit_charge_for(8 * 1024 * 1024), 128); // 8 MiB (server max)
+    }
+
     // ── Header encode/decode round-trip ──────────────────────────────
 
     #[test]
@@ -908,6 +951,62 @@ mod tests {
     #[test]
     fn decode_create_response_too_short() {
         assert!(decode_create_response(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn encode_create_request_empty_path_emits_buffer_byte() {
+        // Opening the share root (e.g. ListObjectsV2 with no prefix) uses an
+        // empty name. StructureSize is 57 = 56 fixed bytes + 1 mandatory buffer
+        // byte, so the body must be 57 bytes even with no name. A 56-byte body
+        // is rejected by servers with STATUS_INVALID_PARAMETER (0xC000000D).
+        let mut buf = BytesMut::new();
+        encode_create_request(&mut buf, "", 0, 0, 0, 0);
+        assert_eq!(buf.len(), 57, "empty-name CREATE body must be 57 bytes");
+        assert_eq!((&buf[0..2]).get_u16_le(), 57, "StructureSize"); // StructureSize
+        assert_eq!((&buf[46..48]).get_u16_le(), 0, "NameLength"); // NameLength
+    }
+
+    #[test]
+    fn encode_create_request_named_path() {
+        let mut buf = BytesMut::new();
+        encode_create_request(&mut buf, "x", 0, 0, 0, 0);
+        // 56-byte fixed part + UTF-16 name ("x" = 2 bytes).
+        assert_eq!(buf.len(), 58);
+        assert_eq!((&buf[46..48]).get_u16_le(), 2, "NameLength"); // NameLength
+    }
+
+    #[test]
+    fn encode_create_request_delete_on_close() {
+        // DeleteObject opens the file with FILE_DELETE_ON_CLOSE (0x1000) set in
+        // CreateOptions, alongside NON_DIRECTORY_FILE (0x40) — exactly what
+        // `ShareSession::delete_object` passes so the file is removed when the
+        // handle closes. Verify the delete access, Open disposition, and the
+        // delete-on-close option all land at their wire offsets in the body.
+        const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+        let create_options = CreateOptions::NonDirectoryFile as u32 | FILE_DELETE_ON_CLOSE;
+        let mut buf = BytesMut::new();
+        encode_create_request(
+            &mut buf,
+            "stale.bin",
+            DesiredAccess::Delete as u32,
+            ShareAccess::Delete as u32,
+            CreateDisposition::Open as u32,
+            create_options,
+        );
+        // Field offsets within the CREATE request body (SMB2 header excluded).
+        assert_eq!(
+            (&buf[24..28]).get_u32_le(),
+            DesiredAccess::Delete as u32,
+            "DesiredAccess"
+        );
+        assert_eq!(
+            (&buf[36..40]).get_u32_le(),
+            CreateDisposition::Open as u32,
+            "CreateDisposition"
+        );
+        let opts = (&buf[40..44]).get_u32_le();
+        assert_eq!(opts, create_options, "CreateOptions");
+        assert_ne!(opts & FILE_DELETE_ON_CLOSE, 0, "DELETE_ON_CLOSE bit set");
     }
 
     #[test]
@@ -1132,6 +1231,29 @@ mod tests {
     #[test]
     fn parse_directory_entries_empty() {
         assert!(parse_directory_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn parse_directory_entries_stops_on_sub_entry_advance() {
+        // A nonzero next_entry_offset smaller than the 104-byte fixed header is
+        // malformed; the parser must stop rather than re-parse overlapping
+        // bytes (a CPU/memory amplification vector). With the guard, a single
+        // entry is returned; without it, the small advance would yield more.
+        let mut data = vec![0u8; 300];
+        data[0..4].copy_from_slice(&50u32.to_le_bytes()); // next_entry_offset = 50 (< 104)
+        // file_name_length (offset 60) stays 0.
+        assert_eq!(parse_directory_entries(&data).len(), 1);
+    }
+
+    #[test]
+    fn session_setup_rejects_offset_inside_header() {
+        // A SecurityBufferOffset below the 64-byte SMB2 header is malformed and
+        // must be rejected, not clamped to read garbage as the auth blob.
+        let hdr = Header::new(Command::SessionSetup, 1);
+        let mut body = vec![0u8; 16];
+        body[4..6].copy_from_slice(&10u16.to_le_bytes()); // offset 10 (< 64)
+        body[6..8].copy_from_slice(&4u16.to_le_bytes());
+        assert!(decode_session_setup_response(&hdr, &body).is_none());
     }
 
     #[test]
