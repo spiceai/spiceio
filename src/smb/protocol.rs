@@ -40,8 +40,8 @@ pub enum NtStatus {
     EndOfFile,
     NoMoreFiles,
     ObjectPathNotFound,
-    // Server capacity / limit statuses (treated as retryable ResourceBusy
-    // at the connection layer, not auth or file errors).
+    // Server capacity / limit statuses. Treated as retryable ResourceBusy at the
+    // connection layer, not as auth or file errors.
     InsufficientResources,
     TooManySessions,
     RequestNotAccepted,
