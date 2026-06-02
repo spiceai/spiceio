@@ -413,13 +413,31 @@ impl ShareSession {
             .await?;
 
         let compound_max = self.pool.compound_max_write_size as usize;
-        let chunk_size = self.pool.write_chunk_size() as usize;
         if data.len() <= compound_max {
             let _ = client.create_write_close(tree_id, smb_path, data).await?;
             return Ok(());
         }
 
-        let file = client
+        // Large part — resilient windowed write that rides the back-off ladder
+        // internally so a single UploadPart survives a degraded NAS instead of
+        // failing to a 503 the client (e.g. the AWS CLI, with its small retry
+        // budget) must absorb.
+        self.write_all_resilient(smb_path, data).await
+    }
+
+    /// Write `data` to `smb_path` (truncating any existing file) in
+    /// in-flight-sized windows. On a reset, back off the adaptive write size,
+    /// reconnect on a fresh pool connection, and retry the same window — so a
+    /// single large write rides the back-off ladder down to a sustainable burst
+    /// internally rather than surfacing a retryable error. The handle is always
+    /// closed; the partial file is removed on failure. Bounded by MAX_RETRIES,
+    /// which each landed window refreshes.
+    async fn write_all_resilient(&self, smb_path: &str, data: &[u8]) -> io::Result<()> {
+        const MAX_RETRIES: u32 = 16;
+        let (mut client, mut tree_id) = self.pick_live().await;
+        // First open truncates/creates; reconnects re-open with Open so the
+        // bytes already written are preserved and the offset stays valid.
+        let mut file = client
             .create(
                 tree_id,
                 smb_path,
@@ -429,25 +447,83 @@ impl ShareSession {
                 CreateOptions::NonDirectoryFile as u32,
             )
             .await?;
-
-        let write_result: io::Result<()> = async {
-            let mut offset = 0u64;
-            for chunk in data.chunks(chunk_size) {
-                client.write(tree_id, &file.file_id, offset, chunk).await?;
-                offset += chunk.len() as u64;
+        let mut sent = 0usize;
+        let mut offset = 0u64;
+        let mut attempt = 0u32;
+        let result: io::Result<()> = loop {
+            if sent >= data.len() {
+                break Ok(());
             }
-            Ok(())
-        }
-        .await;
+            let chunk = (self.pool.write_chunk_size() as usize).max(1);
+            let budget = (self.pool.write_inflight() as usize).max(chunk);
+            let end = (sent + budget).min(data.len());
+            let window: Vec<&[u8]> = data[sent..end].chunks(chunk).collect();
+            match client
+                .pipelined_write(tree_id, &file.file_id, offset, &window)
+                .await
+            {
+                Ok(written) => {
+                    let w = written as usize;
+                    if w == 0 {
+                        break Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "pipelined write reported 0 bytes written",
+                        ));
+                    }
+                    offset += written;
+                    sent += w;
+                    attempt = 0; // forward progress refreshes the retry budget
+                }
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_RETRIES {
+                        break Err(e);
+                    }
+                    attempt += 1;
+                    let _ = client.close(tree_id, &file.file_id).await;
+                    let (c, t) = self.pick_live().await;
+                    match c
+                        .create(
+                            t,
+                            smb_path,
+                            DesiredAccess::GenericWrite as u32,
+                            ShareAccess::Read as u32,
+                            CreateDisposition::Open as u32,
+                            CreateOptions::NonDirectoryFile as u32,
+                        )
+                        .await
+                    {
+                        Ok(f) => {
+                            client = c;
+                            tree_id = t;
+                            file = f;
+                        }
+                        Err(ce) => break Err(ce),
+                    }
+                }
+            }
+        };
         let _ = client.close(tree_id, &file.file_id).await;
-        if let Err(e) = write_result {
-            if is_reset(&e) {
-                self.pool.note_write_reset();
-            }
+        if result.is_err() {
             let _ = Self::delete_object_path_on(&client, tree_id, smb_path).await;
-            return Err(e);
         }
-        Ok(())
+        result
+    }
+
+    /// Pick a pool connection that is not poisoned. `pick()` already skips
+    /// poisoned slots, so the common case (one connection dropped, the rest
+    /// healthy) costs nothing; only when every connection is down do we pay for
+    /// a full heal and a brief pause before retrying.
+    async fn pick_live(&self) -> (Arc<SmbClient>, u32) {
+        let (client, tree_id) = self.pick();
+        if client.is_poisoned() {
+            self.pool.heal().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            return self.pick();
+        }
+        (client, tree_id)
     }
 
     /// Read a temp file.
@@ -532,8 +608,16 @@ impl ShareSession {
 
     /// Stream one part file into the WAL writer, always closing the part handle
     /// on every exit path (success, EOF, or read error).
+    ///
+    /// On a mid-read reset the part read reconnects on a fresh pool connection
+    /// and resumes from the current offset (re-reading the adaptive size each
+    /// batch so the burst shrinks under degradation), so assembling a multipart
+    /// upload survives a degraded NAS internally instead of failing
+    /// CompleteMultipartUpload back to the client. Bounded by MAX_RETRIES,
+    /// refreshed by each batch that lands.
     async fn stream_part_into_wal(&self, wal: &mut WalWriter, temp_path: &str) -> io::Result<()> {
-        let (client, tree_id) = self.pick();
+        const MAX_RETRIES: u32 = 16;
+        let (mut client, mut tree_id) = self.pick_live().await;
         let cr = client
             .create(
                 tree_id,
@@ -544,48 +628,74 @@ impl ShareSession {
                 CreateOptions::NonDirectoryFile as u32,
             )
             .await?;
-        let file_id = cr.file_id;
+        let mut file_id = cr.file_id;
         let file_size = cr.file_size;
-        let max_read = self.pool.read_chunk_size();
-        // Cap the read burst by the adaptive in-flight budget (shrinks under
-        // degradation), and at the pipeline depth.
-        let read_depth =
-            ((self.pool.read_inflight() / max_read).max(1) as u64).min(PIPELINE_DEPTH as u64);
 
-        let read_result: io::Result<()> = async {
-            let mut offset = 0u64;
-            while offset < file_size {
-                let remaining = file_size - offset;
-                let batch = remaining.div_ceil(max_read as u64).min(read_depth) as usize;
-                let chunks = match client
-                    .pipelined_read(tree_id, &file_id, offset, max_read, batch)
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        if is_reset(&e) {
-                            self.pool.note_read_reset();
-                        }
-                        return Err(e);
-                    }
-                };
-                if chunks.is_empty() {
-                    return Err(io::Error::new(
+        let mut offset = 0u64;
+        let mut attempt = 0u32;
+        let read_result: io::Result<()> = 'read: loop {
+            if offset >= file_size {
+                break 'read Ok(());
+            }
+            // Re-read the adaptive size each batch so the read burst shrinks
+            // under degradation and recovers as the server does.
+            let max_read = self.pool.read_chunk_size().max(1);
+            let read_depth =
+                ((self.pool.read_inflight() / max_read).max(1) as u64).min(PIPELINE_DEPTH as u64);
+            let remaining = file_size - offset;
+            let batch = remaining.div_ceil(max_read as u64).min(read_depth) as usize;
+            match client
+                .pipelined_read(tree_id, &file_id, offset, max_read, batch)
+                .await
+            {
+                Ok(chunks) if chunks.is_empty() => {
+                    break 'read Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!(
-                            "unexpected EOF assembling part '{}': read {} of {} bytes",
-                            temp_path, offset, file_size
+                            "unexpected EOF assembling part '{temp_path}': read {offset} of {file_size} bytes"
                         ),
                     ));
                 }
-                for chunk in &chunks {
-                    wal.write(chunk).await?;
-                    offset += chunk.len() as u64;
+                Ok(chunks) => {
+                    for chunk in &chunks {
+                        if let Err(e) = wal.write(chunk).await {
+                            break 'read Err(e);
+                        }
+                        offset += chunk.len() as u64;
+                    }
+                    attempt = 0; // forward progress refreshes the retry budget
+                }
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_read_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_RETRIES {
+                        break 'read Err(e);
+                    }
+                    attempt += 1;
+                    let _ = client.close(tree_id, &file_id).await;
+                    let (c, t) = self.pick_live().await;
+                    match c
+                        .create(
+                            t,
+                            temp_path,
+                            DesiredAccess::GenericRead as u32,
+                            ShareAccess::All as u32,
+                            CreateDisposition::Open as u32,
+                            CreateOptions::NonDirectoryFile as u32,
+                        )
+                        .await
+                    {
+                        Ok(ncr) => {
+                            client = c;
+                            tree_id = t;
+                            file_id = ncr.file_id;
+                        }
+                        Err(ce) => break 'read Err(ce),
+                    }
                 }
             }
-            Ok(())
-        }
-        .await;
+        };
 
         let _ = client.close(tree_id, &file_id).await;
         read_result
@@ -1104,9 +1214,17 @@ impl WalWriter {
     /// caller re-sends the same window at the backed-off size.
     async fn reopen(&mut self) -> io::Result<()> {
         let _ = self.client.close(self.tree_id, &self.file_id).await; // best-effort
-        self.pool.heal().await; // reconnect poisoned slots so pick() lands live
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let the NAS breathe
-        let (client, tree_id) = self.pool.pick();
+        // pick() skips poisoned slots, so the common case (this connection
+        // dropped, the rest healthy) is instant; only when every connection is
+        // down do we pay for a full heal + brief pause.
+        let (mut client, mut tree_id) = self.pool.pick();
+        if client.is_poisoned() {
+            self.pool.heal().await; // reconnect poisoned slots so pick() lands live
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await; // let the NAS breathe
+            let p = self.pool.pick();
+            client = p.0;
+            tree_id = p.1;
+        }
         let file = client
             .create(
                 tree_id,

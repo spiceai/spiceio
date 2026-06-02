@@ -739,12 +739,19 @@ async fn handle_get_object(
                     // truncating. `read_pipeline` already backed off the read size.
                     resumes += 1;
                     let _ = handle.close().await; // best-effort; may already be dead
-                    resume_share.heal().await; // reconnect poisoned slots now
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        (resumes as u64 * 100).min(1000),
-                    ))
-                    .await;
-                    match resume_share.open_read(&resume_key).await {
+                    // open_read picks a non-poisoned connection, so the common
+                    // case (this connection dropped, the rest healthy) is
+                    // instant. Only when the first re-open fails — the whole pool
+                    // is momentarily down — do we pay for a heal + brief pause.
+                    let reopened = match resume_share.open_read(&resume_key).await {
+                        Ok(h) => Ok(h),
+                        Err(_) => {
+                            resume_share.heal().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            resume_share.open_read(&resume_key).await
+                        }
+                    };
+                    match reopened {
                         Ok(h) if h.file_size == expected_size => {
                             chunk_size = h.max_chunk; // adopt the backed-off chunk
                             handle = h;
