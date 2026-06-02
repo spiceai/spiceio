@@ -563,6 +563,10 @@ async fn handle_get_object(
                     "The specified key does not exist.",
                 );
             }
+            // A transient reset on the one-shot compound probe falls through to
+            // the streaming path, which reconnects and retries the open rather
+            // than surfacing a 503 the client must absorb.
+            Err(e) if crate::smb::ops::is_reset(&e) => {}
             Err(e) => return io_to_s3_error(&e),
             _ => {} // Large file — fall through to streaming
         }

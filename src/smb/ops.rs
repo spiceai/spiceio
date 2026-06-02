@@ -96,18 +96,39 @@ impl ShareSession {
 
     /// Open a file for streaming reads. Returns a handle pinned to one connection.
     pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
-        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let file = client
-            .create(
-                tree_id,
-                &smb_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
+        // Resilient open: under heavy concurrent load on a degraded NAS the
+        // create can hit a transient reset; retry on a fresh connection so the
+        // initial open of a streaming GET isn't lost (the client may not retry).
+        // A genuine NotFound is not a reset and returns immediately. Bounded by
+        // MAX_RETRIES; each reset also backs off the adaptive read size.
+        const MAX_RETRIES: u32 = 16;
+        let mut attempt = 0u32;
+        let (client, tree_id, file) = loop {
+            let (client, tree_id) = self.pick_live().await;
+            match client
+                .create(
+                    tree_id,
+                    &smb_path,
+                    DesiredAccess::GenericRead as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32,
+                )
+                .await
+            {
+                Ok(file) => break (client, tree_id, file),
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_read_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                }
+            }
+        };
 
         let meta = ObjectMeta {
             size: file.file_size,
@@ -117,7 +138,7 @@ impl ShareSession {
         };
 
         Ok(FileHandle {
-            client: Arc::clone(&client),
+            client,
             pool: Arc::clone(&self.pool),
             tree_id,
             file_id: file.file_id,
@@ -747,29 +768,50 @@ impl ShareSession {
     /// memory and flushed to a temp file under `.spiceio-wal/` via pipelined
     /// SMB writes. Call `commit()` to atomically rename to the final path.
     pub async fn open_wal_write(&self, key: &str) -> io::Result<WalWriter> {
-        let (client, tree_id) = self.pick();
         let final_path = to_smb_path(key);
-
-        // Ensure final destination's parent dirs exist (so rename can succeed)
-        self.ensure_parent_dirs_on(&client, tree_id, &final_path)
-            .await?;
-
-        // Generate WAL temp path and ensure its parent dir exists
         let wal_path = wal_temp_path();
-        self.ensure_parent_dirs_on(&client, tree_id, &wal_path)
-            .await?;
 
-        // Create the WAL temp file
-        let file = client
-            .create(
-                tree_id,
-                &wal_path,
-                DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
-                ShareAccess::Read as u32 | ShareAccess::Delete as u32,
-                CreateDisposition::OverwriteIf as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
+        // Resilient setup: opening a streaming PUT takes several round trips
+        // (ensure parent dirs exist + create the temp file), and under heavy
+        // concurrent load on a degraded NAS any of them can hit a transient
+        // reset. Retry the whole setup on a fresh connection so a single PUT is
+        // not lost before its first byte (the client may not retry). Bounded by
+        // MAX_RETRIES; each reset also backs off the adaptive write size.
+        const MAX_RETRIES: u32 = 16;
+        let mut attempt = 0u32;
+        let (client, tree_id, file_id) = loop {
+            let (client, tree_id) = self.pick_live().await;
+            let setup: io::Result<[u8; 16]> = async {
+                self.ensure_parent_dirs_on(&client, tree_id, &final_path)
+                    .await?;
+                self.ensure_parent_dirs_on(&client, tree_id, &wal_path)
+                    .await?;
+                let file = client
+                    .create(
+                        tree_id,
+                        &wal_path,
+                        DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                        ShareAccess::Read as u32 | ShareAccess::Delete as u32,
+                        CreateDisposition::OverwriteIf as u32,
+                        CreateOptions::NonDirectoryFile as u32,
+                    )
+                    .await?;
+                Ok(file.file_id)
+            }
+            .await;
+            match setup {
+                Ok(file_id) => break (client, tree_id, file_id),
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                }
+            }
+        };
 
         // chunk = per-write size; flush_cap = in-flight burst budget. Both come
         // from the adaptive in-flight value (chunk = min(max, inflight)), so a
@@ -778,10 +820,10 @@ impl ShareSession {
         let chunk_size = self.pool.write_chunk_size() as usize;
         let flush_cap = (self.pool.write_inflight() as usize).max(chunk_size);
         Ok(WalWriter {
-            client: Arc::clone(&client),
+            client,
             pool: Arc::clone(&self.pool),
             tree_id,
-            file_id: file.file_id,
+            file_id,
             wal_path,
             final_path,
             buf: Vec::with_capacity(flush_cap),
@@ -794,17 +836,37 @@ impl ShareSession {
 
     /// Head object by raw SMB path (no S3 key conversion).
     async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
-        let (client, tree_id) = self.pick();
-        let (cr, _) = client
-            .create_close(
-                tree_id,
-                smb_path,
-                DesiredAccess::ReadAttributes as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
+        // Resilient stat: retry the one-shot compound probe on a transient reset
+        // (fresh connection each attempt) so a HEAD — and the post-rename
+        // metadata read in WAL commit — survives a degraded NAS. A genuine
+        // NotFound is not a reset and returns immediately. Bounded by MAX_RETRIES.
+        const MAX_RETRIES: u32 = 16;
+        let mut attempt = 0u32;
+        let cr = loop {
+            let (client, tree_id) = self.pick_live().await;
+            match client
+                .create_close(
+                    tree_id,
+                    smb_path,
+                    DesiredAccess::ReadAttributes as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32,
+                )
+                .await
+            {
+                Ok((cr, _)) => break cr,
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_read_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_RETRIES {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                }
+            }
+        };
 
         Ok(ObjectMeta {
             size: cr.file_size,
@@ -1244,39 +1306,71 @@ impl WalWriter {
     /// Flush remaining data, close the WAL file, and rename it to the final path.
     /// Returns the object metadata from a head_object on the final path.
     pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
-        // Flush remaining data and rename to the final path. On any failure,
-        // close the handle and delete the WAL temp so we never leak a handle or
-        // orphan a temp file — the caller cannot abort() after commit takes self.
-        let staged: io::Result<()> = async {
-            self.flush().await?;
-            self.client
-                .rename(self.tree_id, &self.file_id, &self.final_path, true)
-                .await?;
-            Ok(())
+        // Flush all buffered data (windowed retry inside flush), then rename the
+        // temp to the final path. The rename retries on a transient reset by
+        // reconnecting and re-opening the temp file (which still exists until the
+        // rename completes), so a single PUT is not lost at the finish line. On
+        // unrecoverable failure, close the handle and delete the temp so we never
+        // leak a handle or orphan a temp file — the caller cannot abort() after
+        // commit takes self.
+        if let Err(e) = self.flush().await {
+            self.discard_temp().await;
+            return Err(e);
         }
-        .await;
 
-        if let Err(e) = staged {
-            let _ = self.client.close(self.tree_id, &self.file_id).await;
-            // Rename did not complete, so the temp is still at wal_path.
-            let _ = self
+        const MAX_RETRIES: u32 = 16;
+        let mut attempt = 0u32;
+        let rename_result: io::Result<()> = loop {
+            match self
                 .client
-                .create_close(
-                    self.tree_id,
-                    &self.wal_path,
-                    DesiredAccess::Delete as u32,
-                    ShareAccess::Delete as u32,
-                    CreateDisposition::Open as u32,
-                    CreateOptions::NonDirectoryFile as u32 | 0x00001000,
-                )
-                .await;
+                .rename(self.tree_id, &self.file_id, &self.final_path, true)
+                .await
+            {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    }
+                    if !is_reset(&e) || attempt >= MAX_RETRIES {
+                        break Err(e);
+                    }
+                    attempt += 1;
+                    // Reconnect and re-open the temp to retry. If the temp is
+                    // gone, a prior rename actually completed (its response was
+                    // lost to the reset) — treat that as success.
+                    match self.reopen().await {
+                        Ok(()) => {}
+                        Err(re) if re.kind() == io::ErrorKind::NotFound => break Ok(()),
+                        Err(re) => break Err(re),
+                    }
+                }
+            }
+        };
+
+        if let Err(e) = rename_result {
+            self.discard_temp().await;
             return Err(e);
         }
 
         // Rename succeeded — close the handle (now at the final path).
         let _ = self.client.close(self.tree_id, &self.file_id).await;
-        let meta = share.head_object_smb(&self.final_path).await?;
-        Ok(meta)
+        share.head_object_smb(&self.final_path).await
+    }
+
+    /// Close the current handle and best-effort delete the WAL temp file.
+    async fn discard_temp(&self) {
+        let _ = self.client.close(self.tree_id, &self.file_id).await;
+        let _ = self
+            .client
+            .create_close(
+                self.tree_id,
+                &self.wal_path,
+                DesiredAccess::Delete as u32,
+                ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+            )
+            .await;
     }
 
     /// Abort the WAL write — close and delete the temp file.
