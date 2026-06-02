@@ -712,6 +712,12 @@ async fn handle_get_object(
     // so we never splice bytes from a file that changed underneath us.
     tokio::spawn(async move {
         const MAX_GET_RESUMES: u32 = 16;
+        // Heavy concurrent load can poison every pool connection at once, so a
+        // single reconnect attempt may find nothing live. Retry the re-open
+        // (each heals + briefly waits) so a GET rides out a transient
+        // all-connections-down window instead of aborting — symmetric with the
+        // write paths, and bounded to stay within the client's request timeout.
+        const MAX_GET_REOPEN_TRIES: u32 = 12;
         let mut handle = handle;
         let mut chunk_size = chunk_size;
         let mut offset = start;
@@ -740,17 +746,21 @@ async fn handle_get_object(
                     resumes += 1;
                     let _ = handle.close().await; // best-effort; may already be dead
                     // open_read picks a non-poisoned connection, so the common
-                    // case (this connection dropped, the rest healthy) is
-                    // instant. Only when the first re-open fails — the whole pool
-                    // is momentarily down — do we pay for a heal + brief pause.
-                    let reopened = match resume_share.open_read(&resume_key).await {
-                        Ok(h) => Ok(h),
-                        Err(_) => {
-                            resume_share.heal().await;
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            resume_share.open_read(&resume_key).await
-                        }
-                    };
+                    // case (this connection dropped, the rest healthy) succeeds
+                    // on the first try. Under heavy contention the whole pool can
+                    // be momentarily poisoned, so retry with a heal + brief pause
+                    // until a connection comes back (bounded).
+                    let mut reopened = resume_share.open_read(&resume_key).await;
+                    let mut rtry = 0u32;
+                    while reopened.is_err() && rtry < MAX_GET_REOPEN_TRIES {
+                        rtry += 1;
+                        resume_share.heal().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            (rtry as u64 * 150).min(750),
+                        ))
+                        .await;
+                        reopened = resume_share.open_read(&resume_key).await;
+                    }
                     match reopened {
                         Ok(h) if h.file_size == expected_size => {
                             chunk_size = h.max_chunk; // adopt the backed-off chunk
