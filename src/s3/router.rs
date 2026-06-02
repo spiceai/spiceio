@@ -748,6 +748,18 @@ async fn handle_get_object(
                     // Transient mid-stream drop: reconnect and resume instead of
                     // truncating. `read_pipeline` already backed off the read size.
                     resumes += 1;
+                    // Pace consecutive resumes that aren't making progress so the
+                    // budget spreads across the client timeout window (catching a
+                    // recovery window) instead of spinning through all attempts in
+                    // well under a second. The first resume is immediate (a lone
+                    // transient drop recovers at once); forward progress resets
+                    // `resumes`, so an advancing transfer is never paced.
+                    if resumes > 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            ((resumes as u64) * 50).min(500),
+                        ))
+                        .await;
+                    }
                     let _ = handle.close().await; // best-effort; may already be dead
                     // open_read picks a non-poisoned connection, so the common
                     // case (this connection dropped, the rest healthy) succeeds
