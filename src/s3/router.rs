@@ -730,10 +730,30 @@ async fn handle_get_object(
         'outer: while offset < stream_end {
             let remaining = stream_end - offset;
             match handle.read_pipeline(offset, chunk_size, remaining).await {
-                Ok(chunks) if chunks.is_empty() => break,
+                // An empty read while offset < stream_end means the object ended
+                // before its reported length. With a fixed Content-Length a clean
+                // break would emit a silently short body, so surface it as an
+                // aborted transfer instead.
+                Ok(chunks) if chunks.is_empty() => {
+                    crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
+                    let _ = tx
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "object ended before the expected length",
+                        )))
+                        .await;
+                    break 'outer;
+                }
                 Ok(chunks) => {
                     for chunk in chunks {
                         if chunk.is_empty() {
+                            crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
+                            let _ = tx
+                                .send(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "object ended before the expected length",
+                                )))
+                                .await;
                             break 'outer;
                         }
                         offset += chunk.len() as u64;
@@ -1813,8 +1833,16 @@ async fn collect_body(req: Request<Incoming>) -> Result<Bytes, Response<SpiceioB
                 }
             }
             Err(e) => {
+                // A failed body read must not be treated as an empty body —
+                // that would let mutating ops (UploadPart, CompleteMultipartUpload,
+                // multi-delete) silently proceed on a truncated request and
+                // return success. Surface it as an incomplete-body error.
                 crate::serr!("[spiceio] body collect error: {e}");
-                return Ok(Bytes::new());
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "IncompleteBody",
+                    "The request body could not be read completely.",
+                ));
             }
         }
     }

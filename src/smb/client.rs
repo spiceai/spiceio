@@ -52,11 +52,11 @@ impl SmbConfig {
 ///
 /// 256 KB is the measured sweet spot for streaming throughput: on a 10G link a
 /// single-stream PutObject rises from ~31 MiB/s at 64 KB to ~744 MiB/s at
-/// 256 KB. Larger sizes actually regress with the current WAL flush buffer
-/// (`chunk_size * WRITE_PIPELINE_DEPTH`) — at 1 MB it buffers 64 MB before
-/// flushing, which serializes the transfer. 256 KB stays well within what
-/// essentially every SMB server handles, and small files keep using the 64 KB
-/// compound cap (so per-op latency is unchanged). Override via
+/// 256 KB. The WAL writer bounds its in-flight burst with the adaptive flush
+/// budget (`write_inflight`), which backs off on resets, so this cap sets the
+/// per-write size rather than how much is buffered at once. 256 KB stays well
+/// within what essentially every SMB server handles, and small files keep using
+/// the 64 KB compound cap (so per-op latency is unchanged). Override via
 /// `SPICEIO_SMB_MAX_IO`; the effective size is always clamped to the server's
 /// negotiated maximum.
 const DEFAULT_MAX_IO: u32 = 262144;
@@ -181,7 +181,7 @@ impl SmbClient {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "SMB connection poisoned by previous timeout",
+                "SMB connection poisoned by an earlier transport error",
             ));
         }
         match tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
@@ -207,7 +207,7 @@ impl SmbClient {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "SMB connection poisoned by previous timeout",
+                "SMB connection poisoned by an earlier transport error",
             ));
         }
         match tokio::time::timeout(SMB_WRITE_TIMEOUT, stream.write_all(buf)).await {

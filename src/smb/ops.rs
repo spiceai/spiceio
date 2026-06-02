@@ -714,10 +714,20 @@ impl ShareSession {
                         )
                         .await
                     {
-                        Ok(ncr) => {
+                        // Refuse to splice if the part changed underneath us
+                        // (size differs) — we must not assemble bytes from a
+                        // different version of the file.
+                        Ok(ncr) if ncr.file_size == file_size => {
                             client = c;
                             tree_id = t;
                             file_id = ncr.file_id;
+                        }
+                        Ok(ncr) => {
+                            let _ = c.close(t, &ncr.file_id).await;
+                            break 'read Err(io::Error::other(format!(
+                                "part '{temp_path}' changed during assembly: size {file_size} -> {}",
+                                ncr.file_size
+                            )));
                         }
                         Err(ce) => break 'read Err(ce),
                     }
@@ -991,8 +1001,10 @@ impl ShareSession {
                 }
             }
 
-            // Remove the now-empty upload directory.
-            let _ = client
+            // Remove the now-empty upload directory. Only count it as removed
+            // when the delete-on-close actually succeeds, so the log doesn't
+            // overreport (e.g. a non-empty dir or a permission error).
+            if client
                 .create_close(
                     tree_id,
                     &subpath,
@@ -1001,8 +1013,11 @@ impl ShareSession {
                     CreateDisposition::Open as u32,
                     CreateOptions::DirectoryFile as u32 | 0x00001000,
                 )
-                .await;
-            removed += 1;
+                .await
+                .is_ok()
+            {
+                removed += 1;
+            }
         }
 
         if removed > 0 {
