@@ -32,6 +32,9 @@ TEST_TARGET_DIR="${SPICEAI_DIR}/target/test-sccache-spiceio"
 PASS=0
 FAIL=0
 
+# Capture spiceio logs for backoff verification (and error guard)
+SPICEIO_STDERR=$(mktemp /tmp/spiceio-spiceai-stderr.XXXXXX)
+
 # ── Cleanup on exit ──────────────────────────────────────────────────────
 
 SPICEIO_PID=""
@@ -44,6 +47,7 @@ cleanup() {
         wait "$SPICEIO_PID" 2>/dev/null || true
     fi
     rm -rf "$TEST_TARGET_DIR"
+    rm -f "$SPICEIO_STDERR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -98,7 +102,8 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
-"$SPICEIO_BIN" &
+SPICEIO_SMB_CONNECTIONS=128 \
+"$SPICEIO_BIN" 2> >(tee -a "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
 echo "[test] waiting for spiceio on ${BIND}..."
@@ -213,6 +218,20 @@ echo ""
 echo "======================================="
 echo "[test] Assertions"
 echo "======================================="
+
+# ── Session backoff exercise verification (for high SPICEIO_SMB_CONNECTIONS) ─
+if [[ -n "$SPICEIO_PID" ]]; then
+    kill "$SPICEIO_PID" 2>/dev/null || true
+    wait "$SPICEIO_PID" 2>/dev/null || true
+    SPICEIO_PID=""
+fi
+sleep 0.2
+if [[ -s "$SPICEIO_STDERR" ]] && grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICEIO_STDERR" 2>/dev/null; then
+    echo "  PASS: session backoff (capacity reduction) messages seen in spiceio logs"
+    PASS=$((PASS + 1))
+else
+    echo "  NOTE: no capacity reduction messages (server allowed all 128; rerun vs limited server to exercise)"
+fi
 
 assert_gt  "warm build cache hits > 0"   0   "${CACHE_HITS:-0}"
 assert_eq  "warm build write errors == 0" "0" "${WRITE_ERRORS:-0}"

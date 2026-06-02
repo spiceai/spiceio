@@ -321,10 +321,15 @@ impl SmbClient {
 
         let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
-            crate::serr!("[spiceio] smb negotiate failed: 0x{:08X}", resp_hdr.status);
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("negotiate failed: status=0x{:08X}", resp_hdr.status),
+            // A negotiate NTSTATUS failure is a protocol-level rejection over an
+            // already-established TCP connection (e.g. unsupported dialect),
+            // typically permanent — surface it as InvalidData, not
+            // ConnectionRefused, which the S3 layer treats as a retryable 503.
+            // ConnectionRefused is reserved for an actual TCP connect refusal.
+            return Err(handshake_error(
+                "negotiate",
+                resp_hdr.status,
+                io::ErrorKind::InvalidData,
             ));
         }
 
@@ -361,6 +366,21 @@ impl SmbClient {
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
         let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
+
+        // The first session-setup leg should return MORE_PROCESSING_REQUIRED
+        // carrying the NTLM challenge. The session is allocated on this leg, so a
+        // server at capacity refuses *here* — classify any other error status
+        // (commonly server capacity) as a typed, retryable error instead of
+        // failing to parse a challenge out of an error body (which surfaced as a
+        // hard InvalidData 500 and stopped the pool from shrinking).
+        let status1 = NtStatus::from_u32(resp_hdr.status);
+        if status1.is_error() && status1 != NtStatus::MoreProcessingRequired {
+            return Err(handshake_error(
+                "session setup",
+                resp_hdr.status,
+                io::ErrorKind::PermissionDenied,
+            ));
+        }
 
         // Hash session setup response 1
         update_preauth_hash(&mut preauth_hash, &resp_raw);
@@ -399,10 +419,10 @@ impl SmbClient {
 
         let (resp_hdr, ..) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
-            crate::serr!("[spiceio] smb auth failed: 0x{:08X}", resp_hdr.status);
-            return Err(io::Error::new(
+            return Err(handshake_error(
+                "session setup",
+                resp_hdr.status,
                 io::ErrorKind::PermissionDenied,
-                format!("authentication failed: status=0x{:08X}", resp_hdr.status),
             ));
         }
 
@@ -447,19 +467,11 @@ impl SmbClient {
         });
 
         let (resp_hdr, _resp_body) = self.send_recv(&packet).await?;
-        let status = NtStatus::from_u32(resp_hdr.status);
-        if status.is_error() {
-            crate::serr!(
-                "[spiceio] smb tree connect failed: '{}': 0x{:08X}",
-                share,
-                resp_hdr.status
-            );
-            return Err(io::Error::new(
+        if NtStatus::from_u32(resp_hdr.status).is_error() {
+            return Err(handshake_error(
+                &format!("tree connect to '{share}'"),
+                resp_hdr.status,
                 io::ErrorKind::NotFound,
-                format!(
-                    "tree connect to '{}' failed: 0x{:08X}",
-                    share, resp_hdr.status
-                ),
             ));
         }
 
@@ -1463,11 +1475,78 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
             format!("sharing violation: {path}"),
         ),
 
+        // Server capacity / limit statuses all map to retryable ResourceBusy.
+        // Classified via `is_server_capacity_status` (the single source of truth
+        // for these codes) so there is no third hand-maintained list here; the
+        // NtStatus name in the message says which limit was hit.
+        s if is_server_capacity_status(s) => io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("server at capacity ({:?}): {path}", NtStatus::from_u32(s)),
+        ),
+
         _ => {
             crate::serr!("[spiceio] smb error 0x{status:08X}: {path}");
             io::Error::other(format!("SMB error 0x{status:08X} for {path}"))
         }
     }
+}
+
+/// True for NTSTATUS values that indicate the SMB server has hit a connection,
+/// session, or resource limit and is refusing new sessions/connections.
+/// These surface as ResourceBusy (mapped to 503 SlowDown by the S3 layer)
+/// so clients retry, and the pool healer / connect backoff treat them as
+/// transient.
+pub(crate) fn is_server_capacity_status(status: u32) -> bool {
+    matches!(
+        NtStatus::from_u32(status),
+        NtStatus::InsufficientResources
+            | NtStatus::TooManySessions
+            | NtStatus::RequestNotAccepted
+            | NtStatus::SharingPaused
+            | NtStatus::RemoteSessionLimit
+    )
+}
+
+/// Returns whether the given error indicates the SMB server rejected a new
+/// connection or session due to a capacity limit (too many sessions,
+/// insufficient resources, request not accepted, etc.). Used by the pool to
+/// shrink itself instead of failing or retrying the same limit forever.
+///
+/// At the connect / tree-connect layer the *only* source of `ResourceBusy` is a
+/// server-capacity NTSTATUS — no file operations run there, so a sharing
+/// violation (the other `ResourceBusy` producer) can't occur. The typed kind is
+/// therefore a reliable single signal, so we don't re-parse the message text
+/// (which would be a fourth copy of the capacity-code list to keep in sync).
+/// `handshake_error` and `is_server_capacity_status` uphold the invariant:
+/// capacity statuses map to `ResourceBusy`, everything else does not.
+pub(crate) fn is_capacity_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ResourceBusy
+}
+
+/// Build the `io::Error` for a failed SMB handshake step (negotiate, session
+/// setup, tree connect). Server-capacity statuses become retryable
+/// `ResourceBusy` and are logged quietly — they are expected back-pressure, not
+/// bugs, and the pool shrinks / retries on them. `STATUS_ACCESS_DENIED` maps to
+/// `PermissionDenied`; every other status uses `fallback`. Non-capacity errors
+/// are logged at error level. `context` names the step for the log/message.
+fn handshake_error(context: &str, status: u32, fallback: io::ErrorKind) -> io::Error {
+    if is_server_capacity_status(status) {
+        crate::slog!("[spiceio] smb {context} rejected by server capacity: 0x{status:08X}");
+        return io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("{context} rejected by server capacity: status=0x{status:08X}"),
+        );
+    }
+    crate::serr!("[spiceio] smb {context} failed: 0x{status:08X}");
+    // STATUS_ACCESS_DENIED is an auth/ACL failure at any step — surface it as
+    // PermissionDenied rather than the step's generic fallback (e.g. tree
+    // connect's NotFound), so it is not misreported as a missing share.
+    let kind = if NtStatus::from_u32(status) == NtStatus::AccessDenied {
+        io::ErrorKind::PermissionDenied
+    } else {
+        fallback
+    };
+    io::Error::new(kind, format!("{context} failed: status=0x{status:08X}"))
 }
 
 /// Sign a single SMB2 message in-place (no NetBIOS header prefix).
@@ -1536,6 +1615,90 @@ mod tests {
     fn maps_sharing_violation_to_resource_busy() {
         let e = smb_status_to_io_error(0xC000_0043, ".spiceio-wal\\01-0000");
         assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, ".spiceio-wal\\01-0000");
+    }
+
+    #[test]
+    fn maps_insufficient_resources_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC000009A, "conn");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, "InsufficientResources");
+    }
+
+    #[test]
+    fn maps_too_many_sessions_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC00000CE, "srv");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, "TooManySessions");
+    }
+
+    #[test]
+    fn maps_request_not_accepted_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC00000D0, "share");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, "RequestNotAccepted");
+    }
+
+    #[test]
+    fn is_server_capacity_status_recognizes_common_limit_codes() {
+        assert!(is_server_capacity_status(0xC000009A));
+        assert!(is_server_capacity_status(0xC00000CE));
+        assert!(is_server_capacity_status(0xC00000D0));
+        assert!(is_server_capacity_status(0xC00000CF));
+        assert!(is_server_capacity_status(0xC0000196));
+        assert!(!is_server_capacity_status(0xC000000F)); // no such file
+        assert!(!is_server_capacity_status(0));
+    }
+
+    #[test]
+    fn handshake_error_classifies_capacity_as_retryable_resource_busy() {
+        // A capacity rejection at any handshake step — including the first
+        // session-setup leg — must be retryable ResourceBusy, not the fallback,
+        // so the pool shrinks instead of hard-failing.
+        let e = handshake_error("session setup", 0xC00000CE, io::ErrorKind::PermissionDenied);
+        assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
+        assert!(e.to_string().contains("0xC00000CE"), "expected hex in {e}");
+    }
+
+    #[test]
+    fn handshake_error_uses_fallback_for_non_capacity() {
+        // 0xC000000D (STATUS_INVALID_PARAMETER): not capacity, not access-denied.
+        let e = handshake_error("negotiate", 0xC000000D, io::ErrorKind::ConnectionRefused);
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(e.to_string().contains("0xC000000D"), "expected hex in {e}");
+    }
+
+    #[test]
+    fn handshake_error_maps_access_denied_to_permission_denied() {
+        // tree_connect's fallback is NotFound, but ACCESS_DENIED must surface as
+        // PermissionDenied — not a misleading "share not found".
+        let e = handshake_error(
+            "tree connect to 'share'",
+            0xC0000022,
+            io::ErrorKind::NotFound,
+        );
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("0xC0000022"), "expected hex in {e}");
+    }
+
+    #[test]
+    fn is_capacity_error_true_only_for_resource_busy() {
+        // The pool relies on this to decide whether to shrink. Capacity statuses
+        // map to ResourceBusy (via handshake_error / smb_status_to_io_error);
+        // auth / not-found / refused / timeout must NOT trigger a shrink.
+        assert!(is_capacity_error(&handshake_error(
+            "session setup",
+            0xC00000D0,
+            io::ErrorKind::PermissionDenied,
+        )));
+        assert!(is_capacity_error(&smb_status_to_io_error(0xC000009A, "x")));
+        assert!(!is_capacity_error(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "auth failed",
+        )));
+        assert!(!is_capacity_error(&io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "refused",
+        )));
+        assert!(!is_capacity_error(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
     }
 
     #[test]

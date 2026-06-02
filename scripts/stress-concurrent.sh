@@ -4,7 +4,10 @@ set -euo pipefail
 # ── Concurrent stress test ─────────────────────────────────────────────────
 #
 # Hammers spiceio with parallel S3 operations to stress the connection pool
-# and verify no sharing violations under concurrent load.
+# and verify no sharing violations under concurrent load. Requests a high
+# SMB connection count (SPICEIO_SMB_CONNECTIONS) by default so the server
+# is likely to return capacity errors (too many sessions etc.), exercising
+# the dynamic "session backoff" / pool reduction logic.
 #
 # Usage: SPICEIO_SMB_USER=user SPICEIO_SMB_PASS=pass ./scripts/stress-concurrent.sh
 
@@ -25,8 +28,12 @@ PREFIX="stress-$$"
 TMPDIR_BASE=$(mktemp -d /tmp/spiceio-stress.XXXXXX)
 PASS=0
 FAIL=0
-CONCURRENCY="${SPICEIO_STRESS_CONCURRENCY:-16}"
+CONCURRENCY="${SPICEIO_STRESS_CONCURRENCY:-128}"
 CURL_TIMEOUT="${SPICEIO_STRESS_TIMEOUT:-30}"
+# Request a high number of SMB connections to stress the server session limit
+# and exercise the dynamic pool reduction ("session backoff") logic in the
+# pool when capacity errors (too many sessions etc.) are returned.
+SPICEIO_SMB_CONNECTIONS="${SPICEIO_SMB_CONNECTIONS:-128}"
 
 # Capture spiceio stderr for a post-run guard. We still tee to the script's
 # stderr so CI logs stream live; the file is only used to fail the build if
@@ -101,7 +108,8 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
-"$SPICEIO_BIN" 2> >(tee "$SPICEIO_STDERR" >&2) &
+SPICEIO_SMB_CONNECTIONS="$SPICEIO_SMB_CONNECTIONS" \
+"$SPICEIO_BIN" > >(tee -a "$SPICEIO_STDERR" >&2) 2> >(tee -a "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
 for i in $(seq 1 30); do
@@ -111,7 +119,7 @@ for i in $(seq 1 30); do
     fi
     sleep 0.5
 done
-echo "[stress] spiceio ready (concurrency=${CONCURRENCY}, timeout=${CURL_TIMEOUT}s)"
+echo "[stress] spiceio ready (concurrency=${CONCURRENCY}, smb_conns=${SPICEIO_SMB_CONNECTIONS}, timeout=${CURL_TIMEOUT}s)"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1. Concurrent writes — N parallel PUTs to distinct keys
@@ -353,7 +361,7 @@ echo "  integrity: $((PASS - PREV_PASS)) checks passed, reads=${READ_OK}/${READ_
 # ════════════════════════════════════════════════════════════════════════════
 
 echo ""
-LARGE_N="${SPICEIO_STRESS_LARGE_N:-8}"
+LARGE_N="${SPICEIO_STRESS_LARGE_N:-32}"
 echo "═══════════════════════════════════════════════════════════════"
 echo " 5. Concurrent large-file I/O (${LARGE_N} x 1MB — pipelined reads)"
 echo "═══════════════════════════════════════════════════════════════"
@@ -399,6 +407,21 @@ for i in $(seq 1 "$LARGE_N"); do
     assert_eq "large-${i} integrity" "$ORIG" "$GOT"
 done
 echo "  integrity: $((PASS - PREV_PASS))/${LARGE_N} verified"
+
+# ════════════════════════════════════════════════════════════════════════════
+# Session backoff exercise verification
+# With SPICEIO_SMB_CONNECTIONS=128 (high) and high concurrency, the initial
+# pool creation should hit server capacity limits and trigger the dynamic
+# reduction ("session backoff") in SmbPool. We log a note (not a hard fail,
+# since it depends on the live server's session limit).
+# ════════════════════════════════════════════════════════════════════════════
+
+if grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICEIO_STDERR" 2>/dev/null; then
+    echo "  PASS: session backoff (capacity reduction) messages seen in spiceio logs"
+    PASS=$((PASS + 1))
+else
+    echo "  NOTE: no capacity reduction messages in logs (server allowed all ${SPICEIO_SMB_CONNECTIONS} SMB connections? rerun against a tighter server limit to exercise backoff path)"
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # Stderr guard

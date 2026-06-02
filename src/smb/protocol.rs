@@ -40,6 +40,13 @@ pub enum NtStatus {
     EndOfFile,
     NoMoreFiles,
     ObjectPathNotFound,
+    // Server capacity / limit statuses. Treated as retryable ResourceBusy at the
+    // connection layer, not as auth or file errors.
+    InsufficientResources,
+    TooManySessions,
+    RequestNotAccepted,
+    SharingPaused,
+    RemoteSessionLimit,
     Unknown(u32),
 }
 
@@ -55,6 +62,11 @@ impl NtStatus {
             0xC0000011 => Self::EndOfFile,
             0x80000006 => Self::NoMoreFiles,
             0xC000003A => Self::ObjectPathNotFound,
+            0xC000009A => Self::InsufficientResources,
+            0xC00000CE => Self::TooManySessions,
+            0xC00000D0 => Self::RequestNotAccepted,
+            0xC00000CF => Self::SharingPaused,
+            0xC0000196 => Self::RemoteSessionLimit,
             other => Self::Unknown(other),
         }
     }
@@ -70,6 +82,11 @@ impl NtStatus {
             Self::EndOfFile => 0xC0000011,
             Self::NoMoreFiles => 0x80000006,
             Self::ObjectPathNotFound => 0xC000003A,
+            Self::InsufficientResources => 0xC000009A,
+            Self::TooManySessions => 0xC00000CE,
+            Self::RequestNotAccepted => 0xC00000D0,
+            Self::SharingPaused => 0xC00000CF,
+            Self::RemoteSessionLimit => 0xC0000196,
             Self::Unknown(v) => v,
         };
         code & 0xC0000000 == 0xC0000000
@@ -928,6 +945,20 @@ mod tests {
         assert_eq!(NtStatus::from_u32(0x00000000), NtStatus::Success);
         assert_eq!(NtStatus::from_u32(0xC000000F), NtStatus::NoSuchFile);
         assert_eq!(NtStatus::from_u32(0x80000006), NtStatus::NoMoreFiles);
+        assert_eq!(
+            NtStatus::from_u32(0xC000009A),
+            NtStatus::InsufficientResources
+        );
+        assert_eq!(NtStatus::from_u32(0xC00000CE), NtStatus::TooManySessions);
+        assert_eq!(NtStatus::from_u32(0xC00000D0), NtStatus::RequestNotAccepted);
+    }
+
+    #[test]
+    fn nt_status_capacity_codes_are_errors() {
+        assert!(NtStatus::InsufficientResources.is_error());
+        assert!(NtStatus::TooManySessions.is_error());
+        assert!(NtStatus::RequestNotAccepted.is_error());
+        assert!(NtStatus::RemoteSessionLimit.is_error());
     }
 
     // ── Decode responses ─────────────────────────────────────────────

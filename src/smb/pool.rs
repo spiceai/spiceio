@@ -78,9 +78,13 @@ struct Slot {
 /// concurrent operations don't serialize on a single mutex.
 pub struct SmbPool {
     /// Swappable slots — a poisoned connection is replaced in place by `heal`.
+    /// The vec length is the historical max; `n` tracks the current active count
+    /// which can be reduced at runtime.
     slots: RwLock<Vec<Slot>>,
-    /// Fixed number of slots (never changes; only their contents do).
-    n: usize,
+    /// Current number of active connections in the pool (round-robin target).
+    /// Starts at the configured size but is dynamically reduced (by truncating
+    /// slots) if the server reports capacity limits such as too many sessions.
+    n: AtomicUsize,
     next: AtomicUsize,
     /// Config for reconnecting a poisoned slot.
     config: SmbConfig,
@@ -145,9 +149,9 @@ impl SmbPool {
     ///
     /// All connections negotiate independently and authenticate with the same
     /// credentials. The pool uses the negotiated sizes from the first connection.
-    pub async fn connect(config: SmbConfig, n: usize) -> io::Result<Arc<Self>> {
-        let n = n.max(1);
-        let mut clients = Vec::with_capacity(n);
+    pub async fn connect(config: SmbConfig, requested_n: usize) -> io::Result<Arc<Self>> {
+        let requested_n = requested_n.max(1);
+        let mut clients = Vec::with_capacity(requested_n);
 
         // First connection — establishes negotiated parameters
         let first = connect_with_retry(config.clone()).await?;
@@ -156,32 +160,65 @@ impl SmbPool {
         let compound_max_read_size = first.compound_max_read_size;
         let compound_max_write_size = first.compound_max_write_size;
         clients.push(first);
+        let mut actual_n = 1;
 
-        // Additional connections in parallel
-        if n > 1 {
-            let mut joins = Vec::with_capacity(n - 1);
-            for _ in 1..n {
+        // Additional connections in parallel. If the server reports a capacity
+        // limit (too many sessions, request not accepted, etc.) we stop adding
+        // more and dynamically reduce the pool size rather than failing or
+        // retrying the same limit forever.
+        if requested_n > 1 {
+            let mut joins = Vec::with_capacity(requested_n - 1);
+            for _ in 1..requested_n {
                 let cfg = config.clone();
                 joins.push(tokio::spawn(async move { connect_with_retry(cfg).await }));
             }
-            for join in joins {
-                let client = join
-                    .await
-                    .map_err(|e| io::Error::other(format!("spawn failed: {e}")))??;
-                clients.push(client);
+            let mut pending = joins.into_iter();
+            let mut fatal: Option<io::Error> = None;
+            for join in pending.by_ref() {
+                match join.await {
+                    Ok(Ok(client)) => {
+                        clients.push(client);
+                        actual_n += 1;
+                    }
+                    Ok(Err(e)) => {
+                        // Server at capacity → stop adding and use what we have.
+                        // Any other failure is fatal for the whole connect.
+                        if super::client::is_capacity_error(&e) {
+                            crate::slog!(
+                                "[spiceio] smb server at capacity, using only {actual_n} of {requested_n} requested connections"
+                            );
+                        } else {
+                            fatal = Some(e);
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        fatal = Some(io::Error::other(format!("spawn failed: {e}")));
+                        break;
+                    }
+                }
             }
-            crate::slog!("[spiceio] smb pool: {n} connections ready");
+            // Abort the connections we decided not to use: dropping a JoinHandle
+            // detaches the task, which would keep opening SMB sessions in the
+            // background against an already-capacity-limited server.
+            for join in pending {
+                join.abort();
+            }
+            if let Some(e) = fatal {
+                return Err(e);
+            }
+            crate::slog!("[spiceio] smb pool: {actual_n} connections ready");
         }
 
         let slots: Vec<Slot> = clients
             .into_iter()
             .map(|client| Slot { client, tree_id: 0 })
             .collect();
-        let n = slots.len();
+        let pool_n = slots.len();
 
         Ok(Arc::new(Self {
             slots: RwLock::new(slots),
-            n,
+            n: AtomicUsize::new(pool_n),
             next: AtomicUsize::new(0),
             config,
             share: OnceLock::new(),
@@ -277,16 +314,16 @@ impl SmbPool {
     /// healed (reconnected) slot can be re-tree-connected.
     pub async fn connect_share(&self, share: &str) -> io::Result<()> {
         let clients: Vec<Arc<SmbClient>> = {
-            self.slots
-                .read()
-                .unwrap()
-                .iter()
-                .map(|s| s.client.clone())
-                .collect()
+            let guard = self.slots.read().unwrap();
+            let cur = self.n.load(Ordering::Relaxed).min(guard.len());
+            guard[..cur].iter().map(|s| s.client.clone()).collect()
         };
         for (idx, client) in clients.iter().enumerate() {
             let tree_id = client.tree_connect(share).await?;
-            self.slots.write().unwrap()[idx].tree_id = tree_id;
+            let mut guard = self.slots.write().unwrap();
+            if idx < guard.len() {
+                guard[idx].tree_id = tree_id;
+            }
         }
         let _ = self.share.set(share.to_string());
         Ok(())
@@ -294,18 +331,26 @@ impl SmbPool {
 
     /// Pick the next healthy connection via round-robin, skipping poisoned ones.
     /// Returns an owned `Arc` and its tree id. Falls back to a poisoned slot if
-    /// all are poisoned — the I/O fails fast and `heal` reconnects it.
+    /// all (current active) are poisoned — the I/O fails fast and `heal` reconnects it.
     pub fn pick(&self) -> (Arc<SmbClient>, u32) {
         let slots = self.slots.read().unwrap();
+        let mut current_n = self.n.load(Ordering::Relaxed).min(slots.len());
+        if current_n == 0 {
+            // Degenerate case (should not happen after successful connect).
+            if slots.is_empty() {
+                panic!("smb pool is empty");
+            }
+            current_n = 1;
+        }
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        for i in 0..self.n {
-            let idx = (start + i) % self.n;
+        for i in 0..current_n {
+            let idx = (start + i) % current_n;
             if !slots[idx].client.is_poisoned() {
                 return (slots[idx].client.clone(), slots[idx].tree_id);
             }
         }
-        // All poisoned — return a round-robin pick; the I/O will fail fast.
-        let idx = start % self.n;
+        // All (current) poisoned — return a round-robin pick; the I/O will fail fast.
+        let idx = start % current_n;
         (slots[idx].client.clone(), slots[idx].tree_id)
     }
 
@@ -325,10 +370,35 @@ impl SmbPool {
         (client, tree_id)
     }
 
+    /// Back the active pool off by one connection (truncating the last slot).
+    /// Called when a heal reconnect hits a server capacity limit: the server
+    /// can't sustain the current count, so we reduce by one — based on the
+    /// current size, NOT the failing slot index, which could discard most of a
+    /// healthy pool. Repeated capacity errors shrink it further, one at a time.
+    /// Keeps at least one slot (a poisoned last slot is retried on the next
+    /// heal; restart with a lower SPICEIO_SMB_CONNECTIONS for a hard low limit).
+    fn shrink_by_one(&self) {
+        let mut slots = self.slots.write().unwrap();
+        let old = self.n.load(Ordering::Relaxed);
+        if old <= 1 {
+            return;
+        }
+        let new_size = (old - 1).min(slots.len());
+        slots.truncate(new_size);
+        self.n.store(new_size, Ordering::Relaxed);
+        crate::slog!(
+            "[spiceio] smb pool reduced from {} to {} connections due to server capacity limit",
+            old,
+            new_size
+        );
+    }
+
     /// Reconnect any poisoned slots and re-tree-connect them to the share.
     /// Best-effort: a slot whose reconnect fails stays poisoned and is retried
     /// on the next pass. Without this the pool degrades monotonically — every
     /// timeout would permanently remove a connection until the proxy is wedged.
+    /// If a reconnect fails specifically due to server capacity (too many
+    /// sessions etc.), we shrink the pool instead of keeping a poisoned slot.
     pub async fn heal(&self) {
         let Some(share) = self.share.get() else {
             return;
@@ -339,22 +409,55 @@ impl SmbPool {
         // healthy (the `is_poisoned` check) and skip them.
         {
             let _guard = self.heal_lock.lock().await;
-            for idx in 0..self.n {
-                let poisoned = self.slots.read().unwrap()[idx].client.is_poisoned();
+            let current_n = self.n.load(Ordering::Relaxed);
+            for idx in 0..current_n {
+                // Re-check current size in case a prior capacity shrink happened.
+                let cur = self.n.load(Ordering::Relaxed);
+                if idx >= cur {
+                    break;
+                }
+                let poisoned = self
+                    .slots
+                    .read()
+                    .unwrap()
+                    .get(idx)
+                    .is_some_and(|s| s.client.is_poisoned());
                 if !poisoned {
                     continue;
                 }
                 match connect_with_retry(self.config.clone()).await {
                     Ok(client) => match client.tree_connect(share).await {
                         Ok(tree_id) => {
-                            self.slots.write().unwrap()[idx] = Slot { client, tree_id };
+                            // Guard the write in case size changed.
+                            let mut guard = self.slots.write().unwrap();
+                            if idx < guard.len() {
+                                guard[idx] = Slot { client, tree_id };
+                            }
                             crate::slog!("[spiceio] healed poisoned smb connection (slot {idx})");
                         }
                         Err(e) => {
-                            crate::serr!("[spiceio] heal tree-connect failed (slot {idx}): {e}")
+                            if super::client::is_capacity_error(&e) {
+                                self.shrink_by_one();
+                                crate::slog!(
+                                    "[spiceio] heal tree-connect hit server capacity, reduced pool (slot {idx})"
+                                );
+                                break;
+                            } else {
+                                crate::serr!("[spiceio] heal tree-connect failed (slot {idx}): {e}")
+                            }
                         }
                     },
-                    Err(e) => crate::serr!("[spiceio] heal reconnect failed (slot {idx}): {e}"),
+                    Err(e) => {
+                        if super::client::is_capacity_error(&e) {
+                            self.shrink_by_one();
+                            crate::slog!(
+                                "[spiceio] heal reconnect hit server capacity, reduced pool (slot {idx})"
+                            );
+                            break;
+                        } else {
+                            crate::serr!("[spiceio] heal reconnect failed (slot {idx}): {e}")
+                        }
+                    }
                 }
             }
         }
@@ -363,9 +466,10 @@ impl SmbPool {
         self.grow_io();
     }
 
-    /// Number of connections in the pool.
+    /// Current number of (active) connections in the pool. May be smaller than
+    /// originally requested if the server indicated capacity limits.
     pub fn size(&self) -> usize {
-        self.n
+        self.n.load(Ordering::Relaxed)
     }
 }
 
