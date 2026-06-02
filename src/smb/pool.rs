@@ -108,6 +108,12 @@ pub struct SmbPool {
     /// Without this the healer could grow the size back mid-retry-burst, making
     /// a client's retry hit a too-large chunk that resets again.
     reset_since_grow: AtomicBool,
+    /// Serializes connection healing so a burst of concurrent retries triggers
+    /// one reconnect pass, not N competing ones that pile reconnect load onto an
+    /// already-struggling server (a retry storm). The per-slot `is_poisoned`
+    /// check inside `heal` lets callers that queue behind a heal skip the slots
+    /// it already restored.
+    heal_lock: tokio::sync::Mutex<()>,
 }
 
 /// Floor for the adaptive streaming in-flight size — one conservative op the
@@ -186,6 +192,7 @@ impl SmbPool {
             write_inflight: AtomicU32::new(INFLIGHT_MAX),
             read_inflight: AtomicU32::new(INFLIGHT_MAX),
             reset_since_grow: AtomicBool::new(false),
+            heal_lock: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -310,22 +317,29 @@ impl SmbPool {
         let Some(share) = self.share.get() else {
             return;
         };
-        for idx in 0..self.n {
-            let poisoned = self.slots.read().unwrap()[idx].client.is_poisoned();
-            if !poisoned {
-                continue;
-            }
-            match connect_with_retry(self.config.clone()).await {
-                Ok(client) => match client.tree_connect(share).await {
-                    Ok(tree_id) => {
-                        self.slots.write().unwrap()[idx] = Slot { client, tree_id };
-                        crate::slog!("[spiceio] healed poisoned smb connection (slot {idx})");
-                    }
-                    Err(e) => {
-                        crate::serr!("[spiceio] heal tree-connect failed (slot {idx}): {e}")
-                    }
-                },
-                Err(e) => crate::serr!("[spiceio] heal reconnect failed (slot {idx}): {e}"),
+        // Coalesce concurrent heals: serialize the reconnect pass so a burst of
+        // retrying requests doesn't fan out into competing reconnect storms.
+        // Callers that queue behind a heal find the slots it restored already
+        // healthy (the `is_poisoned` check) and skip them.
+        {
+            let _guard = self.heal_lock.lock().await;
+            for idx in 0..self.n {
+                let poisoned = self.slots.read().unwrap()[idx].client.is_poisoned();
+                if !poisoned {
+                    continue;
+                }
+                match connect_with_retry(self.config.clone()).await {
+                    Ok(client) => match client.tree_connect(share).await {
+                        Ok(tree_id) => {
+                            self.slots.write().unwrap()[idx] = Slot { client, tree_id };
+                            crate::slog!("[spiceio] healed poisoned smb connection (slot {idx})");
+                        }
+                        Err(e) => {
+                            crate::serr!("[spiceio] heal tree-connect failed (slot {idx}): {e}")
+                        }
+                    },
+                    Err(e) => crate::serr!("[spiceio] heal reconnect failed (slot {idx}): {e}"),
+                }
             }
         }
         // Re-probe larger I/O sizes now the server has had a moment to recover
