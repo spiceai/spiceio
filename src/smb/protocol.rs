@@ -373,6 +373,9 @@ pub enum CreateDisposition {
 pub enum CreateOptions {
     DirectoryFile = 0x00000001,
     NonDirectoryFile = 0x00000040,
+    /// FILE_DELETE_ON_CLOSE — the file/dir is deleted when its last handle
+    /// closes. OR with `DirectoryFile`/`NonDirectoryFile` for a delete-on-close.
+    DeleteOnClose = 0x00001000,
 }
 
 pub fn encode_create_request(

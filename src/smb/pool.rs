@@ -309,10 +309,12 @@ impl SmbPool {
         (slots[idx].client.clone(), slots[idx].tree_id)
     }
 
-    /// Pick a connection that is not poisoned. `pick` already skips poisoned
-    /// slots, so the common case (one connection dropped, the rest healthy)
-    /// costs nothing; only when every connection is down do we pay for a heal
-    /// and a brief pause before re-picking.
+    /// Pick a connection, preferring a healthy one. `pick` already skips
+    /// poisoned slots, so the common case (one connection dropped, the rest
+    /// healthy) costs nothing; only when every connection is down do we pay for
+    /// a heal and a brief pause before re-picking. If the whole pool is still
+    /// poisoned after that (the heal could not reconnect), this falls back to a
+    /// poisoned connection — the caller's op then fails fast and retries.
     pub async fn pick_live(&self) -> (Arc<SmbClient>, u32) {
         let (client, tree_id) = self.pick();
         if client.is_poisoned() {

@@ -352,7 +352,11 @@ impl ShareSession {
             if is_reset(&e) {
                 self.pool.note_write_reset();
             }
-            let _ = Self::delete_object_path_on(&client, tree_id, &smb_path).await;
+            // Clean up the partial object on a fresh connection — the one that
+            // just failed is likely poisoned, so reusing it would no-op the
+            // delete and leave the torn file behind.
+            let (dc, dt) = self.pick_live().await;
+            let _ = Self::delete_object_path_on(&dc, dt, &smb_path).await;
             return Err(e);
         }
 
@@ -376,7 +380,7 @@ impl ShareSession {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await?;
         Ok(())
@@ -758,7 +762,7 @@ impl ShareSession {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await?;
         Ok(())
@@ -774,7 +778,7 @@ impl ShareSession {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::DirectoryFile as u32 | 0x00001000,
+                CreateOptions::DirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
     }
@@ -937,7 +941,7 @@ impl ShareSession {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::DirectoryFile as u32 | 0x00001000,
+                CreateOptions::DirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
     }
@@ -1011,7 +1015,7 @@ impl ShareSession {
                     DesiredAccess::Delete as u32,
                     ShareAccess::Delete as u32,
                     CreateDisposition::Open as u32,
-                    CreateOptions::DirectoryFile as u32 | 0x00001000,
+                    CreateOptions::DirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
                 )
                 .await
                 .is_ok()
@@ -1032,7 +1036,7 @@ impl ShareSession {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::DirectoryFile as u32 | 0x00001000,
+                CreateOptions::DirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
     }
@@ -1367,7 +1371,7 @@ impl WalWriter {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
     }
@@ -1384,7 +1388,7 @@ impl WalWriter {
                 DesiredAccess::Delete as u32,
                 ShareAccess::Delete as u32,
                 CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32 | 0x00001000,
+                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
     }

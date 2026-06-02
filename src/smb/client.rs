@@ -223,6 +223,16 @@ impl SmbClient {
         }
     }
 
+    /// Mark the connection poisoned and best-effort shut the socket down. A
+    /// failed transport/framing/pipelined/compound op can leave unread responses
+    /// queued in the stream; closing the socket lets the server release the
+    /// session promptly and ensures the leftover bytes can never be misread as a
+    /// later reply (the poisoned flag already blocks reuse until the pool heals).
+    async fn poison(&self) {
+        self.poisoned.store(true, Ordering::Relaxed);
+        let _ = self.stream.lock().await.shutdown().await;
+    }
+
     /// Send a packet and receive a response, also returning the raw SMB2 response bytes
     /// (without NetBIOS header) for preauth hash computation.
     async fn send_recv_raw(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
@@ -241,7 +251,7 @@ impl SmbClient {
         // otherwise be misread as the next operation's reply).
         let r = self.send_recv_io(packet).await;
         if r.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
+            self.poison().await;
         }
         r
     }
@@ -583,7 +593,7 @@ impl SmbClient {
             .pipelined_read_io(tree_id, file_id, start_offset, chunk_size, count)
             .await;
         if r.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
+            self.poison().await;
         }
         r
     }
@@ -781,7 +791,7 @@ impl SmbClient {
             .pipelined_write_io(tree_id, file_id, start_offset, chunks)
             .await;
         if r.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
+            self.poison().await;
         }
         r
     }
@@ -992,7 +1002,7 @@ impl SmbClient {
         // stream is never reused.
         let r = self.send_compound_io(requests).await;
         if r.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
+            self.poison().await;
         }
         r
     }
