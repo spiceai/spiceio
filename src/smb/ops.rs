@@ -521,7 +521,11 @@ impl ShareSession {
         };
         let _ = client.close(tree_id, &file.file_id).await;
         if result.is_err() {
-            let _ = Self::delete_object_path_on(&client, tree_id, smb_path).await;
+            // Clean up the partial file on a fresh connection — the one that
+            // just failed is likely poisoned, so reusing it would no-op the
+            // delete and leave the torn part behind.
+            let (dc, dt) = self.pick_live().await;
+            let _ = Self::delete_object_path_on(&dc, dt, smb_path).await;
         }
         result
     }
@@ -1150,6 +1154,10 @@ pub(crate) fn is_reset(e: &io::Error) -> bool {
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::TimedOut
+            // A dropped pool connection can surface as NotConnected; the HTTP
+            // layer already maps it to a retryable 503, so the retry/resume
+            // paths must agree or they'd abort instead of reconnecting.
+            | io::ErrorKind::NotConnected
             // An overwhelmed NAS often closes the TCP connection with a FIN
             // (graceful close) mid-response rather than an RST, so `read_exact`
             // returns `UnexpectedEof` ("early eof") instead of a reset. In the
@@ -1314,9 +1322,10 @@ impl WalWriter {
         // temp to the final path. The rename retries on a transient reset by
         // reconnecting and re-opening the temp file (which still exists until the
         // rename completes), so a single PUT is not lost at the finish line. On
-        // unrecoverable failure, close the handle and delete the temp so we never
-        // leak a handle or orphan a temp file — the caller cannot abort() after
-        // commit takes self.
+        // unrecoverable failure, close the handle and best-effort delete the
+        // temp — the caller cannot abort() after commit takes self. The delete
+        // ignores errors (a poisoned connection may make it fail); any temp left
+        // behind is swept up by the startup WAL cleanup.
         if let Err(e) = self.flush().await {
             self.discard_temp().await;
             return Err(e);
