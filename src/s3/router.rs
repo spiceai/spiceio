@@ -1717,7 +1717,10 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
         // Transient, retryable conditions → 503 SlowDown (the standard S3
         // retryable status), logged at info level (not `serr!`) since they
         // are not bugs:
-        //   - ResourceBusy: sharing violation under concurrent access.
+        //   - ResourceBusy: sharing violation under concurrent access, or SMB
+        //     server capacity (too many sessions / insufficient resources /
+        //     request not accepted) — we surface the NTSTATUS detail in the
+        //     io error; healer / connect backoff will retry.
         //   - BrokenPipe/ConnectionReset/ConnectionAborted/NotConnected: the
         //     SMB server dropped a pool connection (common under heavy
         //     concurrent load); the healer reconnects it, so the client should
@@ -1727,7 +1730,11 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
         //   - UnexpectedEof: an overwhelmed NAS closed the connection with a
         //     FIN mid-response ("early eof"); the healer reconnects it, so the
         //     client should back off and retry rather than see a hard 500.
-        io::ErrorKind::ResourceBusy
+        //   - ConnectionRefused: TCP connect refused (server unreachable or
+        //     temporarily out of capacity/backlog); connect retry + healer
+        //     handle it.
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ResourceBusy
         | io::ErrorKind::BrokenPipe
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
@@ -1900,9 +1907,10 @@ mod tests {
 
     #[test]
     fn io_to_s3_error_maps_dropped_connection_to_retryable() {
-        // A pool connection the SMB server dropped under load must surface as a
-        // retryable 503, not a hard 500, so clients back off and retry.
+        // Connection and capacity errors (dropped conns under load, TCP refused,
+        // server session limits) must surface as retryable 503, not hard 500.
         for kind in [
+            io::ErrorKind::ConnectionRefused,
             io::ErrorKind::BrokenPipe,
             io::ErrorKind::ConnectionReset,
             io::ErrorKind::ConnectionAborted,

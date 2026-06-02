@@ -321,10 +321,16 @@ impl SmbClient {
 
         let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
-            crate::serr!("[spiceio] smb negotiate failed: 0x{:08X}", resp_hdr.status);
+            let st = resp_hdr.status;
+            crate::serr!("[spiceio] smb negotiate failed: 0x{:08X}", st);
+            let kind = if is_server_capacity_status(st) {
+                io::ErrorKind::ResourceBusy
+            } else {
+                io::ErrorKind::ConnectionRefused
+            };
             return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("negotiate failed: status=0x{:08X}", resp_hdr.status),
+                kind,
+                format!("negotiate failed: status=0x{:08X}", st),
             ));
         }
 
@@ -399,11 +405,26 @@ impl SmbClient {
 
         let (resp_hdr, ..) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
-            crate::serr!("[spiceio] smb auth failed: 0x{:08X}", resp_hdr.status);
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("authentication failed: status=0x{:08X}", resp_hdr.status),
-            ));
+            let st = resp_hdr.status;
+            if is_server_capacity_status(st) {
+                crate::slog!(
+                    "[spiceio] smb session setup rejected by server capacity: 0x{:08X}",
+                    st
+                );
+            } else {
+                crate::serr!("[spiceio] smb auth failed: 0x{:08X}", st);
+            }
+            let kind = if is_server_capacity_status(st) {
+                io::ErrorKind::ResourceBusy
+            } else {
+                io::ErrorKind::PermissionDenied
+            };
+            let msg = if is_server_capacity_status(st) {
+                format!("server capacity limit: status=0x{:08X}", st)
+            } else {
+                format!("authentication failed: status=0x{:08X}", st)
+            };
+            return Err(io::Error::new(kind, msg));
         }
 
         // Derive the signing key
@@ -449,17 +470,20 @@ impl SmbClient {
         let (resp_hdr, _resp_body) = self.send_recv(&packet).await?;
         let status = NtStatus::from_u32(resp_hdr.status);
         if status.is_error() {
+            let st = resp_hdr.status;
             crate::serr!(
                 "[spiceio] smb tree connect failed: '{}': 0x{:08X}",
                 share,
-                resp_hdr.status
+                st
             );
+            let kind = if is_server_capacity_status(st) {
+                io::ErrorKind::ResourceBusy
+            } else {
+                io::ErrorKind::NotFound
+            };
             return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "tree connect to '{}' failed: 0x{:08X}",
-                    share, resp_hdr.status
-                ),
+                kind,
+                format!("tree connect to '{}' failed: 0x{:08X}", share, st),
             ));
         }
 
@@ -1463,11 +1487,52 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
             format!("sharing violation: {path}"),
         ),
 
+        0xC000_009A => io::Error::new( // STATUS_INSUFFICIENT_RESOURCES
+            io::ErrorKind::ResourceBusy,
+            format!("insufficient resources: {path}"),
+        ),
+
+        0xC000_00CE => io::Error::new( // STATUS_TOO_MANY_SESSIONS
+            io::ErrorKind::ResourceBusy,
+            format!("too many sessions (server limit): {path}"),
+        ),
+
+        0xC000_00D0 => io::Error::new( // STATUS_REQUEST_NOT_ACCEPTED
+            io::ErrorKind::ResourceBusy,
+            format!("no more connections accepted by server: {path}"),
+        ),
+
+        0xC000_00CF => io::Error::new( // STATUS_SHARING_PAUSED
+            io::ErrorKind::ResourceBusy,
+            format!("sharing paused: {path}"),
+        ),
+
+        0xC000_0196 => io::Error::new( // STATUS_REMOTE_SESSION_LIMIT
+            io::ErrorKind::ResourceBusy,
+            format!("remote session limit exceeded: {path}"),
+        ),
+
         _ => {
             crate::serr!("[spiceio] smb error 0x{status:08X}: {path}");
             io::Error::other(format!("SMB error 0x{status:08X} for {path}"))
         }
     }
+}
+
+/// True for NTSTATUS values that indicate the SMB server has hit a connection,
+/// session, or resource limit and is refusing new sessions/connections.
+/// These surface as ResourceBusy (mapped to 503 SlowDown by the S3 layer)
+/// so clients retry, and the pool healer / connect backoff treat them as
+/// transient.
+pub(crate) fn is_server_capacity_status(status: u32) -> bool {
+    matches!(
+        status,
+        0xC000_009A // STATUS_INSUFFICIENT_RESOURCES
+            | 0xC000_00CE // STATUS_TOO_MANY_SESSIONS
+            | 0xC000_00D0 // STATUS_REQUEST_NOT_ACCEPTED
+            | 0xC000_00CF // STATUS_SHARING_PAUSED
+            | 0xC000_0196 // STATUS_REMOTE_SESSION_LIMIT
+    )
 }
 
 /// Sign a single SMB2 message in-place (no NetBIOS header prefix).
@@ -1536,6 +1601,35 @@ mod tests {
     fn maps_sharing_violation_to_resource_busy() {
         let e = smb_status_to_io_error(0xC000_0043, ".spiceio-wal\\01-0000");
         assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, ".spiceio-wal\\01-0000");
+    }
+
+    #[test]
+    fn maps_insufficient_resources_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC000009A, "conn");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, "insufficient resources");
+    }
+
+    #[test]
+    fn maps_too_many_sessions_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC00000CE, "srv");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, "too many sessions");
+    }
+
+    #[test]
+    fn maps_request_not_accepted_to_resource_busy() {
+        let e = smb_status_to_io_error(0xC00000D0, "share");
+        assert_kind_and_path(&e, io::ErrorKind::ResourceBusy, "no more connections");
+    }
+
+    #[test]
+    fn is_server_capacity_status_recognizes_common_limit_codes() {
+        assert!(is_server_capacity_status(0xC000009A));
+        assert!(is_server_capacity_status(0xC00000CE));
+        assert!(is_server_capacity_status(0xC00000D0));
+        assert!(is_server_capacity_status(0xC00000CF));
+        assert!(is_server_capacity_status(0xC0000196));
+        assert!(!is_server_capacity_status(0xC000000F)); // no such file
+        assert!(!is_server_capacity_status(0));
     }
 
     #[test]
