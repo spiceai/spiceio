@@ -22,6 +22,11 @@ jobs:
     runs-on: spiceai-macos
     permissions:
       contents: read
+    env:
+      # Pin the SMB connection pool to 8 for CI so the live test suites don't
+      # overwhelm the shared test NAS with full-core fan-out under concurrent
+      # load (the runner default would scale with cores).
+      SPICEIO_SMB_CONNECTIONS: "8"
 
     steps:
       - name: Check out repository
