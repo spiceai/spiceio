@@ -232,7 +232,11 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     buf.put_u16_le(dialect_count);
     buf.put_u16_le(0x0001); // SecurityMode: signing enabled
     buf.put_u16_le(0); // Reserved
-    buf.put_u32_le(0x00000041); // Capabilities: DFS | Leasing
+    // Capabilities: DFS (0x01) | LARGE_MTU (0x04) | ENCRYPTION (0x40).
+    // LARGE_MTU is required to use multi-credit reads/writes (>64 KiB in one
+    // request); without it, multi-credit I/O violates the credit/sequence
+    // window and the server resets the connection under load.
+    buf.put_u32_le(0x00000045);
     buf.put_slice(client_guid);
     buf.put_u32_le(ctx_offset); // NegotiateContextOffset
     buf.put_u16_le(2); // NegotiateContextCount
@@ -851,6 +855,23 @@ pub fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Multi-credit charge ──────────────────────────────────────────
+
+    #[test]
+    fn credit_charge_matches_smb2_rule() {
+        // CreditCharge = max(1, ceil(payload / 65536)). Single-credit up to and
+        // including 64 KiB; multi-credit above. These charges are also the
+        // MessageId stride the send paths must advance by.
+        assert_eq!(credit_charge_for(0), 1);
+        assert_eq!(credit_charge_for(1), 1);
+        assert_eq!(credit_charge_for(65536), 1); // exactly 64 KiB = 1 credit
+        assert_eq!(credit_charge_for(65537), 2);
+        assert_eq!(credit_charge_for(131072), 2); // 128 KiB
+        assert_eq!(credit_charge_for(262144), 4); // 256 KiB (default I/O)
+        assert_eq!(credit_charge_for(1048576), 16); // 1 MiB
+        assert_eq!(credit_charge_for(8 * 1024 * 1024), 128); // 8 MiB (server max)
+    }
 
     // ── Header encode/decode round-trip ──────────────────────────────
 

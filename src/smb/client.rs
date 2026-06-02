@@ -540,7 +540,11 @@ impl SmbClient {
         offset: u64,
         length: u32,
     ) -> io::Result<bytes::Bytes> {
-        let msg_id = self.next_message_id();
+        // Multi-credit commands (payload > 64 KiB) consume `credit_charge`
+        // sequence numbers, so advance the MessageId window by the charge.
+        let msg_id = self
+            .message_id
+            .fetch_add(credit_charge_for(length) as u64, Ordering::Relaxed);
         let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(length);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -621,9 +625,13 @@ impl SmbClient {
             ));
         }
 
-        // Allocate message IDs in a contiguous batch so we can map
-        // response.message_id → slot index via simple subtraction.
-        let base_msg_id = self.message_id.fetch_add(count as u64, Ordering::Relaxed);
+        // Multi-credit reads consume `credit_charge` sequence numbers each, so
+        // the MessageId window advances by count * charge and requests are
+        // spaced by `charge`. A response maps to its slot via that stride.
+        let charge = credit_charge_for(chunk_size) as u64;
+        let base_msg_id = self
+            .message_id
+            .fetch_add(count as u64 * charge, Ordering::Relaxed);
 
         // Each request: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 49
         // (read request fixed part incl. 1-byte buffer pad).
@@ -635,7 +643,7 @@ impl SmbClient {
         for i in 0..count {
             packet_starts.push(buf.len());
             let offset = start_offset + (i as u64) * (chunk_size as u64);
-            let msg_id = base_msg_id + i as u64;
+            let msg_id = base_msg_id + i as u64 * charge;
             let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(chunk_size);
             hdr.session_id = self.session_id;
             hdr.tree_id = tree_id;
@@ -687,16 +695,17 @@ impl SmbClient {
                 continue;
             }
 
-            let slot = (header.message_id.wrapping_sub(base_msg_id)) as usize;
-            if slot >= count {
+            let delta = header.message_id.wrapping_sub(base_msg_id);
+            if delta % charge != 0 || (delta / charge) as usize >= count {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "unexpected message_id {} (base={}, count={})",
-                        header.message_id, base_msg_id, count
+                        "unexpected message_id {} (base={}, count={}, charge={})",
+                        header.message_id, base_msg_id, count, charge
                     ),
                 ));
             }
+            let slot = (delta / charge) as usize;
 
             let status = NtStatus::from_u32(header.status);
             if status == NtStatus::EndOfFile {
@@ -738,7 +747,11 @@ impl SmbClient {
         offset: u64,
         data: &[u8],
     ) -> io::Result<u32> {
-        let msg_id = self.next_message_id();
+        // Multi-credit commands consume `credit_charge` sequence numbers.
+        let msg_id = self.message_id.fetch_add(
+            credit_charge_for(data.len() as u32) as u64,
+            Ordering::Relaxed,
+        );
         let mut hdr = Header::new(Command::Write, msg_id).with_credit_charge(data.len() as u32);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -808,7 +821,14 @@ impl SmbClient {
         }
 
         let n = chunks.len();
-        let base_msg_id = self.message_id.fetch_add(n as u64, Ordering::Relaxed);
+        // Multi-credit writes consume `credit_charge` sequence numbers each;
+        // advance the window by the total charge and space each request by its
+        // own charge (chunks may differ in size, e.g. a short final chunk).
+        let total_charge: u64 = chunks
+            .iter()
+            .map(|c| credit_charge_for(c.len() as u32) as u64)
+            .sum();
+        let base_msg_id = self.message_id.fetch_add(total_charge, Ordering::Relaxed);
 
         // Each packet: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 48
         // (write request fixed part) + chunk data.
@@ -821,9 +841,11 @@ impl SmbClient {
         let mut packet_starts: Vec<usize> = Vec::with_capacity(n + 1);
 
         let mut offset = start_offset;
-        for (i, chunk) in chunks.iter().enumerate() {
+        let mut cum_charge = 0u64;
+        for chunk in chunks.iter() {
             packet_starts.push(buf.len());
-            let msg_id = base_msg_id + i as u64;
+            let msg_id = base_msg_id + cum_charge;
+            cum_charge += credit_charge_for(chunk.len() as u32) as u64;
             let mut hdr =
                 Header::new(Command::Write, msg_id).with_credit_charge(chunk.len() as u32);
             hdr.session_id = self.session_id;

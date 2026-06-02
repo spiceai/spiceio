@@ -130,12 +130,6 @@ jobs:
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
           SPICEIO_BIND: 127.0.0.1:18335
           AWS_DEFAULT_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
-          # Calibrate the stress fan-out to the shared test NAS: 12 concurrent
-          # small ops and 4 concurrent 1 MiB streams keep the suite exercising
-          # concurrency/contention without driving the NAS past what it sustains
-          # after the earlier suites (local runs keep the higher defaults).
-          SPICEIO_STRESS_CONCURRENCY: "12"
-          SPICEIO_STRESS_LARGE_N: "4"
         run: ./scripts/stress-concurrent.sh
 
       - name: Build release artifact
