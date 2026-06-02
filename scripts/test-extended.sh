@@ -28,7 +28,7 @@ PREFIX="ext-$$"
 TMPDIR_BASE=$(mktemp -d /tmp/spiceio-ext.XXXXXX)
 PASS=0
 FAIL=0
-CONCURRENCY="${SPICEIO_EXT_CONCURRENCY:-8}"
+CONCURRENCY="${SPICEIO_EXT_CONCURRENCY:-128}"
 CURL_TIMEOUT="${SPICEIO_EXT_TIMEOUT:-60}"
 
 # Capture spiceio stderr so the post-run guard can flag unexpected
@@ -117,6 +117,7 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
+SPICEIO_SMB_CONNECTIONS=128 \
 "$SPICEIO_BIN" 2> >(tee "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
@@ -430,6 +431,14 @@ $AWS s3 cp "s3://${BUCKET}/${PREFIX}/cancel-4m" "${SC_DIR}/dl-after" --quiet
 ORIG_MD5=$(md5 -q "${SC_DIR}/src")
 GOT_MD5=$(md5 -q "${SC_DIR}/dl-after")
 assert_eq "full GET after cancellation succeeds" "$ORIG_MD5" "$GOT_MD5"
+
+# ── Session backoff exercise verification (high conn at startup) ────────────
+if grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICEIO_STDERR" 2>/dev/null; then
+    echo "  PASS: session backoff (capacity reduction) messages seen in spiceio logs"
+    PASS=$((PASS + 1))
+else
+    echo "  NOTE: no capacity messages in extended test (server allowed full 128 SMB conns)"
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # Stderr guard

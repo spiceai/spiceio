@@ -121,6 +121,7 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
+SPICEIO_SMB_CONNECTIONS=128 \
 "$SPICEIO_BIN" 2> >(tee -a "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
@@ -285,6 +286,7 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
+SPICEIO_SMB_CONNECTIONS=128 \
 SPICEIO_LOG_FILE="$SPICEIO_LOG2" \
 "$SPICEIO_BIN" 2> >(tee -a "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID2=$!
@@ -416,6 +418,15 @@ if [[ "${CACHE_HITS:-0}" -gt 0 && "${WRITE_ERRORS:-0}" -eq 0 ]]; then
 else
     echo "[test] FAIL: expected cache hits > 0 (got ${CACHE_HITS:-0}) and write errors == 0 (got ${WRITE_ERRORS:-0})"
     exit 1
+fi
+
+# ── Session backoff exercise verification ───────────────────────────────────
+# (with SPICEIO_SMB_CONNECTIONS=128 on startup)
+if grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICEIO_STDERR" 2>/dev/null; then
+    echo "  PASS: session backoff (capacity reduction) messages seen in spiceio logs"
+    PASS=$((PASS + 1))
+else
+    echo "  NOTE: no capacity reduction messages in sccache test (server allowed 128 conns)"
 fi
 
 # ── Stderr guard ────────────────────────────────────────────────────────────

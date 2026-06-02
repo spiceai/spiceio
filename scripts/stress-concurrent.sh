@@ -416,11 +416,11 @@ echo "  integrity: $((PASS - PREV_PASS))/${LARGE_N} verified"
 # since it depends on the live server's session limit).
 # ════════════════════════════════════════════════════════════════════════════
 
-if grep -q -i 'capacity\|reduced from' "$SPICEIO_STDERR" 2>/dev/null; then
+if grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICEIO_STDERR" 2>/dev/null; then
     echo "  PASS: session backoff (capacity reduction) messages seen in spiceio logs"
     PASS=$((PASS + 1))
 else
-    echo "  NOTE: no 'capacity' or 'reduced from' messages in logs (server allowed all ${SPICEIO_SMB_CONNECTIONS} SMB connections? rerun against a tighter server limit to exercise backoff path)"
+    echo "  NOTE: no capacity reduction messages in logs (server allowed all ${SPICEIO_SMB_CONNECTIONS} SMB connections? rerun against a tighter server limit to exercise backoff path)"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -172,26 +172,40 @@ impl SmbPool {
                 let cfg = config.clone();
                 joins.push(tokio::spawn(async move { connect_with_retry(cfg).await }));
             }
-            for join in joins {
-                let res: io::Result<Arc<SmbClient>> = join
-                    .await
-                    .map_err(|e| io::Error::other(format!("spawn failed: {e}")))?;
-                match res {
-                    Ok(client) => {
+            let mut pending = joins.into_iter();
+            let mut fatal: Option<io::Error> = None;
+            for join in pending.by_ref() {
+                match join.await {
+                    Ok(Ok(client)) => {
                         clients.push(client);
                         actual_n += 1;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
+                        // Server at capacity → stop adding and use what we have.
+                        // Any other failure is fatal for the whole connect.
                         if super::client::is_capacity_error(&e) {
                             crate::slog!(
                                 "[spiceio] smb server at capacity, using only {actual_n} of {requested_n} requested connections"
                             );
-                            break;
                         } else {
-                            return Err(e);
+                            fatal = Some(e);
                         }
+                        break;
+                    }
+                    Err(e) => {
+                        fatal = Some(io::Error::other(format!("spawn failed: {e}")));
+                        break;
                     }
                 }
+            }
+            // Abort the connections we decided not to use: dropping a JoinHandle
+            // detaches the task, which would keep opening SMB sessions in the
+            // background against an already-capacity-limited server.
+            for join in pending {
+                join.abort();
+            }
+            if let Some(e) = fatal {
+                return Err(e);
             }
             crate::slog!("[spiceio] smb pool: {actual_n} connections ready");
         }
@@ -356,21 +370,20 @@ impl SmbPool {
         (client, tree_id)
     }
 
-    /// Reduce the active pool size to `new_size` (truncating slots). Called
-    /// when the server reports capacity limits during initial connect or heal
-    /// reconnect. The dropped connections are released; we simply use fewer
-    /// going forward (user can restart the proxy with a lower
-    /// SPICEIO_SMB_CONNECTIONS if the server has a hard low limit).
-    fn shrink(&self, new_size: usize) {
-        if new_size == 0 {
-            return;
-        }
+    /// Back the active pool off by one connection (truncating the last slot).
+    /// Called when a heal reconnect hits a server capacity limit: the server
+    /// can't sustain the current count, so we reduce by one — based on the
+    /// current size, NOT the failing slot index, which could discard most of a
+    /// healthy pool. Repeated capacity errors shrink it further, one at a time.
+    /// Keeps at least one slot (a poisoned last slot is retried on the next
+    /// heal; restart with a lower SPICEIO_SMB_CONNECTIONS for a hard low limit).
+    fn shrink_by_one(&self) {
         let mut slots = self.slots.write().unwrap();
         let old = self.n.load(Ordering::Relaxed);
-        if new_size >= old {
+        if old <= 1 {
             return;
         }
-        let new_size = new_size.min(slots.len());
+        let new_size = (old - 1).min(slots.len());
         slots.truncate(new_size);
         self.n.store(new_size, Ordering::Relaxed);
         crate::slog!(
@@ -424,7 +437,7 @@ impl SmbPool {
                         }
                         Err(e) => {
                             if super::client::is_capacity_error(&e) {
-                                self.shrink(idx);
+                                self.shrink_by_one();
                                 crate::slog!(
                                     "[spiceio] heal tree-connect hit server capacity, reduced pool (slot {idx})"
                                 );
@@ -436,7 +449,7 @@ impl SmbPool {
                     },
                     Err(e) => {
                         if super::client::is_capacity_error(&e) {
-                            self.shrink(idx);
+                            self.shrink_by_one();
                             crate::slog!(
                                 "[spiceio] heal reconnect hit server capacity, reduced pool (slot {idx})"
                             );

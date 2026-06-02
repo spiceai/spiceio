@@ -321,10 +321,15 @@ impl SmbClient {
 
         let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
+            // A negotiate NTSTATUS failure is a protocol-level rejection over an
+            // already-established TCP connection (e.g. unsupported dialect),
+            // typically permanent — surface it as InvalidData, not
+            // ConnectionRefused, which the S3 layer treats as a retryable 503.
+            // ConnectionRefused is reserved for an actual TCP connect refusal.
             return Err(handshake_error(
                 "negotiate",
                 resp_hdr.status,
-                io::ErrorKind::ConnectionRefused,
+                io::ErrorKind::InvalidData,
             ));
         }
 
