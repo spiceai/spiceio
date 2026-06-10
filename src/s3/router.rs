@@ -1451,19 +1451,14 @@ async fn handle_upload_part_copy(
         None => None,
     };
 
-    // Bound the in-memory part the same way UploadPart bounds a body part.
-    if let Some((s, e)) = range
-        && e.saturating_sub(s).saturating_add(1) > MAX_BUFFERED_BODY as u64
-    {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "EntityTooLarge",
-            "Copy-source range exceeds the maximum part size",
-        );
-    }
-
-    let (src_meta, data) = match state.share.read_range(&src_key, range).await {
-        Ok(v) => v,
+    // Preflight the source size and resolve an explicit byte range *before*
+    // reading, so a part copy never buffers more than MAX_BUFFERED_BODY. A
+    // range-less copy (`x-amz-copy-source-range` absent) would otherwise pull
+    // the whole source object into memory and only reject it afterward — a
+    // client could omit the range to force buffering an arbitrarily large
+    // object and OOM the proxy.
+    let src_meta = match state.share.head_object(&src_key).await {
+        Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return error_response(
                 StatusCode::NOT_FOUND,
@@ -1471,41 +1466,74 @@ async fn handle_upload_part_copy(
                 "The specified source key does not exist.",
             );
         }
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "InvalidRange",
-                "The x-amz-copy-source-range is not satisfiable",
-            );
-        }
         Err(e) => return io_to_s3_error(&e),
     };
-    // A whole-object copy that buffered past the cap (range was None, so the
-    // size wasn't known until the read) is rejected too.
-    if data.len() > MAX_BUFFERED_BODY {
+    let size = src_meta.size;
+    let (start, end) = match range {
+        Some((s, e)) => {
+            if s > e || s >= size {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRange",
+                    "The x-amz-copy-source-range is not satisfiable",
+                );
+            }
+            (s, e.min(size - 1)) // size > 0 here since s < size
+        }
+        None if size == 0 => (0, 0), // empty source → empty part
+        None => (0, size - 1),
+    };
+    let span = if size == 0 { 0 } else { end - start + 1 };
+    if span > MAX_BUFFERED_BODY as u64 {
         return error_response(
             StatusCode::BAD_REQUEST,
             "EntityTooLarge",
-            "Copy-source object exceeds the maximum part size",
+            "Copy-source range exceeds the maximum part size",
         );
     }
 
-    let etag = {
-        let data = data.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::crypto::hex_encode(&crate::crypto::sha256(&data))
-        })
-        .await
-        {
-            Ok(e) => e,
-            Err(e) => {
-                crate::serr!("[spiceio] upload-part-copy hash task failed: {e}");
+    // Read exactly the validated range — bounded by the check above, so memory
+    // is capped regardless of the source object's size.
+    let data = if span == 0 {
+        Vec::new()
+    } else {
+        match state.share.read_range(&src_key, Some((start, end))).await {
+            Ok((_, d)) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    "hash failed",
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "The specified source key does not exist.",
                 );
             }
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRange",
+                    "The x-amz-copy-source-range is not satisfiable",
+                );
+            }
+            Err(e) => return io_to_s3_error(&e),
+        }
+    };
+
+    // Hash on the blocking pool. Move `data` into the task and hand it back
+    // alongside the ETag rather than cloning it — `data` is a `Vec` (a real
+    // copy), so cloning would double peak memory for every part.
+    let (etag, data) = match tokio::task::spawn_blocking(move || {
+        let etag = crate::crypto::hex_encode(&crate::crypto::sha256(&data));
+        (etag, data)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            crate::serr!("[spiceio] upload-part-copy hash task failed: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "hash failed",
+            );
         }
     };
 
