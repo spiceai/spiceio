@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 
+use spiceio::crash;
 use spiceio::log;
 use spiceio::s3;
 use spiceio::serr;
@@ -50,6 +51,43 @@ struct Config {
     smb_max_io: u32,
 }
 
+/// Exit nonzero after draining the async logger. The log writer thread dies
+/// with the process, so an `exit()` immediately after `serr!`/`slog!` would
+/// drop the just-queued line (the channel is non-blocking and drains on its
+/// own thread). Flushing first guarantees the message reaches stderr and the
+/// log file — important for one-line startup/config errors.
+fn flush_and_exit(code: i32) -> ! {
+    log::flush(Duration::from_millis(500));
+    std::process::exit(code);
+}
+
+/// Read a required env var, exiting with a clean config error (not a panic /
+/// crash report) when missing or empty.
+fn require_env(name: &str) -> String {
+    match env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            serr!("[spiceio] {name} is required");
+            flush_and_exit(1);
+        }
+    }
+}
+
+/// Parse an optional env var, warning (instead of silently defaulting) when a
+/// value is present but unparsable — a misconfiguration worth surfacing.
+fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match env::var(name) {
+        Ok(raw) => match raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                serr!("[spiceio] {name}={raw} is not valid; using default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 impl Config {
     fn from_env() -> Self {
         Self {
@@ -59,31 +97,22 @@ impl Config {
                     Ok(addr) => addr,
                     Err(_) => {
                         serr!("[spiceio] SPICEIO_BIND is not a valid socket address: {raw}");
-                        std::process::exit(1);
+                        flush_and_exit(1);
                     }
                 }
             },
-            smb_server: env::var("SPICEIO_SMB_SERVER").expect("SPICEIO_SMB_SERVER is required"),
-            smb_port: env::var("SPICEIO_SMB_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(445),
-            smb_username: env::var("SPICEIO_SMB_USER").expect("SPICEIO_SMB_USER is required"),
-            smb_password: env::var("SPICEIO_SMB_PASS").expect("SPICEIO_SMB_PASS is required"),
+            smb_server: require_env("SPICEIO_SMB_SERVER"),
+            smb_port: parse_env_or("SPICEIO_SMB_PORT", 445),
+            smb_username: require_env("SPICEIO_SMB_USER"),
+            smb_password: require_env("SPICEIO_SMB_PASS"),
             smb_domain: env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
-            smb_share: env::var("SPICEIO_SMB_SHARE").expect("SPICEIO_SMB_SHARE is required"),
+            smb_share: require_env("SPICEIO_SMB_SHARE"),
             bucket_name: env::var("SPICEIO_BUCKET").unwrap_or_else(|_| {
                 env::var("SPICEIO_SMB_SHARE").unwrap_or_else(|_| "data".into())
             }),
             region: env::var("SPICEIO_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            smb_connections: env::var("SPICEIO_SMB_CONNECTIONS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(default_pool_size),
-            smb_max_io: env::var("SPICEIO_SMB_MAX_IO")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
+            smb_connections: parse_env_or("SPICEIO_SMB_CONNECTIONS", default_pool_size()),
+            smb_max_io: parse_env_or("SPICEIO_SMB_MAX_IO", 0),
         }
     }
 }
@@ -107,7 +136,30 @@ async fn main() {
         return;
     }
 
-    log::init(env::var("SPICEIO_LOG_FILE").ok().as_deref());
+    // Treat an empty SPICEIO_LOG_FILE as unset: CI and the test scripts may
+    // forward the variable unconditionally (`SPICEIO_LOG_FILE="${VAR:-}"`), and
+    // opening the path "" would otherwise fail and exit at startup.
+    let log_file = env::var("SPICEIO_LOG_FILE").ok().filter(|s| !s.is_empty());
+    log::init(log_file.as_deref());
+    // Crash reporting (panic hook + fatal-signal handlers) — as early as
+    // possible so every later failure leaves a report on stderr + log file.
+    crash::install(log_file.as_deref());
+
+    // Hidden: `--crash-test <panic|segv|abort>` deliberately crashes through
+    // the real pipeline so the reporting path itself is testable end-to-end.
+    {
+        let args: Vec<String> = env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--crash-test") {
+            let mode = args.get(i + 1).map(String::as_str).unwrap_or("panic");
+            crash::crash_test(mode);
+        }
+    }
+
+    slog!(
+        "[spiceio] v{} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
 
     let config = Config::from_env();
 
@@ -124,14 +176,14 @@ async fn main() {
                         Some(n) if n - start_port <= 100 => n,
                         _ => {
                             serr!("no available port in range {start_port}–{}", addr.port());
-                            std::process::exit(1);
+                            flush_and_exit(1);
                         }
                     };
                     addr.set_port(next);
                 }
                 Err(e) => {
                     serr!("failed to bind TCP listener: {e}");
-                    std::process::exit(1);
+                    flush_and_exit(1);
                 }
             }
         }
@@ -156,15 +208,30 @@ async fn main() {
         max_io_size: config.smb_max_io,
     };
 
-    let pool = SmbPool::connect(smb_config, config.smb_connections)
-        .await
-        .expect("failed to connect to SMB server");
+    // Startup connection failures are operational errors, not crashes —
+    // report them cleanly (server, share, cause) and exit nonzero.
+    let pool = match SmbPool::connect(smb_config, config.smb_connections).await {
+        Ok(p) => p,
+        Err(e) => {
+            serr!(
+                "[spiceio] failed to connect to SMB server {}:{}: {e}",
+                config.smb_server,
+                config.smb_port
+            );
+            flush_and_exit(1);
+        }
+    };
 
-    let share = Arc::new(
-        ShareSession::connect(pool, &config.smb_share)
-            .await
-            .expect("failed to connect to SMB share"),
-    );
+    let share = match ShareSession::connect(pool, &config.smb_share).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            serr!(
+                "[spiceio] failed to connect to SMB share '{}': {e}",
+                config.smb_share
+            );
+            flush_and_exit(1);
+        }
+    };
 
     // Clean up orphaned WAL temp files and stale multipart upload dirs from
     // prior crashes (the in-memory upload map does not survive a restart).
@@ -217,10 +284,15 @@ async fn main() {
                     for part in upload.parts.values() {
                         state.share.delete_temp(&part.temp_path).await;
                     }
+                    // Delete the initiate-time marker file too — without this
+                    // the directory is never empty and remove_dir fails, so
+                    // reaped upload dirs would pile up until the next restart.
+                    let temp_dir = MultipartStore::temp_dir(&upload.upload_id);
                     state
                         .share
-                        .remove_dir(&MultipartStore::temp_dir(&upload.upload_id))
+                        .delete_temp(&format!("{temp_dir}\\marker"))
                         .await;
+                    state.share.remove_dir(&temp_dir).await;
                 }
                 if !expired.is_empty() {
                     slog!(
@@ -232,8 +304,21 @@ async fn main() {
         });
     }
 
+    // SIGTERM (the standard service-manager stop signal) triggers the same
+    // graceful shutdown as Ctrl-C. Registration failing is exceptional; fall
+    // back to a never-resolving future so SIGINT still works.
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+
     // Accept loop
     loop {
+        let term = async {
+            match sigterm.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer_addr) = match accepted {
@@ -268,9 +353,17 @@ async fn main() {
                 });
             }
             _ = signal::ctrl_c() => {
-                slog!("\n[spiceio] shutting down");
+                slog!("\n[spiceio] shutting down (SIGINT)");
+                break;
+            }
+            _ = term => {
+                slog!("[spiceio] shutting down (SIGTERM)");
                 break;
             }
         }
     }
+
+    // Push the final log lines (including the shutdown notice) to disk before
+    // the process exits and takes the writer thread with it.
+    log::flush(Duration::from_millis(500));
 }

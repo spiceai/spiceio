@@ -100,7 +100,10 @@ pub struct Header {
     pub command: u16,
     pub credit_charge: u16,
     pub status: u32,
-    pub credits_requested: u16,
+    /// `CreditRequest` in requests (credits we ask the server to grant),
+    /// `CreditResponse` in responses (credits the server granted). The client
+    /// banks every response's grant into its per-connection credit balance.
+    pub credits: u16,
     pub flags: u32,
     pub next_command: u32,
     pub message_id: u64,
@@ -114,7 +117,9 @@ impl Header {
             command: command as u16,
             credit_charge: 1,
             status: 0,
-            credits_requested: 256,
+            // Ask for a healthy window on every request so the server keeps
+            // the connection's credit balance topped up for pipelined bursts.
+            credits: 256,
             flags: 0,
             next_command: 0,
             message_id,
@@ -137,7 +142,7 @@ impl Header {
         buf.put_u16_le(self.credit_charge); // 6: CreditCharge
         buf.put_u32_le(self.status); // 8: Status
         buf.put_u16_le(self.command); // 12: Command
-        buf.put_u16_le(self.credits_requested); // 14: CreditRequest
+        buf.put_u16_le(self.credits); // 14: CreditRequest/CreditResponse
         buf.put_u32_le(self.flags); // 16: Flags
         buf.put_u32_le(self.next_command); // 20: NextCommand
         buf.put_u64_le(self.message_id); // 24: MessageID
@@ -162,7 +167,7 @@ impl Header {
         let credit_charge = (&buf[..2]).get_u16_le();
         let status = (&buf[2..6]).get_u32_le();
         let command = (&buf[6..8]).get_u16_le();
-        let credits_requested = (&buf[8..10]).get_u16_le();
+        let credits = (&buf[8..10]).get_u16_le();
         let flags = (&buf[10..14]).get_u32_le();
         let next_command = (&buf[14..18]).get_u32_le();
         let message_id = (&buf[18..26]).get_u64_le();
@@ -175,7 +180,7 @@ impl Header {
             command,
             credit_charge,
             status,
-            credits_requested,
+            credits,
             flags,
             next_command,
             message_id,
@@ -195,11 +200,14 @@ pub fn credit_charge_for(payload_size: u32) -> u16 {
 
 /// SMB 3.1.x dialect family
 pub const DIALECT_SMB3_1_1: u16 = 0x0311;
-pub const DIALECT_SMB3_0_2: u16 = 0x0302;
-pub const DIALECT_SMB3_0_0: u16 = 0x0300;
 
-// Offered dialects in preference order (highest first)
-const DIALECTS: [u16; 3] = [DIALECT_SMB3_1_1, DIALECT_SMB3_0_2, DIALECT_SMB3_0_0];
+// Offer 3.1.1 only. Our signing-key derivation is the 3.1.1 KDF
+// (preauth-integrity-hash context, "SMBSigningKey" label); SMB 3.0.x derives
+// signing keys differently ("SMB2AESCMAC"/"SmbSign"), so a server that
+// negotiated 3.0.x would reject every signed request we send. Offering a
+// dialect we cannot actually sign for turns "unsupported server" into a
+// confusing mid-session auth failure — refuse it at negotiate instead.
+const DIALECTS: [u16; 1] = [DIALECT_SMB3_1_1];
 
 // Negotiate context types for SMB 3.1.1
 const SMB2_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;
@@ -898,6 +906,8 @@ mod tests {
         hdr.session_id = 0xDEAD;
         hdr.tree_id = 7;
         hdr.flags = 0x04;
+        hdr.credit_charge = 4;
+        hdr.credits = 33;
 
         let mut buf = BytesMut::with_capacity(64);
         hdr.encode(&mut buf);
@@ -908,6 +918,10 @@ mod tests {
         assert_eq!(decoded.session_id, 0xDEAD);
         assert_eq!(decoded.tree_id, 7);
         assert_eq!(decoded.flags, 0x04);
+        assert_eq!(decoded.credit_charge, 4);
+        // The credits field round-trips — credit accounting banks this value
+        // from every response (where it is CreditResponse, the grant).
+        assert_eq!(decoded.credits, 33);
     }
 
     #[test]

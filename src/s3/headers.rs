@@ -5,6 +5,7 @@ use http::HeaderMap;
 // ── Standard S3 request headers ─────────────────────────────────────────────
 
 pub const X_AMZ_COPY_SOURCE: &str = "x-amz-copy-source";
+pub const X_AMZ_COPY_SOURCE_RANGE: &str = "x-amz-copy-source-range";
 
 // ── Conditional headers ─────────────────────────────────────────────────────
 
@@ -120,7 +121,7 @@ pub fn parse_http_date(s: &str) -> Option<u64> {
     let hour: u64 = time_parts[0].parse().ok()?;
     let min: u64 = time_parts[1].parse().ok()?;
     let sec: u64 = time_parts[2].parse().ok()?;
-    Some(date_to_epoch(year, month, day, hour, min, sec))
+    date_to_epoch(year, month, day, hour, min, sec)
 }
 
 fn parse_iso8601(s: &str) -> Option<u64> {
@@ -139,7 +140,7 @@ fn parse_iso8601(s: &str) -> Option<u64> {
     let min: u64 = tp[1].parse().ok()?;
     let sec_str = tp[2].split('.').next().unwrap_or("0");
     let sec: u64 = sec_str.parse().ok()?;
-    Some(date_to_epoch(year, month, day, hour, min, sec))
+    date_to_epoch(year, month, day, hour, min, sec)
 }
 
 fn month_number(s: &str) -> Option<u64> {
@@ -160,7 +161,23 @@ fn month_number(s: &str) -> Option<u64> {
     })
 }
 
-fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> u64 {
+fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> Option<u64> {
+    // These fields come from client-supplied headers (If-Modified-Since etc.).
+    // Out-of-range values would underflow the unsigned arithmetic below
+    // (`year - 1` for year 0, `+ day - 1` for day 0) — reject them so a
+    // hostile header can't panic a debug build or wrap in release. Pre-1970
+    // dates are also rejected: epochs are u64 throughout, and "before every
+    // object's mtime" and "invalid, condition ignored" behave identically for
+    // the conditional-request comparisons these feed.
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
     // Compute days from civil date (algorithm from Howard Hinnant)
     let (y, m) = if month <= 2 {
         (year - 1, month + 9)
@@ -172,7 +189,7 @@ fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64)
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    days * 86400 + hour * 3600 + min * 60 + sec
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 /// Generate a unique request ID.
@@ -338,7 +355,7 @@ mod tests {
     #[test]
     fn parse_http_date_rfc7231() {
         // date_to_epoch independently verified
-        assert_eq!(date_to_epoch(1994, 11, 6, 8, 49, 37), 784111777);
+        assert_eq!(date_to_epoch(1994, 11, 6, 8, 49, 37), Some(784111777));
 
         // IMF-fixdate parser: "Day, DD Mon YYYY HH:MM:SS GMT"
         let input = "Sun, 06 Nov 1994 08:49:37 GMT";
@@ -371,6 +388,21 @@ mod tests {
     #[test]
     fn parse_http_date_invalid() {
         assert!(parse_http_date("not a date").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_rejects_out_of_range_fields() {
+        // Hostile/garbage header values must return None, not underflow the
+        // civil-date arithmetic (year 0 → `year - 1`, day 0 → `+ day - 1`).
+        assert!(parse_http_date("0000-01-01T00:00:00Z").is_none());
+        assert!(parse_http_date("2024-03-00T00:00:00Z").is_none());
+        assert!(parse_http_date("2024-00-10T00:00:00Z").is_none());
+        assert!(parse_http_date("2024-13-10T00:00:00Z").is_none());
+        assert!(parse_http_date("Sun, 00 Nov 0000 08:49:37 GMT").is_none());
+        assert!(parse_http_date("1969-12-31T23:59:59Z").is_none());
+        assert!(parse_http_date("2024-01-01T99:99:99Z").is_none());
+        // Boundary values still parse.
+        assert_eq!(parse_http_date("1970-01-01T00:00:00Z"), Some(0));
     }
 
     // ── date round-trip ──────────────────────────────────────────────

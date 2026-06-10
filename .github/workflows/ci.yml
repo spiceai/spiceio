@@ -58,6 +58,13 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked
 
+      - name: Prepare crash-log directory
+        # spiceio writes a crash report (panic or fatal signal) to its
+        # SPICEIO_LOG_FILE synchronously before exiting. The live-test steps
+        # below point that at this directory so a crash during the run is
+        # captured and uploaded as an artifact for offline diagnosis.
+        run: mkdir -p "${{ github.workspace }}/crash-logs"
+
       - name: Check SMB credentials
         run: |
           if [[ -n "$SPICEIO_SMB_PASS" ]]; then
@@ -99,6 +106,7 @@ jobs:
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
           SPICEIO_BUCKET: ${{ vars.SPICEIO_BUCKET || 'spiceio' }}
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/sccache.log
         run: ./scripts/test-sccache.sh
 
       - name: Run extended S3 operations test
@@ -115,6 +123,7 @@ jobs:
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
           SPICEIO_BIND: 127.0.0.1:18336
           AWS_DEFAULT_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/extended.log
         run: ./scripts/test-extended.sh
 
       - name: Run concurrent stress test
@@ -130,7 +139,21 @@ jobs:
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
           SPICEIO_BIND: 127.0.0.1:18335
           AWS_DEFAULT_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/stress.log
         run: ./scripts/stress-concurrent.sh
+
+      - name: Upload crash logs
+        # Always run, even when a prior step failed (a crash fails the step):
+        # this is exactly when the report matters. The debug binary under test
+        # is not stripped, so its reports symbolize in place; the release dSYM
+        # below covers the shipped artifact.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spiceio-crash-logs-${{ github.run_id }}
+          path: crash-logs/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Build release artifact
         run: cargo build --release --locked --bin spiceio
@@ -138,6 +161,11 @@ jobs:
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
+          # Ship the dSYM alongside the binary: release builds are stripped, so
+          # a production crash report's raw addresses are symbolized offline
+          # against this bundle (`atos -o spiceio.dSYM/... -l <image base>`).
           name: spiceio-${{ runner.os }}-${{ runner.arch }}
-          path: target/release/spiceio
+          path: |
+            target/release/spiceio
+            target/release/spiceio.dSYM
           if-no-files-found: error

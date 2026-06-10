@@ -18,8 +18,10 @@ S3 client  --->  spiceio (HTTP :8333)  --->  SMB server (TCP :445)
 - **Zero-mount design** -- speaks SMB 3.1.x natively over TCP, never touches the local filesystem
 - **Full S3 compatibility** for common operations: Get/Put/Copy/Delete/Head Object, ListObjects (v1 & v2), ListBuckets, multipart uploads, range + conditional requests
 - **SMB2 compounding** -- batches Create+Read+Close or Create+Write+Close into single round trips for small file performance
+- **Credit-window flow control** -- tracks the server's SMB2 credit grants per connection and sizes pipelined batches to the granted window, so sustained bursts never violate the protocol's sequence window
 - **Streaming I/O** -- GetObject and PutObject stream directly between HTTP and SMB without buffering entire files
 - **Non-blocking logging** -- timestamped stdout/stderr with optional file tee via `SPICEIO_LOG_FILE`; dedicated writer thread, never stalls the proxy
+- **Crash reporting built in** -- panics and fatal signals (SIGSEGV/SIGBUS/...) always leave a diagnosable report on stderr and in the log file: version, uptime, panic location, registers, fault address, and a backtrace with the info needed to symbolize stripped release builds offline
 - **Simple config** -- everything via environment variables, single binary, `--version` flag
 - **Zero external crypto** -- NTLMv2 auth and AES-CMAC signing via macOS CommonCrypto FFI
 
@@ -89,19 +91,47 @@ All configuration is via environment variables:
 
 - **Objects**: GetObject (range + conditional), PutObject (conditional-write), CopyObject, DeleteObject, HeadObject
 - **Listing**: ListObjectsV1, ListObjectsV2, ListBuckets
-- **Multipart**: CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads
+- **Multipart**: CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads (UploadPartCopy is what `aws s3 cp`/`sync` use to copy objects above the ~8 MiB multipart threshold)
 - **Bucket**: HeadBucket, GetBucketLocation, CreateBucket, DeleteBucket
 - **Stubs**: ACL, tagging, versioning, encryption, lifecycle, CORS (returns valid empty responses)
 
 Path-style addressing only (no virtual-hosted-style).
 
+ListObjects without a `delimiter` walks subdirectories recursively (full S3
+semantics — `aws s3 ls --recursive` and `aws s3 sync` see every key); with
+`delimiter=/` it lists one level and reports subdirectories as common
+prefixes. spiceio's internal bookkeeping directories (`.spiceio-wal/`,
+`.spiceio-uploads/`) are hidden from listings.
+
+## Crash reports & graceful shutdown
+
+If spiceio panics or hits a fatal signal it writes a crash report to stderr
+and (when `SPICEIO_LOG_FILE` is set) appends it to the log file before dying —
+version, pid, uptime, thread, panic message + source location, fault address
+and registers for signals, and a backtrace.
+
+Release binaries are stripped, so reports include the image load address and
+ASLR slide; `make release` also emits `target/release/spiceio.dSYM` (and the
+release tarball bundles it), so raw addresses symbolize offline with:
+
+```bash
+atos -o target/release/spiceio.dSYM/Contents/Resources/DWARF/spiceio \
+     -l <image base from the report> <addresses...>
+```
+
+`SIGTERM` and `SIGINT` (Ctrl-C) both shut down gracefully, flushing the log
+file before exit. Startup/config errors (missing env vars, unreachable SMB
+server) exit cleanly with a one-line reason — only genuine bugs produce crash
+reports.
+
 ## Architecture
 
-Three modules:
+Four modules:
 
 - **`s3`** -- HTTP layer. Parses S3 requests, produces XML responses. Router dispatches to the appropriate handler. Small files (<64KB) use compound fast paths; large files stream.
 - **`smb`** -- Wire protocol client. Manages TCP connection, negotiate/session-setup handshake, and file operations. Supports SMB2 compounding for batching multiple operations in a single round trip.
 - **`crypto`** -- FFI bindings to macOS CommonCrypto. MD4, SHA-256, SHA-512, HMAC-MD5, HMAC-SHA256, AES-128-CMAC. No Rust crypto crates.
+- **`crash`** -- Crash reporting. Panic hook plus async-signal-safe fatal-signal handler; reports go to stderr and the log file synchronously, bypassing the async logger.
 
 ```
 HTTP request

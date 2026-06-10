@@ -40,13 +40,15 @@ The binary requires these environment variables:
 
 ## Architecture
 
-The codebase has three modules:
+The codebase has four modules:
 
-- **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads, and stub endpoints for ACL/tagging/versioning. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spiceio-uploads/` on the SMB share. `body.rs` implements `SpiceioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
+- **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads (including UploadPartCopy, the form `aws s3 cp`/`sync` use for objects above the ~8 MiB multipart threshold), and stub endpoints for ACL/tagging/versioning. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spiceio-uploads/` on the SMB share. `body.rs` implements `SpiceioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
 
 - **`smb`** — Wire protocol client. `protocol.rs` defines SMB 3.1.x packet structures (little-endian). `client.rs` manages a TCP connection, negotiate/session-setup handshake, and exposes operations (tree connect, create, read, write, close, query directory, pipelined read). `pool.rs` manages N authenticated connections for concurrent request fan-out. `auth.rs` implements NTLMv2 challenge-response. `ops.rs` provides the high-level `ShareSession` abstraction the S3 layer consumes (list, read, write, delete, stat, copy).
 
 - **`crypto`** — FFI bindings to macOS CommonCrypto (`Security.framework`/`libcommonCrypto`). Exposes MD4, SHA-256, and HMAC-MD5. No Rust crypto crates.
+
+- **`crash`** — Crash reporting. A panic hook (location + backtrace, works with `panic = "abort"`) and an async-signal-safe fatal-signal handler (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP/SIGABRT: fault address, registers, frame-pointer backtrace). Reports are written synchronously to stderr and `SPICEIO_LOG_FILE`, bypassing the async logger. Release builds stay stripped; `target/release/spiceio.dSYM` (from `split-debuginfo = "packed"`) symbolizes the raw addresses offline via `atos -l <image base>`. Tested end-to-end via the hidden `--crash-test <panic|segv|abort>` flag (`tests/crash_report.rs`).
 
 **Request flow:** HTTP request → `s3::router::handle_request` → S3 operation → `smb::ops::ShareSession` method → `smb::client::SmbClient` wire operations → TCP to SMB server.
 
@@ -56,6 +58,7 @@ The codebase has three modules:
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.
 - Connection pool — N TCP connections (default 8) to the same SMB server, round-robin dispatched. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
 - Pipelined reads — streaming GetObject sends batches of 8 read requests before collecting responses, hiding per-request round-trip latency.
+- SMB2 credit accounting — each connection tracks its credit balance (grants banked from every response's `CreditResponse`, charges consumed in lockstep with MessageId allocation). Pipelined batches clamp to the balance and oversized single I/O splits, so in-flight charge never exceeds the server-granted sequence window.
 - Configurable I/O cap — standalone read/write ops default to 64 KB (safe for commodity NAS); raisable via `SPICEIO_SMB_MAX_IO` for compliant servers. Compound operations always cap at 64 KB.
 - GetObject streams SMB read chunks directly to the HTTP response via `SpiceioBody::channel` — no full-file buffering.
 - PutObject streams HTTP request body chunks directly to SMB write calls — no full-body collection.

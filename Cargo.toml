@@ -1,6 +1,6 @@
 [package]
 name = "spiceio"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 description = "S3-compatible API proxy to SMB file shares"
 license = "Apache-2.0"
@@ -56,3 +56,9 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+# Crash diagnostics for stripped builds: emit line tables into a separate
+# dSYM bundle (target/release/spiceio.dSYM) so the raw addresses in crash
+# reports can be symbolized offline with `atos`. The shipped binary is
+# unchanged — still stripped, and line tables do not affect codegen.
+debug = "line-tables-only"
+split-debuginfo = "packed"

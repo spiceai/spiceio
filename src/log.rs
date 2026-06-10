@@ -23,10 +23,13 @@ const CHANNEL_CAP: usize = 4096;
 /// BufWriter capacity — bytes buffered before a syscall write.
 const BUF_CAP: usize = 64 * 1024;
 
-/// A queued log line and which console stream it targets.
+/// A queued log line and which console stream it targets, or a flush request.
 enum LogMsg {
     Stdout(String),
     Stderr(String),
+    /// Flush the file buffer and acknowledge — used at shutdown so the final
+    /// lines are on disk before the process exits.
+    Flush(mpsc::SyncSender<()>),
 }
 
 static LOG_TX: OnceLock<mpsc::SyncSender<LogMsg>> = OnceLock::new();
@@ -41,7 +44,11 @@ pub fn init(path: Option<&str>) {
             .create(true)
             .append(true)
             .open(p)
-            .unwrap_or_else(|e| panic!("[spiceio] failed to open log file {p}: {e}"))
+            .unwrap_or_else(|e| {
+                // Config error, not a crash — report cleanly and exit.
+                eprintln!("[spiceio] failed to open log file {p}: {e}");
+                std::process::exit(1);
+            })
     });
 
     let (tx, rx) = mpsc::sync_channel::<LogMsg>(CHANNEL_CAP);
@@ -63,9 +70,15 @@ fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    let handle = |msg: LogMsg, fw: &mut Option<BufWriter<std::fs::File>>| {
+    let handle = |msg: LogMsg,
+                  fw: &mut Option<BufWriter<std::fs::File>>,
+                  acks: &mut Vec<mpsc::SyncSender<()>>| {
         let line = match &msg {
             LogMsg::Stdout(s) | LogMsg::Stderr(s) => s.as_str(),
+            LogMsg::Flush(ack) => {
+                acks.push(ack.clone());
+                return;
+            }
         };
         match &msg {
             LogMsg::Stdout(_) => {
@@ -76,6 +89,7 @@ fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
                 let mut e = stderr.lock();
                 let _ = writeln!(e, "{line}");
             }
+            LogMsg::Flush(_) => unreachable!(),
         }
         if let Some(w) = fw.as_mut() {
             let _ = w.write_all(line.as_bytes());
@@ -83,16 +97,61 @@ fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
         }
     };
 
+    let mut acks: Vec<mpsc::SyncSender<()>> = Vec::new();
     while let Ok(msg) = rx.recv() {
-        handle(msg, &mut fw);
+        handle(msg, &mut fw, &mut acks);
         // Drain any queued messages before issuing the syscall flush.
         while let Ok(msg) = rx.try_recv() {
-            handle(msg, &mut fw);
+            handle(msg, &mut fw, &mut acks);
         }
         if let Some(w) = fw.as_mut() {
             let _ = w.flush();
         }
+        // Acknowledge flush requests only after the file hit the OS.
+        for ack in acks.drain(..) {
+            let _ = ack.send(());
+        }
     }
+}
+
+/// Block until all log lines queued so far are flushed (file included), or the
+/// timeout elapses. Call at graceful shutdown — without it the writer thread
+/// dies with the process and the final buffered lines are lost.
+///
+/// Honors `timeout` as an overall deadline split across two waits: blocking to
+/// *enqueue* the flush request (the channel may be momentarily full under heavy
+/// logging — exactly when the final lines matter most, so `try_send` would drop
+/// them) and then waiting for the writer's ack within the remaining budget. If
+/// the request can't be enqueued before the deadline, it gives up rather than
+/// hang.
+pub fn flush(timeout: std::time::Duration) {
+    let Some(tx) = LOG_TX.get() else { return };
+    let deadline = std::time::Instant::now() + timeout;
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+    // Enqueue the flush request, retrying within the deadline if the channel is
+    // momentarily full (heavy logging — exactly when the final lines matter, so
+    // a single non-blocking `try_send` would drop them). `try_send` hands the
+    // message back on `Full`, so reuse it. `send_timeout` would be simpler but
+    // is unstable on stable Rust.
+    let mut msg = LogMsg::Flush(ack_tx);
+    loop {
+        match tx.try_send(msg) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                if std::time::Instant::now() >= deadline {
+                    return; // couldn't enqueue before the deadline — give up
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                msg = returned;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return,
+        }
+    }
+    // The flush is processed after every line queued before it, so the ack
+    // means the writer has drained and flushed them. Wait out the remaining
+    // budget for it.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let _ = ack_rx.recv_timeout(remaining);
 }
 
 /// Format a timestamp from `gettimeofday` into a fixed 24-byte ISO-8601 UTC
