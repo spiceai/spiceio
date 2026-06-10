@@ -58,6 +58,7 @@ The codebase has four modules:
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.
 - Connection pool — N TCP connections (default 8) to the same SMB server, round-robin dispatched. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
 - Pipelined reads — streaming GetObject sends batches of 8 read requests before collecting responses, hiding per-request round-trip latency.
+- SMB2 credit accounting — each connection tracks its credit balance (grants banked from every response's `CreditResponse`, charges consumed in lockstep with MessageId allocation). Pipelined batches clamp to the balance and oversized single I/O splits, so in-flight charge never exceeds the server-granted sequence window.
 - Configurable I/O cap — standalone read/write ops default to 64 KB (safe for commodity NAS); raisable via `SPICEIO_SMB_MAX_IO` for compliant servers. Compound operations always cap at 64 KB.
 - GetObject streams SMB read chunks directly to the HTTP response via `SpiceioBody::channel` — no full-file buffering.
 - PutObject streams HTTP request body chunks directly to SMB write calls — no full-body collection.

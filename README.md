@@ -18,6 +18,7 @@ S3 client  --->  spiceio (HTTP :8333)  --->  SMB server (TCP :445)
 - **Zero-mount design** -- speaks SMB 3.1.x natively over TCP, never touches the local filesystem
 - **Full S3 compatibility** for common operations: Get/Put/Copy/Delete/Head Object, ListObjects (v1 & v2), ListBuckets, multipart uploads, range + conditional requests
 - **SMB2 compounding** -- batches Create+Read+Close or Create+Write+Close into single round trips for small file performance
+- **Credit-window flow control** -- tracks the server's SMB2 credit grants per connection and sizes pipelined batches to the granted window, so sustained bursts never violate the protocol's sequence window
 - **Streaming I/O** -- GetObject and PutObject stream directly between HTTP and SMB without buffering entire files
 - **Non-blocking logging** -- timestamped stdout/stderr with optional file tee via `SPICEIO_LOG_FILE`; dedicated writer thread, never stalls the proxy
 - **Crash reporting built in** -- panics and fatal signals (SIGSEGV/SIGBUS/...) always leave a diagnosable report on stderr and in the log file: version, uptime, panic location, registers, fault address, and a backtrace with the info needed to symbolize stripped release builds offline

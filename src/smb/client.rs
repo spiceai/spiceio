@@ -3,7 +3,7 @@
 use bytes::Buf;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -81,6 +81,20 @@ pub struct SmbClient {
     signing_key: Option<[u8; 16]>,
     /// Set on read timeout — connection framing is desynchronized.
     poisoned: AtomicBool,
+    /// SMB2 credit balance: credits granted by the server (the
+    /// `CreditResponse` field of every response, banked by `harvest_credits`)
+    /// minus credits consumed by requests (each request costs
+    /// `credit_charge`, consumed by `alloc_ids` in lockstep with its
+    /// MessageId range). Sending more in-flight charge than the balance
+    /// violates the server's sequence window — servers disconnect — so the
+    /// pipelined paths clamp their batches to it and the single-op paths
+    /// split oversized I/O. Signed: a compliant server always leaves the
+    /// client ≥ 1 credit, but we permit a one-request overdraft on a
+    /// non-compliant grant rather than wedging (see `affordable_count`).
+    credits: AtomicI64,
+    /// One-shot flag so the first credit-limited batch on this connection is
+    /// logged (visibility) without per-batch log spam.
+    credit_clamp_logged: AtomicBool,
 }
 
 impl SmbClient {
@@ -157,6 +171,10 @@ impl SmbClient {
             client_guid,
             signing_key: None,
             poisoned: AtomicBool::new(false),
+            // One credit to spend on the negotiate request; every response
+            // from then on replenishes the balance via `harvest_credits`.
+            credits: AtomicI64::new(1),
+            credit_clamp_logged: AtomicBool::new(false),
         };
 
         client.negotiate_and_auth().await?;
@@ -169,7 +187,44 @@ impl SmbClient {
     }
 
     fn next_message_id(&self) -> u64 {
-        self.message_id.fetch_add(1, Ordering::Relaxed)
+        self.alloc_ids(1)
+    }
+
+    /// Allocate a MessageId range spanning `total_charge` sequence numbers and
+    /// consume the same amount from the credit balance. Charges and MessageIds
+    /// advance in lockstep, so "balance ≥ 0" is exactly "every allocated
+    /// MessageId lies within the server-granted sequence window" — callers
+    /// check affordability *before* allocating (`affordable_count` /
+    /// `affordable_prefix`).
+    fn alloc_ids(&self, total_charge: u64) -> u64 {
+        self.credits
+            .fetch_sub(total_charge as i64, Ordering::Relaxed);
+        self.message_id.fetch_add(total_charge, Ordering::Relaxed)
+    }
+
+    /// Bank the credits granted by a response. Every response — including
+    /// STATUS_PENDING interims and each message of a compound chain — carries
+    /// a `CreditResponse` grant that replenishes the connection's balance.
+    fn harvest_credits(&self, hdr: &Header) {
+        self.credits
+            .fetch_add(i64::from(hdr.credits), Ordering::Relaxed);
+    }
+
+    /// Current credit balance (may be momentarily negative under the bounded
+    /// single-request overdraft `affordable_count` permits).
+    fn credit_balance(&self) -> i64 {
+        self.credits.load(Ordering::Relaxed)
+    }
+
+    /// Log the first credit-limited batch on this connection — expected on a
+    /// fresh connection (grants accumulate as responses arrive) but worth one
+    /// line of visibility, without per-batch spam.
+    fn note_credit_clamp(&self, want: usize, got: usize) {
+        if got < want && !self.credit_clamp_logged.swap(true, Ordering::Relaxed) {
+            crate::slog!(
+                "[spiceio] smb credit window limited a batch to {got} of {want} request(s); batches grow as grants arrive"
+            );
+        }
     }
 
     /// Read exactly `buf.len()` bytes from the stream with a timeout.
@@ -293,6 +348,7 @@ impl SmbClient {
                 crate::serr!("[spiceio] smb invalid header");
                 io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
             })?;
+            self.harvest_credits(&header);
 
             // STATUS_PENDING (0x00000103): server is still processing, wait for real response
             if header.status == 0x0000_0103 {
@@ -561,7 +617,9 @@ impl SmbClient {
         Ok(())
     }
 
-    /// Read from an open file.
+    /// Read from an open file. May return fewer bytes than requested (EOF, a
+    /// short server read, or credit-window clamping) — callers advance by the
+    /// returned length and loop.
     pub async fn read(
         &self,
         tree_id: u32,
@@ -569,11 +627,12 @@ impl SmbClient {
         offset: u64,
         length: u32,
     ) -> io::Result<bytes::Bytes> {
+        // Clamp the request to the credit balance (floor: one credit's worth)
+        // so a multi-credit read never exceeds the granted sequence window.
+        let length = length.min(credit_affordable_bytes(self.credit_balance()));
         // Multi-credit commands (payload > 64 KiB) consume `credit_charge`
         // sequence numbers, so advance the MessageId window by the charge.
-        let msg_id = self
-            .message_id
-            .fetch_add(credit_charge_for(length) as u64, Ordering::Relaxed);
+        let msg_id = self.alloc_ids(credit_charge_for(length) as u64);
         let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(length);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -657,10 +716,17 @@ impl SmbClient {
         // Multi-credit reads consume `credit_charge` sequence numbers each, so
         // the MessageId window advances by count * charge and requests are
         // spaced by `charge`. A response maps to its slot via that stride.
+        //
+        // Clamp the batch to the credit balance: a batch whose total charge
+        // exceeds the server's grants violates the sequence window (servers
+        // disconnect under exactly the heavy load where it matters). Callers
+        // loop on the returned chunks, so a shortened batch simply means the
+        // next batch resumes from the new offset with a replenished balance.
         let charge = credit_charge_for(chunk_size) as u64;
-        let base_msg_id = self
-            .message_id
-            .fetch_add(count as u64 * charge, Ordering::Relaxed);
+        let want = count;
+        let count = affordable_count(self.credit_balance(), charge as u16, count);
+        self.note_credit_clamp(want, count);
+        let base_msg_id = self.alloc_ids(count as u64 * charge);
 
         // Each request: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 49
         // (read request fixed part incl. 1-byte buffer pad).
@@ -718,6 +784,7 @@ impl SmbClient {
 
             let header = Header::decode(&msg)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+            self.harvest_credits(&header);
 
             // Skip STATUS_PENDING interim responses
             if header.status == 0x0000_0103 {
@@ -768,7 +835,10 @@ impl SmbClient {
             .collect())
     }
 
-    /// Write to an open file.
+    /// Write all of `data` to an open file. Returns `data.len()` on success —
+    /// short server writes and credit-window clamping are handled internally
+    /// by resuming from the acknowledged count, so a success never leaves a
+    /// silent gap (callers track offsets by the data they passed).
     pub async fn write(
         &self,
         tree_id: u32,
@@ -776,11 +846,42 @@ impl SmbClient {
         offset: u64,
         data: &[u8],
     ) -> io::Result<u32> {
+        let mut sent = 0usize;
+        while sent < data.len() {
+            // Clamp each sub-write to the credit balance (floor: one credit).
+            let take =
+                (data.len() - sent).min(credit_affordable_bytes(self.credit_balance()) as usize);
+            let written = self
+                .write_once(
+                    tree_id,
+                    file_id,
+                    offset + sent as u64,
+                    &data[sent..sent + take],
+                )
+                .await?;
+            if written == 0 {
+                // A "success" that wrote nothing would loop forever.
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "SMB write reported 0 bytes written",
+                ));
+            }
+            sent += written as usize;
+        }
+        Ok(data.len() as u32)
+    }
+
+    /// Send one WRITE request (no splitting). Returns the server-acknowledged
+    /// byte count, which may be short.
+    async fn write_once(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        offset: u64,
+        data: &[u8],
+    ) -> io::Result<u32> {
         // Multi-credit commands consume `credit_charge` sequence numbers.
-        let msg_id = self.message_id.fetch_add(
-            credit_charge_for(data.len() as u32) as u64,
-            Ordering::Relaxed,
-        );
+        let msg_id = self.alloc_ids(credit_charge_for(data.len() as u32) as u64);
         let mut hdr = Header::new(Command::Write, msg_id).with_credit_charge(data.len() as u32);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -849,15 +950,20 @@ impl SmbClient {
             return Ok(0);
         }
 
-        let n = chunks.len();
         // Multi-credit writes consume `credit_charge` sequence numbers each;
         // advance the window by the total charge and space each request by its
         // own charge (chunks may differ in size, e.g. a short final chunk).
-        let total_charge: u64 = chunks
-            .iter()
-            .map(|c| credit_charge_for(c.len() as u32) as u64)
-            .sum();
-        let base_msg_id = self.message_id.fetch_add(total_charge, Ordering::Relaxed);
+        //
+        // Clamp the batch to the longest chunk prefix whose total charge fits
+        // the credit balance (always at least one chunk) — more in-flight
+        // charge than the server granted violates the sequence window.
+        // Callers advance by the returned byte count and re-send the
+        // remainder, so a shortened batch self-heals on the next window.
+        let (take, total_charge) = affordable_prefix(self.credit_balance(), chunks);
+        self.note_credit_clamp(chunks.len(), take);
+        let chunks = &chunks[..take];
+        let n = chunks.len();
+        let base_msg_id = self.alloc_ids(total_charge);
 
         // Each packet: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 48
         // (write request fixed part) + chunk data.
@@ -922,6 +1028,7 @@ impl SmbClient {
 
             let header = Header::decode(&msg)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
+            self.harvest_credits(&header);
 
             if header.status == 0x0000_0103 {
                 continue;
@@ -1124,15 +1231,21 @@ impl SmbClient {
             let mut msg = vec![0u8; msg_len];
             self.read_exact_timeout(&mut stream, &mut msg).await?;
 
-            // Single STATUS_PENDING interim — skip
+            // Single STATUS_PENDING interim — skip, but bank its credit grant
             if let Some(h) = Header::decode(&msg)
                 && h.status == 0x0000_0103
                 && h.next_command == 0
             {
+                self.harvest_credits(&h);
                 continue;
             }
 
-            return Ok(parse_compound_response(&msg));
+            // Each message of the compound chain carries its own grant.
+            let responses = parse_compound_response(&msg);
+            for (h, _) in &responses {
+                self.harvest_credits(h);
+            }
+            return Ok(responses);
         }
     }
 
@@ -1147,7 +1260,10 @@ impl SmbClient {
         create_disposition: u32,
         create_options: u32,
     ) -> io::Result<(CreateResponse, CloseResponse)> {
-        let base = self.message_id.fetch_add(2, Ordering::Relaxed);
+        // Compound ops are ≤ 64 KiB (effective_io_sizes clamps the compound
+        // caps), so every chained request charges exactly 1 credit and the
+        // MessageId stride equals the message count.
+        let base = self.alloc_ids(2);
 
         let mut h1 = Header::new(Command::Create, base);
         h1.session_id = self.session_id;
@@ -1203,7 +1319,9 @@ impl SmbClient {
         path: &str,
         max_read: u32,
     ) -> io::Result<(CreateResponse, bytes::Bytes)> {
-        let base = self.message_id.fetch_add(3, Ordering::Relaxed);
+        // Compound reads are capped at 64 KiB (charge 1), so the three chained
+        // messages charge 3 credits and stride 3 MessageIds.
+        let base = self.alloc_ids(3);
 
         let mut h1 = Header::new(Command::Create, base);
         h1.session_id = self.session_id;
@@ -1272,7 +1390,9 @@ impl SmbClient {
         path: &str,
         data: &[u8],
     ) -> io::Result<CloseResponse> {
-        let base = self.message_id.fetch_add(3, Ordering::Relaxed);
+        // Compound writes are capped at 64 KiB (charge 1), so the three
+        // chained messages charge 3 credits and stride 3 MessageIds.
+        let base = self.alloc_ids(3);
 
         let mut h1 = Header::new(Command::Create, base);
         h1.session_id = self.session_id;
@@ -1345,7 +1465,8 @@ impl SmbClient {
         }
 
         let count = dirs.len() * 2;
-        let base = self.message_id.fetch_add(count as u64, Ordering::Relaxed);
+        // Create/Close pairs charge 1 credit each.
+        let base = self.alloc_ids(count as u64);
         let mut requests = Vec::with_capacity(count);
 
         for (i, dir) in dirs.iter().enumerate() {
@@ -1443,6 +1564,48 @@ pub(crate) fn effective_io_sizes(
         compound_max_read: max_read.min(65536),
         compound_max_write: max_write.min(65536),
     }
+}
+
+// ── SMB2 credit-window arithmetic (pure, unit-tested) ───────────────────────
+
+/// How many requests of `charge` credits each a batch may send within the
+/// current credit `balance`, capped at `want`. Always at least one (when any
+/// were requested): a compliant server never leaves the client below one
+/// credit, so a zero/negative balance means either a fresh connection whose
+/// window is still growing or a non-compliant grant — a bounded one-request
+/// overdraft recovers both, whereas sending nothing would wedge the transfer.
+fn affordable_count(balance: i64, charge: u16, want: usize) -> usize {
+    if want == 0 {
+        return 0;
+    }
+    let per = i64::from(charge.max(1));
+    usize::try_from((balance / per).max(1))
+        .unwrap_or(1)
+        .min(want)
+}
+
+/// Longest prefix of `chunks` whose total credit charge fits `balance`
+/// (always at least one chunk — see `affordable_count` for the overdraft
+/// rationale). Returns `(chunk_count, total_charge)`.
+fn affordable_prefix(balance: i64, chunks: &[&[u8]]) -> (usize, u64) {
+    let budget = balance.max(0) as u64;
+    let mut take = 0usize;
+    let mut total = 0u64;
+    for c in chunks {
+        let ch = u64::from(credit_charge_for(c.len() as u32));
+        if take > 0 && total + ch > budget {
+            break;
+        }
+        take += 1;
+        total += ch;
+    }
+    (take, total)
+}
+
+/// Bytes a single read/write request may carry within `balance` credits
+/// (floor: one credit = 64 KiB — the bounded single-request overdraft).
+fn credit_affordable_bytes(balance: i64) -> u32 {
+    u32::try_from(balance.max(1).saturating_mul(65536)).unwrap_or(u32::MAX)
 }
 
 /// Sign an SMB2 packet in-place. `packet` includes the 4-byte NetBIOS header.
@@ -1761,6 +1924,56 @@ mod tests {
         let path = ".spiceio-wal\\01778725545751751000-0000";
         let e = smb_status_to_io_error(0xC000_0043, path);
         assert!(e.to_string().contains(path));
+    }
+
+    // ── credit-window arithmetic ────────────────────────────────────────────
+
+    #[test]
+    fn affordable_count_clamps_to_balance() {
+        // Plenty of balance: full batch.
+        assert_eq!(affordable_count(256, 1, 64), 64);
+        assert_eq!(affordable_count(256, 4, 64), 64);
+        // Partial balance: batch shrinks (whole requests only).
+        assert_eq!(affordable_count(16, 4, 64), 4);
+        assert_eq!(affordable_count(15, 4, 64), 3);
+        // Tight/zero/negative balance: floor at one request (the bounded
+        // overdraft) so a transfer can always make progress.
+        assert_eq!(affordable_count(3, 4, 64), 1);
+        assert_eq!(affordable_count(0, 1, 64), 1);
+        assert_eq!(affordable_count(-8, 4, 64), 1);
+        // Never exceeds the requested count; zero requests stay zero.
+        assert_eq!(affordable_count(1_000_000, 1, 7), 7);
+        assert_eq!(affordable_count(256, 1, 0), 0);
+        // Charge 0 is treated as 1, never a division by zero.
+        assert_eq!(affordable_count(8, 0, 64), 8);
+    }
+
+    #[test]
+    fn affordable_prefix_takes_what_fits() {
+        let a = vec![0u8; 65536]; // charge 1
+        let b = vec![0u8; 131072]; // charge 2
+        let c = vec![0u8; 1]; // charge 1
+        let chunks: Vec<&[u8]> = vec![&a, &b, &c];
+        // Everything fits.
+        assert_eq!(affordable_prefix(16, &chunks), (3, 4));
+        // Exactly the first two (1 + 2 = 3 credits).
+        assert_eq!(affordable_prefix(3, &chunks), (2, 3));
+        // Only the first.
+        assert_eq!(affordable_prefix(1, &chunks), (1, 1));
+        // Zero/negative balance still sends one chunk (bounded overdraft).
+        assert_eq!(affordable_prefix(0, &chunks), (1, 1));
+        assert_eq!(affordable_prefix(-5, &chunks), (1, 1));
+        // Empty input.
+        let empty: Vec<&[u8]> = Vec::new();
+        assert_eq!(affordable_prefix(100, &empty), (0, 0));
+    }
+
+    #[test]
+    fn credit_affordable_bytes_floors_and_saturates() {
+        assert_eq!(credit_affordable_bytes(0), 65536); // floor: one credit
+        assert_eq!(credit_affordable_bytes(-3), 65536);
+        assert_eq!(credit_affordable_bytes(4), 4 * 65536);
+        assert_eq!(credit_affordable_bytes(i64::MAX / 2), u32::MAX); // saturates
     }
 
     // ── effective_io_sizes ──────────────────────────────────────────────────
