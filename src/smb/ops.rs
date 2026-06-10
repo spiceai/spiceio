@@ -181,124 +181,121 @@ impl ShareSession {
 
     // ── Buffered file operations (existing) ─────────────────────────────
 
-    /// List objects in a directory. `prefix` uses forward-slash separators.
+    /// List objects under a prefix. `prefix` uses forward-slash separators.
+    ///
+    /// With a delimiter (the common `delimiter=/` case), one directory level
+    /// is listed and subdirectories become common prefixes. Without a
+    /// delimiter, S3 semantics require *every* key under the prefix, so the
+    /// walk descends into subdirectories (breadth-first). Spiceio-internal
+    /// bookkeeping directories (`.spiceio-wal/`, `.spiceio-uploads/`) at the
+    /// share root are hidden from both forms.
     pub async fn list_objects(
         &self,
         prefix: &str,
         delimiter: Option<&str>,
     ) -> io::Result<(Vec<ObjectInfo>, Vec<String>)> {
+        // Backstops for the recursive walk so a pathological tree cannot pin
+        // unbounded memory: fail loudly rather than return a silently
+        // incomplete listing a client would trust (IsTruncated=false).
+        const MAX_LIST_DIRS: usize = 100_000;
+        const MAX_LIST_ENTRIES: usize = 1_000_000;
+
         let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(prefix);
         let (dir_path, pattern) = split_dir_pattern(&smb_path);
 
-        // Open the directory
-        let dir = client
-            .create(
-                tree_id,
-                &dir_path,
-                DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::DirectoryFile as u32,
-            )
-            .await?;
-
-        let entries = client
-            .query_directory(tree_id, &dir.file_id, &pattern)
-            .await;
-
-        // Close directory handle regardless
-        let _ = client.close(tree_id, &dir.file_id).await;
-
-        let entries = entries?;
-
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
 
-        for entry in entries {
-            let key = if dir_path.is_empty() {
-                entry.file_name.replace('\\', "/")
-            } else {
-                format!(
-                    "{}/{}",
-                    dir_path.replace('\\', "/"),
-                    entry.file_name.replace('\\', "/")
+        // Work queue of (SMB directory path, query pattern). The first level
+        // uses the prefix-derived pattern; descended levels list everything
+        // (their full subtree already shares the requested prefix).
+        let mut queue: std::collections::VecDeque<(String, String)> =
+            std::collections::VecDeque::new();
+        queue.push_back((dir_path, pattern));
+        let mut first = true;
+        let mut dirs_visited = 0usize;
+
+        while let Some((dir_path, pattern)) = queue.pop_front() {
+            dirs_visited += 1;
+            if dirs_visited > MAX_LIST_DIRS
+                || objects.len() + common_prefixes.len() > MAX_LIST_ENTRIES
+            {
+                return Err(io::Error::other(format!(
+                    "listing under prefix '{prefix}' exceeds {MAX_LIST_DIRS} directories or {MAX_LIST_ENTRIES} entries; use a narrower prefix or a delimiter"
+                )));
+            }
+
+            let dir = match client
+                .create(
+                    tree_id,
+                    &dir_path,
+                    DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::DirectoryFile as u32,
                 )
+                .await
+            {
+                Ok(d) => d,
+                // The top-level open propagates (NotFound → empty listing at
+                // the router); a subdirectory that vanished or errored
+                // mid-walk is skipped, matching S3's view of concurrently
+                // deleted keys.
+                Err(e) if first => return Err(e),
+                Err(_) => continue,
             };
 
-            if entry.is_directory() {
-                if delimiter.is_some() {
-                    common_prefixes.push(format!("{}/", key));
+            let entries = client
+                .query_directory(tree_id, &dir.file_id, &pattern)
+                .await;
+            let _ = client.close(tree_id, &dir.file_id).await;
+            let entries = match entries {
+                Ok(e) => e,
+                Err(e) if first => return Err(e),
+                Err(_) => continue,
+            };
+            first = false;
+
+            for entry in entries {
+                // Hide spiceio's own bookkeeping dirs at the share root —
+                // recursing into them would surface WAL temps and multipart
+                // part files as objects.
+                if dir_path.is_empty()
+                    && entry.is_directory()
+                    && (entry.file_name == WAL_DIR || entry.file_name == UPLOADS_DIR)
+                {
+                    continue;
                 }
-                // If no delimiter, we'd recurse — but keep it simple for now
-            } else {
-                objects.push(ObjectInfo {
-                    key,
-                    size: entry.file_size,
-                    last_modified: filetime_to_epoch_secs(entry.last_write_time),
-                    etag: etag_for(entry.file_size, entry.last_write_time),
-                });
+
+                let key = if dir_path.is_empty() {
+                    entry.file_name.replace('\\', "/")
+                } else {
+                    format!(
+                        "{}/{}",
+                        dir_path.replace('\\', "/"),
+                        entry.file_name.replace('\\', "/")
+                    )
+                };
+
+                if entry.is_directory() {
+                    if delimiter.is_some() {
+                        common_prefixes.push(format!("{}/", key));
+                    } else {
+                        queue.push_back((to_smb_path(&key), "*".to_string()));
+                    }
+                } else {
+                    objects.push(ObjectInfo {
+                        key,
+                        size: entry.file_size,
+                        last_modified: filetime_to_epoch_secs(entry.last_write_time),
+                        etag: etag_for(entry.file_size, entry.last_write_time),
+                    });
+                }
             }
         }
 
         Ok((objects, common_prefixes))
-    }
-
-    /// Get object (file) content. Uses compound Create+Read+Close for files
-    /// that fit in one read chunk, falling back to sequential for larger files.
-    pub async fn get_object(&self, key: &str) -> io::Result<(ObjectMeta, Vec<u8>)> {
-        let (client, tree_id) = self.pick();
-        let smb_path = to_smb_path(key);
-        let compound_max = self.pool.compound_max_read_size;
-        let max_read = self.pool.read_chunk_size();
-
-        // Compound: Create+Read+Close in 1 round trip (uses compound cap)
-        let (cr, first_chunk) = client
-            .create_read_close(tree_id, &smb_path, compound_max)
-            .await?;
-
-        let meta = ObjectMeta {
-            size: cr.file_size,
-            last_modified: filetime_to_epoch_secs(cr.last_write_time),
-            etag: etag_for(cr.file_size, cr.last_write_time),
-            content_type: guess_content_type(key),
-        };
-
-        // Small file — got everything in the compound
-        if cr.file_size <= first_chunk.len() as u64 {
-            return Ok((meta, first_chunk.to_vec()));
-        }
-
-        // Large file — re-open and read sequentially
-        let file = client
-            .create(
-                tree_id,
-                &smb_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
-
-        let mut data = Vec::with_capacity(cr.file_size as usize);
-        let mut offset = 0u64;
-        loop {
-            let chunk = client
-                .read(tree_id, &file.file_id, offset, max_read)
-                .await?;
-            if chunk.is_empty() {
-                break;
-            }
-            offset += chunk.len() as u64;
-            data.extend_from_slice(&chunk);
-            if offset >= cr.file_size {
-                break;
-            }
-        }
-
-        let _ = client.close(tree_id, &file.file_id).await;
-        Ok((meta, data))
     }
 
     /// Put object (write file). Uses compound Create+Write+Close for small
@@ -409,15 +406,37 @@ impl ShareSession {
         })
     }
 
-    /// Copy a file on the SMB share (read source, write dest).
+    /// Copy a file on the SMB share, streaming through a WAL temp file
+    /// (pipelined reads → pipelined writes → atomic rename).
+    ///
+    /// Never buffers the whole object in memory (the previous implementation
+    /// did, so copying a multi-GB object could OOM the proxy), and the
+    /// destination is only replaced once the copy has fully landed — a failed
+    /// copy leaves an existing destination object untouched instead of
+    /// truncated or deleted.
     pub async fn copy_object(&self, src_key: &str, dst_key: &str) -> io::Result<ObjectMeta> {
-        let (meta, data) = self.get_object(src_key).await?;
-        let dst_meta = self.put_object(dst_key, &data).await?;
+        let src_path = to_smb_path(src_key);
+        let mut wal = self.open_wal_write(dst_key).await?;
+
+        // Same guard as assemble_parts: protect the per-batch `div_ceil`
+        // inside stream_part_into_wal from a zero-floored pool entry.
+        if self.pool.max_read_size == 0 {
+            wal.abort().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy_object: pool max_read_size = 0",
+            ));
+        }
+
+        if let Err(e) = self.stream_part_into_wal(&mut wal, &src_path).await {
+            wal.abort().await;
+            return Err(e);
+        }
+
+        let meta = wal.commit(self).await?;
         Ok(ObjectMeta {
-            last_modified: dst_meta.last_modified,
-            etag: dst_meta.etag,
-            size: meta.size,
-            content_type: meta.content_type,
+            content_type: guess_content_type(dst_key),
+            ..meta
         })
     }
 
@@ -563,55 +582,6 @@ impl ShareSession {
         }
     }
 
-    /// Read a temp file.
-    pub async fn read_temp(&self, smb_path: &str) -> io::Result<Vec<u8>> {
-        let (client, tree_id) = self.pick();
-        let compound_max = self.pool.compound_max_read_size;
-        let max_read = self.pool.read_chunk_size();
-        let (cr, first_chunk) = client
-            .create_read_close(tree_id, smb_path, compound_max)
-            .await?;
-
-        if cr.file_size <= first_chunk.len() as u64 {
-            return Ok(first_chunk.to_vec());
-        }
-
-        // Large temp file — re-open and read sequentially
-        let file = client
-            .create(
-                tree_id,
-                smb_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
-
-        let read_result: io::Result<Vec<u8>> = async {
-            let mut data = Vec::with_capacity(cr.file_size as usize);
-            let mut offset = 0u64;
-            loop {
-                let chunk = client
-                    .read(tree_id, &file.file_id, offset, max_read)
-                    .await?;
-                if chunk.is_empty() {
-                    break;
-                }
-                offset += chunk.len() as u64;
-                data.extend_from_slice(&chunk);
-                if offset >= cr.file_size {
-                    break;
-                }
-            }
-            Ok(data)
-        }
-        .await;
-
-        let _ = client.close(tree_id, &file.file_id).await;
-        read_result
-    }
-
     /// Assemble multipart upload parts into a single file via streaming.
     ///
     /// Reads each temp part using pipelined reads and writes through a WalWriter
@@ -643,21 +613,22 @@ impl ShareSession {
         wal.commit(self).await
     }
 
-    /// Stream one part file into the WAL writer, always closing the part handle
-    /// on every exit path (success, EOF, or read error).
+    /// Stream one source file (a multipart part, or a copy source) into the
+    /// WAL writer, always closing the source handle on every exit path
+    /// (success, EOF, or read error).
     ///
-    /// On a mid-read reset the part read reconnects on a fresh pool connection
-    /// and resumes from the current offset (re-reading the adaptive size each
-    /// batch so the burst shrinks under degradation), so assembling a multipart
-    /// upload survives a degraded NAS internally instead of failing
-    /// CompleteMultipartUpload back to the client. Bounded by MAX_RESET_RETRIES,
-    /// refreshed by each batch that lands.
-    async fn stream_part_into_wal(&self, wal: &mut WalWriter, temp_path: &str) -> io::Result<()> {
+    /// On a mid-read reset the source read reconnects on a fresh pool
+    /// connection and resumes from the current offset (re-reading the adaptive
+    /// size each batch so the burst shrinks under degradation), so multipart
+    /// assembly and CopyObject survive a degraded NAS internally instead of
+    /// failing back to the client. Bounded by MAX_RESET_RETRIES, refreshed by
+    /// each batch that lands.
+    async fn stream_part_into_wal(&self, wal: &mut WalWriter, src_path: &str) -> io::Result<()> {
         let (mut client, mut tree_id) = self.pick_live().await;
         let cr = client
             .create(
                 tree_id,
-                temp_path,
+                src_path,
                 DesiredAccess::GenericRead as u32,
                 ShareAccess::All as u32,
                 CreateDisposition::Open as u32,
@@ -688,7 +659,7 @@ impl ShareSession {
                     break 'read Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         format!(
-                            "unexpected EOF assembling part '{temp_path}': read {offset} of {file_size} bytes"
+                            "unexpected EOF streaming '{src_path}': read {offset} of {file_size} bytes"
                         ),
                     ));
                 }
@@ -714,7 +685,7 @@ impl ShareSession {
                     match c
                         .create(
                             t,
-                            temp_path,
+                            src_path,
                             DesiredAccess::GenericRead as u32,
                             ShareAccess::All as u32,
                             CreateDisposition::Open as u32,
@@ -733,7 +704,7 @@ impl ShareSession {
                         Ok(ncr) => {
                             let _ = c.close(t, &ncr.file_id).await;
                             break 'read Err(io::Error::other(format!(
-                                "part '{temp_path}' changed during assembly: size {file_size} -> {}",
+                                "source '{src_path}' changed mid-stream: size {file_size} -> {}",
                                 ncr.file_size
                             )));
                         }

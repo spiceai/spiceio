@@ -23,10 +23,13 @@ const CHANNEL_CAP: usize = 4096;
 /// BufWriter capacity — bytes buffered before a syscall write.
 const BUF_CAP: usize = 64 * 1024;
 
-/// A queued log line and which console stream it targets.
+/// A queued log line and which console stream it targets, or a flush request.
 enum LogMsg {
     Stdout(String),
     Stderr(String),
+    /// Flush the file buffer and acknowledge — used at shutdown so the final
+    /// lines are on disk before the process exits.
+    Flush(mpsc::SyncSender<()>),
 }
 
 static LOG_TX: OnceLock<mpsc::SyncSender<LogMsg>> = OnceLock::new();
@@ -41,7 +44,11 @@ pub fn init(path: Option<&str>) {
             .create(true)
             .append(true)
             .open(p)
-            .unwrap_or_else(|e| panic!("[spiceio] failed to open log file {p}: {e}"))
+            .unwrap_or_else(|e| {
+                // Config error, not a crash — report cleanly and exit.
+                eprintln!("[spiceio] failed to open log file {p}: {e}");
+                std::process::exit(1);
+            })
     });
 
     let (tx, rx) = mpsc::sync_channel::<LogMsg>(CHANNEL_CAP);
@@ -63,9 +70,15 @@ fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    let handle = |msg: LogMsg, fw: &mut Option<BufWriter<std::fs::File>>| {
+    let handle = |msg: LogMsg,
+                  fw: &mut Option<BufWriter<std::fs::File>>,
+                  acks: &mut Vec<mpsc::SyncSender<()>>| {
         let line = match &msg {
             LogMsg::Stdout(s) | LogMsg::Stderr(s) => s.as_str(),
+            LogMsg::Flush(ack) => {
+                acks.push(ack.clone());
+                return;
+            }
         };
         match &msg {
             LogMsg::Stdout(_) => {
@@ -76,6 +89,7 @@ fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
                 let mut e = stderr.lock();
                 let _ = writeln!(e, "{line}");
             }
+            LogMsg::Flush(_) => unreachable!(),
         }
         if let Some(w) = fw.as_mut() {
             let _ = w.write_all(line.as_bytes());
@@ -83,15 +97,35 @@ fn writer_loop(rx: mpsc::Receiver<LogMsg>, file: Option<std::fs::File>) {
         }
     };
 
+    let mut acks: Vec<mpsc::SyncSender<()>> = Vec::new();
     while let Ok(msg) = rx.recv() {
-        handle(msg, &mut fw);
+        handle(msg, &mut fw, &mut acks);
         // Drain any queued messages before issuing the syscall flush.
         while let Ok(msg) = rx.try_recv() {
-            handle(msg, &mut fw);
+            handle(msg, &mut fw, &mut acks);
         }
         if let Some(w) = fw.as_mut() {
             let _ = w.flush();
         }
+        // Acknowledge flush requests only after the file hit the OS.
+        for ack in acks.drain(..) {
+            let _ = ack.send(());
+        }
+    }
+}
+
+/// Block until all log lines queued so far are flushed (file included), or the
+/// timeout elapses. Call at graceful shutdown — without it the writer thread
+/// dies with the process and the final buffered lines are lost.
+pub fn flush(timeout: std::time::Duration) {
+    let Some(tx) = LOG_TX.get() else { return };
+    let (ack_tx, ack_rx) = mpsc::sync_channel::<()>(1);
+    if tx.try_send(LogMsg::Flush(ack_tx)).is_ok() {
+        let _ = ack_rx.recv_timeout(timeout);
+    } else {
+        // Channel full — the writer is mid-batch and flushes after each drain;
+        // give it a moment rather than blocking indefinitely.
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

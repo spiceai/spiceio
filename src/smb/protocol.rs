@@ -195,11 +195,14 @@ pub fn credit_charge_for(payload_size: u32) -> u16 {
 
 /// SMB 3.1.x dialect family
 pub const DIALECT_SMB3_1_1: u16 = 0x0311;
-pub const DIALECT_SMB3_0_2: u16 = 0x0302;
-pub const DIALECT_SMB3_0_0: u16 = 0x0300;
 
-// Offered dialects in preference order (highest first)
-const DIALECTS: [u16; 3] = [DIALECT_SMB3_1_1, DIALECT_SMB3_0_2, DIALECT_SMB3_0_0];
+// Offer 3.1.1 only. Our signing-key derivation is the 3.1.1 KDF
+// (preauth-integrity-hash context, "SMBSigningKey" label); SMB 3.0.x derives
+// signing keys differently ("SMB2AESCMAC"/"SmbSign"), so a server that
+// negotiated 3.0.x would reject every signed request we send. Offering a
+// dialect we cannot actually sign for turns "unsupported server" into a
+// confusing mid-session auth failure — refuse it at negotiate instead.
+const DIALECTS: [u16; 1] = [DIALECT_SMB3_1_1];
 
 // Negotiate context types for SMB 3.1.1
 const SMB2_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;

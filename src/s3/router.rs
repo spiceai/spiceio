@@ -257,7 +257,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         Method::PUT => {
             // CopyObject: PUT with x-amz-copy-source header
             if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-                handle_copy_object(&hdrs, share, key).await
+                handle_copy_object(&hdrs, state, key).await
             } else {
                 handle_put_object(req, &hdrs, share, key).await
             }
@@ -665,6 +665,24 @@ async fn handle_get_object(
         (0, file_size.saturating_sub(1), false)
     };
 
+    // A zero-byte object (reachable here when the compound fast path hit a
+    // transient reset, or when an invalid Range header is ignored): the
+    // `end - start + 1` math below assumes at least one byte and would emit
+    // Content-Length: 1 with an aborted body. Serve the empty object directly.
+    // (A *valid* Range on an empty object already returned 416 above.)
+    if !is_range && file_size == 0 {
+        let _ = handle.close().await;
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", &content_type)
+            .header("Content-Length", "0")
+            .header("ETag", &etag)
+            .header("Last-Modified", last_modified)
+            .header("Accept-Ranges", "bytes")
+            .body(SpiceioBody::empty())
+            .unwrap();
+    }
+
     let content_length = end - start + 1;
 
     // Build response with streaming body.
@@ -971,11 +989,26 @@ async fn handle_put_object(
 
 // ── CopyObject ──────────────────────────────────────────────────────────────
 
+/// Parse an `x-amz-copy-source` header into (bucket, percent-decoded key).
+/// Accepts `/bucket/key` and `bucket/key`; strips a `?versionId=…` suffix
+/// (versioning is not supported, but clients send it — it must not become
+/// part of the key).
+fn parse_copy_source(header: &str) -> (String, String) {
+    let path = header.split('?').next().unwrap_or(header);
+    let path = path.trim_start_matches('/');
+    let (bucket, raw_key) = match path.find('/') {
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => (path, ""),
+    };
+    (bucket.to_string(), percent_decode(raw_key))
+}
+
 async fn handle_copy_object(
     hdrs: &http::HeaderMap,
-    share: &ShareSession,
+    state: &AppState,
     dest_key: &str,
 ) -> Response<SpiceioBody> {
+    let share = &state.share;
     let copy_source = match get_header(hdrs, X_AMZ_COPY_SOURCE) {
         Some(s) => s.to_string(),
         None => {
@@ -987,15 +1020,27 @@ async fn handle_copy_object(
         }
     };
 
-    // Parse source: /bucket/key or bucket/key
-    let src_key = copy_source.trim_start_matches('/');
-    let src_key = match src_key.find('/') {
-        Some(pos) => &src_key[pos + 1..],
-        None => src_key,
-    };
-    let src_key = percent_encoding::percent_decode_str(src_key)
-        .decode_utf8_lossy()
-        .into_owned();
+    let (src_bucket, src_key) = parse_copy_source(&copy_source);
+
+    // The source must name our (single) bucket — without this check a copy
+    // from "any-bucket/key" silently reads key from this share.
+    if src_bucket != state.bucket {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified source bucket does not exist.",
+        );
+    }
+    // The destination key was traversal-checked by the router; the source key
+    // arrives via this header and needs the same check, or `..` segments
+    // could read files outside the share root.
+    if src_key.is_empty() || key_has_traversal(&src_key) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Invalid x-amz-copy-source key",
+        );
+    }
 
     // Conditional copy headers
     let if_match = get_header(hdrs, X_AMZ_COPY_SOURCE_IF_MATCH).map(String::from);
@@ -1185,9 +1230,13 @@ async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<Sp
                 }
             }
             Err(e) => {
+                let code = match e.kind() {
+                    io::ErrorKind::PermissionDenied => "AccessDenied",
+                    _ => "InternalError",
+                };
                 w.open("Error");
                 w.element("Key", key);
-                w.element("Code", "InternalError");
+                w.element("Code", code);
                 w.element("Message", &e.to_string());
                 w.close("Error");
             }
@@ -1240,6 +1289,16 @@ async fn handle_upload_part(
         );
     }
 
+    // Reject an unknown/completed/aborted uploadId before buffering the body
+    // and writing a temp file the upload map would never track.
+    if state.multipart.get(upload_id).await.is_none() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        );
+    }
+
     let body = match collect_body(req).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -1271,16 +1330,29 @@ async fn handle_upload_part(
         return io_to_s3_error(&e);
     }
 
-    state
+    // The upload can be completed/aborted/reaped while the part body was
+    // uploading; `put_part` returns None then. Returning 200 anyway would
+    // acknowledge a part that no completion can ever reference — surface
+    // NoSuchUpload (per S3) and remove the orphaned temp file.
+    if state
         .multipart
         .put_part(
             upload_id,
             part_number,
             body.len() as u64,
             etag.clone(),
-            temp_path,
+            temp_path.clone(),
         )
-        .await;
+        .await
+        .is_none()
+    {
+        state.share.delete_temp(&temp_path).await;
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        );
+    }
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1306,6 +1378,17 @@ async fn handle_complete_multipart_upload(
         }
     };
 
+    // An uploadId is scoped to the key it was initiated for. Completing it
+    // against a different key would assemble the object at a path the client
+    // never initiated — S3 treats the pair as nonexistent.
+    if upload.key != key {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist for this key.",
+        );
+    }
+
     // Parse the completion XML to get ordered parts
     let body_str = String::from_utf8_lossy(&body_bytes);
     let part_numbers: Vec<u32> = xml::extract_sections(&body_str, "<Part>", "</Part>")
@@ -1314,6 +1397,16 @@ async fn handle_complete_multipart_upload(
             xml::extract_element(section, "PartNumber").and_then(|s| s.parse().ok())
         })
         .collect();
+
+    // S3 rejects a completion naming zero parts; assembling it would quietly
+    // produce an empty object.
+    if part_numbers.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "You must specify at least one part",
+        );
+    }
 
     // S3 requires PartNumbers to be strictly ascending and unique; otherwise
     // assembling in the client-supplied order would silently produce a
@@ -1881,6 +1974,34 @@ mod tests {
         assert!(!key_has_traversal("a/b/c.txt"));
         // ".." only as a full path segment, not a prefix.
         assert!(!key_has_traversal("..foo/bar"));
+    }
+
+    #[test]
+    fn parse_copy_source_forms() {
+        // Leading slash and bare forms.
+        assert_eq!(
+            parse_copy_source("/bucket/a/b.txt"),
+            ("bucket".into(), "a/b.txt".into())
+        );
+        assert_eq!(
+            parse_copy_source("bucket/a/b.txt"),
+            ("bucket".into(), "a/b.txt".into())
+        );
+        // Percent-decoding applies to the key.
+        assert_eq!(
+            parse_copy_source("/bucket/a%20b.txt"),
+            ("bucket".into(), "a b.txt".into())
+        );
+        // versionId suffix is stripped, never folded into the key.
+        assert_eq!(
+            parse_copy_source("/bucket/k.txt?versionId=abc123"),
+            ("bucket".into(), "k.txt".into())
+        );
+        // Bucket-only (no key) yields an empty key, which the handler rejects.
+        assert_eq!(parse_copy_source("/bucket"), ("bucket".into(), "".into()));
+        // Traversal survives decoding for the handler's check to catch.
+        let (_, k) = parse_copy_source("/bucket/%2e%2e/etc/passwd");
+        assert!(key_has_traversal(&k));
     }
 
     #[test]

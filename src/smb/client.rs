@@ -340,6 +340,23 @@ impl SmbClient {
             crate::serr!("[spiceio] smb invalid negotiate response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid negotiate response")
         })?;
+        // We only offer (and can only sign for) SMB 3.1.1 — its signing key is
+        // derived from the preauth integrity hash, which earlier dialects do
+        // not use. A server answering with anything else is misbehaving;
+        // continuing would fail with signature errors on every request.
+        if neg_resp.dialect_revision != DIALECT_SMB3_1_1 {
+            crate::serr!(
+                "[spiceio] smb server negotiated unsupported dialect 0x{:04X} (require 3.1.1)",
+                neg_resp.dialect_revision
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "server negotiated unsupported SMB dialect 0x{:04X} (require 3.1.1)",
+                    neg_resp.dialect_revision
+                ),
+            ));
+        }
         let io_cap = if self.config.max_io_size > 0 {
             self.config.max_io_size
         } else {
@@ -1303,6 +1320,16 @@ impl SmbClient {
                 resp[1].0.status
             )));
         }
+        // A success status with a short count would silently truncate the
+        // object while PutObject reports 200 — verify every byte landed.
+        let written = decode_write_response(&resp[1].1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid write response"))?;
+        if written as usize != data.len() {
+            return Err(io::Error::other(format!(
+                "compound write short: {written} of {} bytes for {path}",
+                data.len()
+            )));
+        }
 
         Ok(decode_close_response(&resp[2].1).unwrap_or(CloseResponse {
             last_write_time: 0,
@@ -1396,13 +1423,18 @@ pub(crate) fn effective_io_sizes(
             v
         }
     };
+    // A single SMB2 message must fit the 24-bit NetBIOS length frame the
+    // transport writes (`len & 0x00FF_FFFF`). An `SPICEIO_SMB_MAX_IO` above
+    // ~16 MiB would silently truncate the frame length and desynchronize the
+    // stream — clamp well below the limit (headroom for headers).
+    const MAX_WIRE_IO: u32 = 0x00F0_0000; // 15 MiB
     let read = nonzero("max_read_size", neg_max_read, &mut on_zero);
     let write = nonzero("max_write_size", neg_max_write, &mut on_zero);
     let transact = nonzero("max_transact_size", neg_max_transact, &mut on_zero);
     // Cap standalone I/O by: min(server_advertised, max_transact, configured_cap).
     // Many NAS servers advertise multi-MB limits but fail at much smaller sizes.
-    let max_read = read.min(transact).min(io_cap);
-    let max_write = write.min(transact).min(io_cap);
+    let max_read = read.min(transact).min(io_cap).min(MAX_WIRE_IO);
+    let max_write = write.min(transact).min(io_cap).min(MAX_WIRE_IO);
     // Cap at 64KB for compound requests — some NAS servers reject larger
     // payloads inside compound (chained) operations.
     EffectiveIoSizes {
@@ -1458,6 +1490,12 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
         | 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
         | 0xC000_003A // STATUS_OBJECT_PATH_NOT_FOUND
         | 0xC000_0033 // STATUS_OBJECT_NAME_INVALID
+        // The S3 namespace has no directories: a key that resolves to an SMB
+        // directory (GET dir-as-key), a path whose intermediate component is a
+        // file, or a file mid-deletion is "no such key", not a 500.
+        | 0xC000_00BA // STATUS_FILE_IS_A_DIRECTORY
+        | 0xC000_0103 // STATUS_NOT_A_DIRECTORY
+        | 0xC000_0056 // STATUS_DELETE_PENDING
         => io::Error::new(io::ErrorKind::NotFound, format!("not found: {path}")),
 
         0xC000_0022 => io::Error::new( // STATUS_ACCESS_DENIED
