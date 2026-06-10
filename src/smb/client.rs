@@ -190,16 +190,100 @@ impl SmbClient {
         self.alloc_ids(1)
     }
 
-    /// Allocate a MessageId range spanning `total_charge` sequence numbers and
-    /// consume the same amount from the credit balance. Charges and MessageIds
-    /// advance in lockstep, so "balance ≥ 0" is exactly "every allocated
-    /// MessageId lies within the server-granted sequence window" — callers
-    /// check affordability *before* allocating (`affordable_count` /
-    /// `affordable_prefix`).
+    /// Allocate a MessageId range spanning `total_charge` sequence numbers AND
+    /// atomically consume the same amount from the credit balance, for callers
+    /// that charge a *fixed* amount (single write, compound chains, handshake).
+    /// Charges and MessageIds advance together, so "balance ≥ 0" means "every
+    /// allocated MessageId lies within the server-granted sequence window".
     fn alloc_ids(&self, total_charge: u64) -> u64 {
         self.credits
-            .fetch_sub(total_charge as i64, Ordering::Relaxed);
+            .fetch_sub(total_charge as i64, Ordering::AcqRel);
         self.message_id.fetch_add(total_charge, Ordering::Relaxed)
+    }
+
+    /// Advance the MessageId window by `total_charge` *without* touching the
+    /// credit balance — for callers that already reserved their credits via
+    /// `reserve_*` (the variable-size pipelined / single-IO paths). Splitting
+    /// reservation from MessageId allocation lets reservation be a single
+    /// atomic CAS (see `reserve_request_count`).
+    fn alloc_msg_ids(&self, total_charge: u64) -> u64 {
+        self.message_id.fetch_add(total_charge, Ordering::Relaxed)
+    }
+
+    /// Atomically reserve credits for up to `want` requests of `charge` credits
+    /// each, returning how many were granted. A single CAS makes the
+    /// affordability check and the debit one indivisible step, so concurrent
+    /// callers cannot both observe the same balance and each commit a full
+    /// batch — which would put far more in-flight charge on the wire than the
+    /// server granted and trip its sequence window. Always grants ≥ 1 when
+    /// `want ≥ 1` (the bounded per-request overdraft: a compliant server keeps
+    /// the balance ≥ 1, so the floor only bites on a fresh or stingy
+    /// connection and merely prevents a stuck transfer). Reservations are
+    /// conservative — held from here until the response replenishes the
+    /// balance via `harvest_credits` — which errs on the safe side of the grant.
+    fn reserve_request_count(&self, charge: u16, want: usize) -> usize {
+        if want == 0 {
+            return 0;
+        }
+        let per = i64::from(charge.max(1));
+        let mut bal = self.credits.load(Ordering::Relaxed);
+        loop {
+            let n = affordable_count(bal, charge, want);
+            let cost = n as i64 * per;
+            match self.credits.compare_exchange_weak(
+                bal,
+                bal - cost,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return n,
+                Err(actual) => bal = actual,
+            }
+        }
+    }
+
+    /// Atomically reserve credits for the longest prefix of `chunks` that fits
+    /// the balance (always ≥ 1 chunk — same bounded overdraft as
+    /// `reserve_request_count`), returning `(chunk_count, total_charge)`. CAS
+    /// for the same race-freedom reason as the read path.
+    fn reserve_chunk_prefix(&self, chunks: &[&[u8]]) -> (usize, u64) {
+        if chunks.is_empty() {
+            return (0, 0);
+        }
+        let mut bal = self.credits.load(Ordering::Relaxed);
+        loop {
+            let (take, total) = affordable_prefix(bal, chunks);
+            match self.credits.compare_exchange_weak(
+                bal,
+                bal - total as i64,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return (take, total),
+                Err(actual) => bal = actual,
+            }
+        }
+    }
+
+    /// Atomically reserve credits for a single read/write of up to `length`
+    /// bytes, returning the granted length (clamped to the balance, floored at
+    /// one credit's worth). CAS so a concurrent op can't reserve the same
+    /// credits.
+    fn reserve_io_len(&self, length: u32) -> u32 {
+        let mut bal = self.credits.load(Ordering::Relaxed);
+        loop {
+            let len = length.min(credit_affordable_bytes(bal));
+            let cost = i64::from(credit_charge_for(len));
+            match self.credits.compare_exchange_weak(
+                bal,
+                bal - cost,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return len,
+                Err(actual) => bal = actual,
+            }
+        }
     }
 
     /// Bank the credits granted by a response. Every response — including
@@ -207,13 +291,7 @@ impl SmbClient {
     /// a `CreditResponse` grant that replenishes the connection's balance.
     fn harvest_credits(&self, hdr: &Header) {
         self.credits
-            .fetch_add(i64::from(hdr.credits), Ordering::Relaxed);
-    }
-
-    /// Current credit balance (may be momentarily negative under the bounded
-    /// single-request overdraft `affordable_count` permits).
-    fn credit_balance(&self) -> i64 {
-        self.credits.load(Ordering::Relaxed)
+            .fetch_add(i64::from(hdr.credits), Ordering::AcqRel);
     }
 
     /// Log the first credit-limited batch on this connection — expected on a
@@ -627,12 +705,14 @@ impl SmbClient {
         offset: u64,
         length: u32,
     ) -> io::Result<bytes::Bytes> {
-        // Clamp the request to the credit balance (floor: one credit's worth)
-        // so a multi-credit read never exceeds the granted sequence window.
-        let length = length.min(credit_affordable_bytes(self.credit_balance()));
+        // Atomically reserve credits for (and clamp to) this read, so a
+        // multi-credit read never exceeds the granted sequence window even
+        // under concurrent callers (floor: one credit's worth).
+        let length = self.reserve_io_len(length);
         // Multi-credit commands (payload > 64 KiB) consume `credit_charge`
-        // sequence numbers, so advance the MessageId window by the charge.
-        let msg_id = self.alloc_ids(credit_charge_for(length) as u64);
+        // sequence numbers; the credits are already reserved, so just advance
+        // the MessageId window by the charge.
+        let msg_id = self.alloc_msg_ids(credit_charge_for(length) as u64);
         let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(length);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -724,9 +804,9 @@ impl SmbClient {
         // next batch resumes from the new offset with a replenished balance.
         let charge = credit_charge_for(chunk_size) as u64;
         let want = count;
-        let count = affordable_count(self.credit_balance(), charge as u16, count);
+        let count = self.reserve_request_count(charge as u16, count);
         self.note_credit_clamp(want, count);
-        let base_msg_id = self.alloc_ids(count as u64 * charge);
+        let base_msg_id = self.alloc_msg_ids(count as u64 * charge);
 
         // Each request: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 49
         // (read request fixed part incl. 1-byte buffer pad).
@@ -848,9 +928,11 @@ impl SmbClient {
     ) -> io::Result<u32> {
         let mut sent = 0usize;
         while sent < data.len() {
-            // Clamp each sub-write to the credit balance (floor: one credit).
-            let take =
-                (data.len() - sent).min(credit_affordable_bytes(self.credit_balance()) as usize);
+            // Atomically reserve credits for (and clamp) each sub-write, so it
+            // never exceeds the granted window under concurrent callers (floor:
+            // one credit). `write_once` then only advances the MessageId window.
+            let want = (data.len() - sent).min(u32::MAX as usize) as u32;
+            let take = self.reserve_io_len(want) as usize;
             let written = self
                 .write_once(
                     tree_id,
@@ -880,8 +962,9 @@ impl SmbClient {
         offset: u64,
         data: &[u8],
     ) -> io::Result<u32> {
-        // Multi-credit commands consume `credit_charge` sequence numbers.
-        let msg_id = self.alloc_ids(credit_charge_for(data.len() as u32) as u64);
+        // Credits were reserved by the caller (`write`) via `reserve_io_len`;
+        // just advance the MessageId window by this request's charge.
+        let msg_id = self.alloc_msg_ids(credit_charge_for(data.len() as u32) as u64);
         let mut hdr = Header::new(Command::Write, msg_id).with_credit_charge(data.len() as u32);
         hdr.session_id = self.session_id;
         hdr.tree_id = tree_id;
@@ -959,11 +1042,11 @@ impl SmbClient {
         // charge than the server granted violates the sequence window.
         // Callers advance by the returned byte count and re-send the
         // remainder, so a shortened batch self-heals on the next window.
-        let (take, total_charge) = affordable_prefix(self.credit_balance(), chunks);
+        let (take, total_charge) = self.reserve_chunk_prefix(chunks);
         self.note_credit_clamp(chunks.len(), take);
         let chunks = &chunks[..take];
         let n = chunks.len();
-        let base_msg_id = self.alloc_ids(total_charge);
+        let base_msg_id = self.alloc_msg_ids(total_charge);
 
         // Each packet: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 48
         // (write request fixed part) + chunk data.

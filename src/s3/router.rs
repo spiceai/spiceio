@@ -182,7 +182,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         // branch the copy-source PUT falls through to a normal UploadPart,
         // which reads an empty body and returns the wrong response shape.
         let resp = if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-            handle_upload_part_copy(&hdrs, state, &upload_id, part_number).await
+            handle_upload_part_copy(&hdrs, state, key, &upload_id, part_number).await
         } else {
             handle_upload_part(req, state, key, &upload_id, part_number).await
         };
@@ -1286,7 +1286,7 @@ async fn handle_create_multipart_upload(
 async fn handle_upload_part(
     req: Request<Incoming>,
     state: &AppState,
-    _key: &str,
+    key: &str,
     upload_id: &str,
     part_number: u32,
 ) -> Response<SpiceioBody> {
@@ -1298,14 +1298,19 @@ async fn handle_upload_part(
         );
     }
 
-    // Reject an unknown/completed/aborted uploadId before buffering the body
-    // and writing a temp file the upload map would never track.
-    if state.multipart.get(upload_id).await.is_none() {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "The specified upload does not exist.",
-        );
+    // Reject an unknown/completed/aborted uploadId — or one initiated for a
+    // different key (the uploadId is scoped to its key, matching the check in
+    // CompleteMultipartUpload) — before buffering the body and writing a temp
+    // file the upload map would never track.
+    match state.multipart.get(upload_id).await {
+        Some(u) if u.key == key => {}
+        _ => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "The specified upload does not exist.",
+            );
+        }
     }
 
     let body = match collect_body(req).await {
@@ -1381,6 +1386,7 @@ async fn handle_upload_part(
 async fn handle_upload_part_copy(
     hdrs: &http::HeaderMap,
     state: &AppState,
+    key: &str,
     upload_id: &str,
     part_number: u32,
 ) -> Response<SpiceioBody> {
@@ -1392,13 +1398,19 @@ async fn handle_upload_part_copy(
         );
     }
 
-    // Reject an unknown/completed/aborted uploadId before touching the source.
-    if state.multipart.get(upload_id).await.is_none() {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "The specified upload does not exist.",
-        );
+    // Reject an unknown/completed/aborted uploadId — or one initiated for a
+    // different key — before touching the source. The uploadId is scoped to
+    // its key (same rule as CompleteMultipartUpload); accepting a part against
+    // a mismatched key would create a part no completion could reference.
+    match state.multipart.get(upload_id).await {
+        Some(u) if u.key == key => {}
+        _ => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "The specified upload does not exist.",
+            );
+        }
     }
 
     // Source key: same parse + validation as CopyObject (bucket match,
