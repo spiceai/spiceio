@@ -5,6 +5,7 @@ use http::HeaderMap;
 // ── Standard S3 request headers ─────────────────────────────────────────────
 
 pub const X_AMZ_COPY_SOURCE: &str = "x-amz-copy-source";
+pub const X_AMZ_COPY_SOURCE_RANGE: &str = "x-amz-copy-source-range";
 
 // ── Conditional headers ─────────────────────────────────────────────────────
 

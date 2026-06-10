@@ -35,9 +35,13 @@ jobs:
         run: cargo build --release --locked --bin spiceio
 
       - name: Package binary
+        # Bundle the dSYM alongside the (stripped) binary so a production crash
+        # report's raw addresses can be symbolized offline against this exact
+        # build: `atos -o spiceio.dSYM/Contents/Resources/DWARF/spiceio
+        # -l <image base from the report> <addrs...>`.
         run: |
           cd target/release
-          tar czf spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz spiceio
+          tar czf spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz spiceio spiceio.dSYM
           shasum -a 256 spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz > spiceio-${{ runner.os }}-${{ runner.arch }}.tar.gz.sha256
 
       - name: Upload release assets

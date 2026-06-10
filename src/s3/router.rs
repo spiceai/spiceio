@@ -176,7 +176,16 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let upload_id = extract_query_param(&query, "uploadId").unwrap_or_default();
-        let resp = handle_upload_part(req, state, key, &upload_id, part_number).await;
+        // UploadPartCopy: a part sourced from another object carries
+        // x-amz-copy-source (no body) — the form `aws s3 cp` / `sync` use for
+        // any object over the multipart threshold (~8 MiB). Without this
+        // branch the copy-source PUT falls through to a normal UploadPart,
+        // which reads an empty body and returns the wrong response shape.
+        let resp = if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
+            handle_upload_part_copy(&hdrs, state, &upload_id, part_number).await
+        } else {
+            handle_upload_part(req, state, key, &upload_id, part_number).await
+        };
         return with_common_headers(resp, &request_id, &state.region);
     }
 
@@ -1359,6 +1368,172 @@ async fn handle_upload_part(
         .header("ETag", format!("\"{}\"", etag))
         .body(SpiceioBody::empty())
         .unwrap()
+}
+
+/// UploadPartCopy — a multipart part whose content is a (range of a) source
+/// object rather than the request body. This is what `aws s3 cp` / `sync` and
+/// the SDKs use to copy any object above the multipart threshold (~8 MiB), so
+/// without it large server-side copies fail. The part is materialized as a
+/// temp file with a real SHA-256 ETag, exactly like a body-sourced part, and
+/// the response is a `CopyPartResult` (the ETag lives in the XML body here,
+/// not the header — that response-shape difference is why a copy-source PUT
+/// must not fall through to the regular UploadPart handler).
+async fn handle_upload_part_copy(
+    hdrs: &http::HeaderMap,
+    state: &AppState,
+    upload_id: &str,
+    part_number: u32,
+) -> Response<SpiceioBody> {
+    if part_number == 0 || part_number > 10000 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Part number must be 1-10000",
+        );
+    }
+
+    // Reject an unknown/completed/aborted uploadId before touching the source.
+    if state.multipart.get(upload_id).await.is_none() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        );
+    }
+
+    // Source key: same parse + validation as CopyObject (bucket match,
+    // traversal check, versionId stripped).
+    let copy_source = get_header(hdrs, X_AMZ_COPY_SOURCE).unwrap_or_default();
+    let (src_bucket, src_key) = parse_copy_source(copy_source);
+    if src_bucket != state.bucket {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified source bucket does not exist.",
+        );
+    }
+    if src_key.is_empty() || key_has_traversal(&src_key) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Invalid x-amz-copy-source key",
+        );
+    }
+
+    // Optional byte range of the source for this part. Unlike Range, S3's
+    // copy-source-range requires both bounds; we resolve/clamp in read_range.
+    let range = match get_header(hdrs, X_AMZ_COPY_SOURCE_RANGE) {
+        Some(r) => match parse_range(r).and_then(|spec| match (spec.start, spec.end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        }) {
+            Some(pair) => Some(pair),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Invalid x-amz-copy-source-range",
+                );
+            }
+        },
+        None => None,
+    };
+
+    // Bound the in-memory part the same way UploadPart bounds a body part.
+    if let Some((s, e)) = range
+        && e.saturating_sub(s).saturating_add(1) > MAX_BUFFERED_BODY as u64
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "EntityTooLarge",
+            "Copy-source range exceeds the maximum part size",
+        );
+    }
+
+    let (src_meta, data) = match state.share.read_range(&src_key, range).await {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "The specified source key does not exist.",
+            );
+        }
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidRange",
+                "The x-amz-copy-source-range is not satisfiable",
+            );
+        }
+        Err(e) => return io_to_s3_error(&e),
+    };
+    // A whole-object copy that buffered past the cap (range was None, so the
+    // size wasn't known until the read) is rejected too.
+    if data.len() > MAX_BUFFERED_BODY {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "EntityTooLarge",
+            "Copy-source object exceeds the maximum part size",
+        );
+    }
+
+    let etag = {
+        let data = data.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::crypto::hex_encode(&crate::crypto::sha256(&data))
+        })
+        .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                crate::serr!("[spiceio] upload-part-copy hash task failed: {e}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "hash failed",
+                );
+            }
+        }
+    };
+
+    let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
+    if let Err(e) = state.share.write_temp(&temp_path, &data).await {
+        return io_to_s3_error(&e);
+    }
+
+    // Same race guard as UploadPart: the upload may have been completed/aborted
+    // while the source was being copied.
+    if state
+        .multipart
+        .put_part(
+            upload_id,
+            part_number,
+            data.len() as u64,
+            etag.clone(),
+            temp_path.clone(),
+        )
+        .await
+        .is_none()
+    {
+        state.share.delete_temp(&temp_path).await;
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        );
+    }
+
+    let mut w = XmlWriter::new();
+    w.declaration();
+    w.open_ns("CopyPartResult", S3_XMLNS);
+    w.element(
+        "LastModified",
+        &xml::epoch_to_iso8601(src_meta.last_modified),
+    );
+    w.element("ETag", &format!("\"{etag}\""));
+    w.close("CopyPartResult");
+    xml_response(StatusCode::OK, w.finish())
 }
 
 async fn handle_complete_multipart_upload(

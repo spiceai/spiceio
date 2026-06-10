@@ -91,7 +91,7 @@ All configuration is via environment variables:
 
 - **Objects**: GetObject (range + conditional), PutObject (conditional-write), CopyObject, DeleteObject, HeadObject
 - **Listing**: ListObjectsV1, ListObjectsV2, ListBuckets
-- **Multipart**: CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads
+- **Multipart**: CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads (UploadPartCopy is what `aws s3 cp`/`sync` use to copy objects above the ~8 MiB multipart threshold)
 - **Bucket**: HeadBucket, GetBucketLocation, CreateBucket, DeleteBucket
 - **Stubs**: ACL, tagging, versioning, encryption, lifecycle, CORS (returns valid empty responses)
 
@@ -111,8 +111,8 @@ version, pid, uptime, thread, panic message + source location, fault address
 and registers for signals, and a backtrace.
 
 Release binaries are stripped, so reports include the image load address and
-ASLR slide; `make release` also emits `target/release/spiceio.dSYM`, and raw
-addresses symbolize offline with:
+ASLR slide; `make release` also emits `target/release/spiceio.dSYM` (and the
+release tarball bundles it), so raw addresses symbolize offline with:
 
 ```bash
 atos -o target/release/spiceio.dSYM/Contents/Resources/DWARF/spiceio \

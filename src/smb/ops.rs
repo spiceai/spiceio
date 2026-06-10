@@ -140,6 +140,84 @@ impl ShareSession {
         })
     }
 
+    /// Read the inclusive byte range `[start, end]` of `key` into memory,
+    /// along with the source's metadata. Used by UploadPartCopy, where the
+    /// part is fully materialized as a temp file anyway (mirroring the regular
+    /// UploadPart path, which buffers the part to hash it). Callers cap the
+    /// range to bound memory; pass `None` for the whole object.
+    ///
+    /// Returns the source `ObjectMeta` and the range bytes. A genuine read
+    /// reset surfaces as a retryable error (the client retries the part).
+    pub async fn read_range(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> io::Result<(ObjectMeta, Vec<u8>)> {
+        let handle = self.open_read(key).await?;
+        let meta = handle.meta.clone();
+        let file_size = handle.file_size;
+
+        let (start, end) = match range {
+            Some((s, e)) => {
+                // copy-source-range names explicit, in-bounds positions.
+                if s > e || s >= file_size {
+                    let _ = handle.close().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "copy-source-range is not satisfiable",
+                    ));
+                }
+                (s, e.min(file_size.saturating_sub(1)))
+            }
+            None => {
+                if file_size == 0 {
+                    let _ = handle.close().await;
+                    return Ok((meta, Vec::new()));
+                }
+                (0, file_size - 1)
+            }
+        };
+
+        let stream_end = end + 1;
+        let chunk = handle.max_chunk.max(1);
+        let mut buf: Vec<u8> = Vec::with_capacity((stream_end - start) as usize);
+        let mut offset = start;
+        let result: io::Result<()> = async {
+            while offset < stream_end {
+                let chunks = handle
+                    .read_pipeline(offset, chunk, stream_end - offset)
+                    .await?;
+                if chunks.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "source ended before the requested range",
+                    ));
+                }
+                for c in chunks {
+                    if c.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short read while copying range",
+                        ));
+                    }
+                    // The last pipelined chunk can overshoot `end` (reads are
+                    // chunk-aligned); take only the bytes within the range.
+                    let take = ((stream_end - offset) as usize).min(c.len());
+                    buf.extend_from_slice(&c[..take]);
+                    offset += take as u64;
+                    if offset >= stream_end {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = handle.close().await;
+        result?;
+        Ok((meta, buf))
+    }
+
     /// Open (or create) a file for streaming writes. Handle pinned to one connection.
     pub async fn open_write(&self, key: &str) -> io::Result<FileHandle> {
         let (client, tree_id) = self.pick();

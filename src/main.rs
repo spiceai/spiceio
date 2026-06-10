@@ -126,7 +126,10 @@ async fn main() {
         return;
     }
 
-    let log_file = env::var("SPICEIO_LOG_FILE").ok();
+    // Treat an empty SPICEIO_LOG_FILE as unset: CI and the test scripts may
+    // forward the variable unconditionally (`SPICEIO_LOG_FILE="${VAR:-}"`), and
+    // opening the path "" would otherwise fail and exit at startup.
+    let log_file = env::var("SPICEIO_LOG_FILE").ok().filter(|s| !s.is_empty());
     log::init(log_file.as_deref());
     // Crash reporting (panic hook + fatal-signal handlers) — as early as
     // possible so every later failure leaves a report on stderr + log file.
