@@ -51,6 +51,16 @@ struct Config {
     smb_max_io: u32,
 }
 
+/// Exit nonzero after draining the async logger. The log writer thread dies
+/// with the process, so an `exit()` immediately after `serr!`/`slog!` would
+/// drop the just-queued line (the channel is non-blocking and drains on its
+/// own thread). Flushing first guarantees the message reaches stderr and the
+/// log file — important for one-line startup/config errors.
+fn flush_and_exit(code: i32) -> ! {
+    log::flush(Duration::from_millis(500));
+    std::process::exit(code);
+}
+
 /// Read a required env var, exiting with a clean config error (not a panic /
 /// crash report) when missing or empty.
 fn require_env(name: &str) -> String {
@@ -58,7 +68,7 @@ fn require_env(name: &str) -> String {
         Ok(v) if !v.is_empty() => v,
         _ => {
             serr!("[spiceio] {name} is required");
-            std::process::exit(1);
+            flush_and_exit(1);
         }
     }
 }
@@ -87,7 +97,7 @@ impl Config {
                     Ok(addr) => addr,
                     Err(_) => {
                         serr!("[spiceio] SPICEIO_BIND is not a valid socket address: {raw}");
-                        std::process::exit(1);
+                        flush_and_exit(1);
                     }
                 }
             },
@@ -166,14 +176,14 @@ async fn main() {
                         Some(n) if n - start_port <= 100 => n,
                         _ => {
                             serr!("no available port in range {start_port}–{}", addr.port());
-                            std::process::exit(1);
+                            flush_and_exit(1);
                         }
                     };
                     addr.set_port(next);
                 }
                 Err(e) => {
                     serr!("failed to bind TCP listener: {e}");
-                    std::process::exit(1);
+                    flush_and_exit(1);
                 }
             }
         }
@@ -208,8 +218,7 @@ async fn main() {
                 config.smb_server,
                 config.smb_port
             );
-            log::flush(Duration::from_millis(500));
-            std::process::exit(1);
+            flush_and_exit(1);
         }
     };
 
@@ -220,8 +229,7 @@ async fn main() {
                 "[spiceio] failed to connect to SMB share '{}': {e}",
                 config.smb_share
             );
-            log::flush(Duration::from_millis(500));
-            std::process::exit(1);
+            flush_and_exit(1);
         }
     };
 

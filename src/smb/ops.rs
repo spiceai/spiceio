@@ -316,11 +316,14 @@ impl ShareSession {
                 .await
             {
                 Ok(d) => d,
-                // The top-level open propagates (NotFound → empty listing at
-                // the router); a subdirectory that vanished or errored
-                // mid-walk is skipped, matching S3's view of concurrently
-                // deleted keys.
-                Err(e) if first => return Err(e),
+                // The top-level open always propagates (NotFound → empty
+                // listing at the router). For a subdirectory, only a vanished
+                // dir (NotFound) is skipped — that matches S3's view of a key
+                // concurrently deleted mid-walk. Any other error
+                // (PermissionDenied, an SMB protocol failure, …) propagates:
+                // silently dropping it would return an incomplete listing the
+                // client trusts as complete (IsTruncated=false).
+                Err(e) if first || e.kind() != io::ErrorKind::NotFound => return Err(e),
                 Err(_) => continue,
             };
 
@@ -330,7 +333,10 @@ impl ShareSession {
             let _ = client.close(tree_id, &dir.file_id).await;
             let entries = match entries {
                 Ok(e) => e,
-                Err(e) if first => return Err(e),
+                // Same rule as the open above: tolerate only a vanished
+                // subdirectory; propagate every other error rather than
+                // truncate the listing silently.
+                Err(e) if first || e.kind() != io::ErrorKind::NotFound => return Err(e),
                 Err(_) => continue,
             };
             first = false;

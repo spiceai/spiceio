@@ -29,10 +29,8 @@
 //! handler restores the default disposition *first*, so a nested fault while
 //! reporting terminates the process instead of looping.
 
-use std::io::Write as _;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 // ── libc / libSystem FFI ────────────────────────────────────────────────────
 
@@ -49,10 +47,22 @@ const SA_ONSTACK: i32 = 0x0001;
 const SA_SIGINFO: i32 = 0x0040;
 const SIG_DFL: usize = 0;
 
+/// `CLOCK_MONOTONIC` from macOS `<time.h>`.
+const CLOCK_MONOTONIC: i32 = 6;
+
+/// `struct timespec` (64-bit macOS): `time_t tv_sec; long tv_nsec`.
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
 unsafe extern "C" {
     fn sigaction(signum: i32, act: *const Sigaction, oldact: *mut Sigaction) -> i32;
     fn raise(signum: i32) -> i32;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    /// POSIX-guaranteed async-signal-safe; used for uptime in the handler.
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
     /// ASLR slide of image `index` (0 = main executable).
     fn _dyld_get_image_vmaddr_slide(index: u32) -> isize;
     /// Mach header address of image `index` (0 = main executable).
@@ -79,8 +89,11 @@ static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
 static PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
 /// Re-entrancy guard for the signal handler.
 static IN_SIGNAL_HANDLER: AtomicBool = AtomicBool::new(false);
-/// Process start time, for uptime in reports.
-static STARTED: OnceLock<Instant> = OnceLock::new();
+/// Process start time as monotonic seconds (`clock_gettime(CLOCK_MONOTONIC)`),
+/// for uptime in reports. Stored as a raw second count — not `Instant` — so the
+/// fatal-signal handler can recompute uptime with only async-signal-safe calls
+/// (`clock_gettime` + an atomic load), never `Instant::elapsed()`.
+static STARTED_SECS: AtomicU64 = AtomicU64::new(0);
 /// Main-image load address and ASLR slide, captured at install time (the dyld
 /// calls are not async-signal-safe, so they must not run in the handler).
 static IMAGE_BASE: OnceLock<usize> = OnceLock::new();
@@ -90,7 +103,7 @@ static IMAGE_SLIDE: OnceLock<isize> = OnceLock::new();
 /// after logging is initialised. `log_path` mirrors `SPICEIO_LOG_FILE`; when
 /// set, crash reports are appended there as well as to stderr.
 pub fn install(log_path: Option<&str>) {
-    STARTED.set(Instant::now()).ok();
+    STARTED_SECS.store(monotonic_secs(), Ordering::SeqCst);
     IMAGE_BASE.set(unsafe { _dyld_get_image_header(0) }).ok();
     IMAGE_SLIDE
         .set(unsafe { _dyld_get_image_vmaddr_slide(0) })
@@ -124,17 +137,35 @@ pub fn install(log_path: Option<&str>) {
     }
 }
 
+/// Monotonic seconds via `clock_gettime(CLOCK_MONOTONIC)`. Async-signal-safe
+/// (POSIX lists `clock_gettime`), so it is callable from the fatal-signal
+/// handler — unlike `Instant::elapsed()`, whose macOS backend is not on the
+/// async-signal-safe list. Returns 0 if the clock read fails.
+fn monotonic_secs() -> u64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, exclusively-borrowed out-param for the call.
+    if unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    ts.tv_sec.max(0) as u64
+}
+
 fn uptime_secs() -> u64 {
-    STARTED.get().map(|s| s.elapsed().as_secs()).unwrap_or(0)
+    monotonic_secs().saturating_sub(STARTED_SECS.load(Ordering::Relaxed))
 }
 
 /// Write a crash report to stderr and (when configured) the log file.
-/// Synchronous and direct — never routed through the async logger, whose
-/// buffered lines would be lost when the process aborts.
+/// Writes via raw `write(2)` to fd 2 rather than `std::io::stderr().lock()`:
+/// a panic that fires while another thread (e.g. the log writer) holds the
+/// Rust stderr lock would otherwise deadlock the hook and produce no report.
+/// This also matches the fatal-signal path, which must avoid locks entirely.
+/// Never routed through the async logger, whose buffered lines would be lost
+/// when the process aborts.
 fn crash_write(bytes: &[u8]) {
-    let mut err = std::io::stderr().lock();
-    let _ = err.write_all(bytes);
-    let _ = err.flush();
+    write_fd(2, bytes);
     write_fd(CRASH_FD.load(Ordering::SeqCst), bytes);
 }
 
@@ -455,9 +486,20 @@ pub fn crash_test(mode: &str) -> ! {
     match mode {
         "panic" => panic!("crash-test: deliberate panic"),
         "segv" => {
-            // SAFETY: deliberately not safe — that's the point.
-            unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
-            unreachable!("null write did not fault");
+            // Deliver SIGSEGV via `raise` rather than performing a real invalid
+            // memory access. It drives the exact same SA_SIGINFO handler path
+            // (signal, siginfo with si_addr 0, ucontext registers, report,
+            // re-raise) deterministically, while keeping the shipped binary
+            // free of an intentional invalid-pointer dereference — there is no
+            // reason to bake reachable undefined behavior into a release just
+            // to test the handler.
+            const SIGSEGV: i32 = 11;
+            // SAFETY: `raise` is async-signal-safe and simply posts the signal
+            // to this thread, where the installed fatal-signal handler runs.
+            unsafe {
+                raise(SIGSEGV);
+            }
+            unreachable!("raise(SIGSEGV) did not terminate");
         }
         "abort" => std::process::abort(),
         other => {
