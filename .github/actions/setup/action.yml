@@ -3,9 +3,9 @@ description: Install a released version of spiceio and start the S3-to-SMB proxy
 
 inputs:
   version:
-    description: Release tag to install (e.g. "v0.1.0"). Use "latest" for the most recent release.
+    description: Release tag to install (e.g. "v0.5.8"). Use "latest" for the most recent release.
     required: false
-    default: latest
+    default: v0.5.8
   smb-url:
     description: >
       SMB connection URL: smb://user:pass@server/share or smb://user:pass@server:port/share.
