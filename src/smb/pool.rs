@@ -10,11 +10,20 @@ use std::time::Duration;
 
 use super::client::{SmbClient, SmbConfig};
 
-/// Backoff schedule between connect attempts. Ramps up, then holds at 15s so a
-/// NAS restart (the server can refuse connections for a minute or two while it
-/// reboots) is retried patiently rather than hammered. The schedule spans the
-/// full `CONNECT_TOTAL_BUDGET`, which is what ultimately bounds the retry loop.
-const CONNECT_RETRY_BACKOFF: &[Duration] = &[
+/// Backoff schedule for healing a poisoned connection and for the extra startup
+/// connections once the first is up. Fast, so a transient blip recovers quickly;
+/// a slot that stays down is retried on the next healer tick rather than blocking.
+const FAST_CONNECT_BACKOFF: &[Duration] = &[
+    Duration::from_millis(250),
+    Duration::from_millis(750),
+    Duration::from_millis(2000),
+];
+
+/// Backoff schedule for the first startup connection only. Ramps up, then holds
+/// at 15s so a NAS restart (the server can refuse connections for a minute or
+/// two while it reboots) is ridden out patiently rather than hammered. Spans the
+/// full `CONNECT_TOTAL_BUDGET`, which ultimately bounds the loop.
+const PATIENT_CONNECT_BACKOFF: &[Duration] = &[
     Duration::from_secs(2),
     Duration::from_secs(4),
     Duration::from_secs(8),
@@ -82,24 +91,27 @@ where
     Err(last_err.unwrap_or_else(|| io::Error::other(format!("{label} failed without error"))))
 }
 
-async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
-    // Each attempt is capped at CONNECT_ATTEMPT_TIMEOUT, with backoff between;
-    // the whole loop is bounded by CONNECT_TOTAL_BUDGET so a NAS restart is
-    // ridden out while a down/saturated NAS still fails in a predictable time.
-    let retry = retry_with_backoff("smb connect", CONNECT_RETRY_BACKOFF, || {
-        let cfg = config.clone();
-        async move {
-            match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, SmbClient::connect(cfg)).await {
-                Ok(res) => res,
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "connect exceeded {}s — TCP reachable but the SMB handshake stalled (NAS overloaded or at its session limit?)",
-                        CONNECT_ATTEMPT_TIMEOUT.as_secs()
-                    ),
-                )),
-            }
-        }
+/// One connect attempt (TCP + negotiate + auth), capped so a stalled SMB
+/// handshake fails fast instead of burning the per-op read timeout.
+async fn connect_attempt(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
+    match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, SmbClient::connect(config)).await {
+        Ok(res) => res,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "connect exceeded {}s — TCP reachable but the SMB handshake stalled (NAS overloaded or at its session limit?)",
+                CONNECT_ATTEMPT_TIMEOUT.as_secs()
+            ),
+        )),
+    }
+}
+
+/// Patient connect for the first startup connection: rides out a NAS restart
+/// with a long backoff, bounded by `CONNECT_TOTAL_BUDGET` so a down/saturated
+/// NAS still fails in a predictable time.
+async fn connect_patient(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
+    let retry = retry_with_backoff("smb connect", PATIENT_CONNECT_BACKOFF, || {
+        connect_attempt(config.clone())
     });
     match tokio::time::timeout(CONNECT_TOTAL_BUDGET, retry).await {
         Ok(res) => res,
@@ -111,6 +123,16 @@ async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
             ),
         )),
     }
+}
+
+/// Fast connect for healing a poisoned slot and for the extra startup
+/// connections: recovers from a transient blip quickly; a slot that stays down
+/// is retried on the next healer tick rather than blocking here.
+async fn connect_fast(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
+    retry_with_backoff("smb reconnect", FAST_CONNECT_BACKOFF, || {
+        connect_attempt(config.clone())
+    })
+    .await
 }
 
 /// One pool connection: an authenticated session and its tree-connect id for
@@ -203,7 +225,7 @@ impl SmbPool {
         let mut clients = Vec::with_capacity(requested_n);
 
         // First connection — establishes negotiated parameters
-        let first = connect_with_retry(config.clone()).await?;
+        let first = connect_patient(config.clone()).await?;
         let max_read_size = first.max_read_size;
         let max_write_size = first.max_write_size;
         let compound_max_read_size = first.compound_max_read_size;
@@ -219,7 +241,7 @@ impl SmbPool {
             let mut joins = Vec::with_capacity(requested_n - 1);
             for _ in 1..requested_n {
                 let cfg = config.clone();
-                joins.push(tokio::spawn(async move { connect_with_retry(cfg).await }));
+                joins.push(tokio::spawn(async move { connect_fast(cfg).await }));
             }
             let mut pending = joins.into_iter();
             let mut fatal: Option<io::Error> = None;
@@ -474,7 +496,7 @@ impl SmbPool {
                 if !poisoned {
                     continue;
                 }
-                match connect_with_retry(self.config.clone()).await {
+                match connect_fast(self.config.clone()).await {
                     Ok(client) => match client.tree_connect(share).await {
                         Ok(tree_id) => {
                             // Guard the write in case size changed.
@@ -642,12 +664,14 @@ mod tests {
     }
 
     #[test]
-    fn connect_backoff_schedule_is_monotonic_nondecreasing() {
-        let mut prev = Duration::ZERO;
-        for d in CONNECT_RETRY_BACKOFF {
-            assert!(*d >= prev, "backoff schedule must be nondecreasing");
-            prev = *d;
+    fn connect_backoff_schedules_are_monotonic_nondecreasing() {
+        for schedule in [FAST_CONNECT_BACKOFF, PATIENT_CONNECT_BACKOFF] {
+            let mut prev = Duration::ZERO;
+            for d in schedule {
+                assert!(*d >= prev, "backoff schedule must be nondecreasing");
+                prev = *d;
+            }
+            assert!(!schedule.is_empty());
         }
-        assert!(!CONNECT_RETRY_BACKOFF.is_empty());
     }
 }
