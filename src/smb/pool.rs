@@ -10,22 +10,37 @@ use std::time::Duration;
 
 use super::client::{SmbClient, SmbConfig};
 
-/// Backoff schedule for transient connect failures (TCP/negotiate/auth).
-/// A shared NAS under load can flake one connect while the rest succeed —
-/// retry handles that without taking down startup.
+/// Backoff schedule between connect attempts. Ramps up, then holds at 15s so a
+/// NAS restart (the server can refuse connections for a minute or two while it
+/// reboots) is retried patiently rather than hammered. The schedule spans the
+/// full `CONNECT_TOTAL_BUDGET`, which is what ultimately bounds the retry loop.
 const CONNECT_RETRY_BACKOFF: &[Duration] = &[
-    Duration::from_millis(250),
-    Duration::from_millis(750),
-    Duration::from_millis(2000),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
+    Duration::from_secs(15),
 ];
 
 /// Hard cap on a single connect attempt (TCP + SMB negotiate + auth). A NAS at
 /// its session limit often completes the TCP handshake but then stalls the SMB
 /// session-setup; without this cap that stall burns the per-op read timeout
-/// (tens of seconds) before a retry can run, blowing the caller's startup
-/// budget. Kept short so the `CONNECT_RETRY_BACKOFF` retries actually get to run
-/// (4 attempts + backoff stays well under a typical ~60s startup budget).
+/// (tens of seconds) before a retry can run. Kept short so each attempt fails
+/// fast and many retries fit within `CONNECT_TOTAL_BUDGET`.
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Total budget for establishing a connection across all retries. Long enough
+/// to ride out a NAS restart (it can be unreachable for a minute or two while
+/// it reboots), but bounded so a down or saturated NAS fails in a predictable
+/// time instead of retrying forever. The per-attempt cap and backoff schedule
+/// run inside this budget.
+const CONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(120);
 
 /// Generic retry-with-backoff helper. Runs `op` until it succeeds, sleeping
 /// the corresponding `backoff` interval between failures. After `backoff.len()`
@@ -68,12 +83,12 @@ where
 }
 
 async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
-    retry_with_backoff("smb connect", CONNECT_RETRY_BACKOFF, || {
+    // Each attempt is capped at CONNECT_ATTEMPT_TIMEOUT, with backoff between;
+    // the whole loop is bounded by CONNECT_TOTAL_BUDGET so a NAS restart is
+    // ridden out while a down/saturated NAS still fails in a predictable time.
+    let retry = retry_with_backoff("smb connect", CONNECT_RETRY_BACKOFF, || {
         let cfg = config.clone();
         async move {
-            // Cap the whole attempt (TCP + negotiate + auth). A saturated NAS
-            // completes TCP but stalls the SMB handshake; without this cap that
-            // stall would burn the per-op read timeout before a retry can run.
             match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, SmbClient::connect(cfg)).await {
                 Ok(res) => res,
                 Err(_) => Err(io::Error::new(
@@ -85,8 +100,17 @@ async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
                 )),
             }
         }
-    })
-    .await
+    });
+    match tokio::time::timeout(CONNECT_TOTAL_BUDGET, retry).await {
+        Ok(res) => res,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "could not connect within {}s (NAS down or unreachable?)",
+                CONNECT_TOTAL_BUDGET.as_secs()
+            ),
+        )),
+    }
 }
 
 /// One pool connection: an authenticated session and its tree-connect id for
