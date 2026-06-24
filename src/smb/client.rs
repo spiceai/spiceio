@@ -110,15 +110,20 @@ impl SmbClient {
                     s
                 }
                 Ok(Err(e)) => {
-                    crate::serr!("[spiceio] smb tcp connect failed: {addr}: {e}");
-                    return Err(e);
+                    // Return a contextual error without logging here: the pool's
+                    // retry loop (`retry_with_backoff`) is the single source of
+                    // per-attempt connect logging, so logging here would double it.
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("smb tcp connect failed: {addr}: {e}"),
+                    ));
                 }
                 Err(_) => {
+                    // Contextual error, no logging here (see the reset arm above).
                     let msg = format!(
                         "smb tcp connect timed out after {}s: {addr}",
                         SMB_CONNECT_TIMEOUT.as_secs()
                     );
-                    crate::serr!("[spiceio] {msg}");
                     return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
                 }
             };

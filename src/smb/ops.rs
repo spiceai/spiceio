@@ -668,11 +668,13 @@ impl ShareSession {
         self.pool.pick_live().await
     }
 
-    /// Run a one-shot read open/stat with bounded retry on transient resets,
-    /// each attempt on a freshly-picked live connection. A non-reset error (e.g.
-    /// a genuine NotFound) returns immediately; a reset backs off the adaptive
-    /// read size. The op receives the picked connection and returns whatever the
-    /// caller needs (typically the picked `(client, tree_id)` plus the result).
+    /// Run a one-shot read open/stat with bounded retry on transient errors —
+    /// connection resets and `ResourceBusy` (SMB sharing violations) — each
+    /// attempt on a freshly-picked live connection. A non-retryable error (e.g. a
+    /// genuine NotFound) returns immediately; a reset backs off the adaptive read
+    /// size and a busy error backs off before retrying. The op receives the picked
+    /// connection and returns whatever the caller needs (typically the picked
+    /// `(client, tree_id)` plus the result).
     async fn retry_read_open<T, F, Fut>(&self, mut op: F) -> io::Result<T>
     where
         F: FnMut(Arc<SmbClient>, u32) -> Fut,

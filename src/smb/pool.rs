@@ -21,8 +21,9 @@ const FAST_CONNECT_BACKOFF: &[Duration] = &[
 
 /// Backoff schedule for the first startup connection only. Ramps up, then holds
 /// at 15s so a NAS restart (the server can refuse connections for a minute or
-/// two while it reboots) is ridden out patiently rather than hammered. Spans the
-/// full `CONNECT_TOTAL_BUDGET`, which ultimately bounds the loop.
+/// two while it reboots) is ridden out patiently rather than hammered. This list
+/// sums to more than `CONNECT_TOTAL_BUDGET`; that budget — not the end of the
+/// list — is what actually bounds the retry loop.
 const PATIENT_CONNECT_BACKOFF: &[Duration] = &[
     Duration::from_secs(2),
     Duration::from_secs(4),
