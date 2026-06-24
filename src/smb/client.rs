@@ -23,8 +23,10 @@ const SMB_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for the initial TCP handshake to the SMB server. Without this,
 /// a server that drops SYNs leaves the OS waiting ~75-90s, which stalls
-/// pool initialization past any sensible CI window.
-const SMB_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// pool initialization past any sensible CI window. Kept short; the whole
+/// connect (TCP + handshake) is additionally capped by the pool's per-attempt
+/// timeout so a stalled SMB session-setup fails fast and retries.
+const SMB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::auth;
 use super::protocol::*;
@@ -108,15 +110,20 @@ impl SmbClient {
                     s
                 }
                 Ok(Err(e)) => {
-                    crate::serr!("[spiceio] smb tcp connect failed: {addr}: {e}");
-                    return Err(e);
+                    // Return a contextual error without logging here: the pool's
+                    // retry loop (`retry_with_backoff`) is the single source of
+                    // per-attempt connect logging, so logging here would double it.
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("smb tcp connect failed: {addr}: {e}"),
+                    ));
                 }
                 Err(_) => {
+                    // Contextual error, no logging here (see the reset arm above).
                     let msg = format!(
                         "smb tcp connect timed out after {}s: {addr}",
                         SMB_CONNECT_TIMEOUT.as_secs()
                     );
-                    crate::serr!("[spiceio] {msg}");
                     return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
                 }
             };

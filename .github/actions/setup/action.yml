@@ -27,6 +27,10 @@ inputs:
     description: Listen address for the S3 endpoint
     required: false
     default: "127.0.0.1:8333"
+  connections:
+    description: SMB connection-pool size (caps concurrent NAS sessions per instance)
+    required: false
+    default: "8"
   token:
     description: GitHub token for downloading release assets from private repos
     required: true
@@ -80,6 +84,7 @@ runs:
         SPICEIO_BUCKET: ${{ inputs.bucket }}
         SPICEIO_REGION: ${{ inputs.region }}
         SPICEIO_BIND: ${{ inputs.bind }}
+        SPICEIO_SMB_CONNECTIONS: ${{ inputs.connections }}
       run: |
         set -euo pipefail
 
@@ -119,7 +124,7 @@ runs:
         fi
 
         export SPICEIO_SMB_SERVER SPICEIO_SMB_PORT SPICEIO_SMB_USER SPICEIO_SMB_PASS SPICEIO_SMB_SHARE
-        export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND
+        export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND SPICEIO_SMB_CONNECTIONS
 
         SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"
         : > "$SPICEIO_LOG"
@@ -132,7 +137,7 @@ runs:
         # auto-increment if the requested port was busy).
         echo "Waiting for spiceio on ${SPICEIO_BIND}..."
         ENDPOINT=""
-        for i in $(seq 1 60); do
+        for i in $(seq 1 150); do
           if ! kill -0 "$PID" 2>/dev/null; then
             echo "::error::spiceio exited unexpectedly"
             echo "::group::spiceio log"
@@ -149,7 +154,7 @@ runs:
           fi
           sleep 1
         done
-        echo "::error::spiceio failed to start within 60s"
+        echo "::error::spiceio failed to start within 150s"
         echo "::group::spiceio log"
         cat "$SPICEIO_LOG" 2>/dev/null || echo "(log file missing)"
         echo "::endgroup::"

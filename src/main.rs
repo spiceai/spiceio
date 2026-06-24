@@ -197,6 +197,12 @@ async fn main() {
         config.smb_connections,
     );
 
+    // Flush the startup lines to disk before the (possibly slow) SMB connect: on
+    // an overloaded NAS the connect can block, and these lines are the
+    // breadcrumb that shows where startup stalled. Without this the async log
+    // buffer holds them and a hung startup leaves an empty log to diagnose from.
+    log::flush(Duration::from_millis(200));
+
     // Connect SMB connection pool
     let smb_config = SmbConfig {
         server: config.smb_server.clone(),

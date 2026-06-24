@@ -526,21 +526,51 @@ impl ShareSession {
 
     /// Write a temp part file for multipart upload.
     pub async fn write_temp(&self, smb_path: &str, data: &[u8]) -> io::Result<()> {
-        let (client, tree_id) = self.pick();
-        self.ensure_parent_dirs_on(&client, tree_id, smb_path)
-            .await?;
-
         let compound_max = self.pool.compound_max_write_size as usize;
-        if data.len() <= compound_max {
-            let _ = client.create_write_close(tree_id, smb_path, data).await?;
-            return Ok(());
-        }
 
-        // Large part — resilient windowed write that rides the back-off ladder
-        // internally so a single UploadPart survives a degraded NAS instead of
-        // failing to a 503 the client (e.g. the AWS CLI, with its small retry
-        // budget) must absorb.
-        self.write_all_resilient(smb_path, data).await
+        // Ensure the parent dirs exist and write the part in one retry envelope.
+        // Under heavy concurrent multipart load the *shared* `.spiceio-uploads/`
+        // directory is a hot spot: creating it (or a part file under it) on one
+        // connection while another connection holds it momentarily surfaces a
+        // sharing violation (ResourceBusy). Absorb that — and a dropped
+        // connection — in place on a fresh live connection each attempt, with a
+        // short back-off for contention, so a single UploadPart rides out the
+        // contention internally instead of failing to a 503 the client (e.g. the
+        // AWS CLI, with its small retry budget) must absorb. Bounded by
+        // MAX_RESET_RETRIES.
+        let mut attempt = 0u32;
+        loop {
+            let (client, tree_id) = self.pick_live().await;
+            let r: io::Result<()> = async {
+                self.ensure_parent_dirs_on(&client, tree_id, smb_path)
+                    .await?;
+                if data.len() <= compound_max {
+                    client.create_write_close(tree_id, smb_path, data).await?;
+                    Ok(())
+                } else {
+                    // Large part: the windowed writer rides resets internally;
+                    // its create is on a per-upload-unique path, so the shared
+                    // hot spot is the dir-ensure above that this loop covers.
+                    self.write_all_resilient(smb_path, data).await
+                }
+            }
+            .await;
+            match r {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    }
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                        return Err(e);
+                    }
+                    if is_busy(&e) {
+                        busy_backoff(attempt).await;
+                    }
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// Write `data` to `smb_path` (truncating any existing file) in
@@ -638,11 +668,13 @@ impl ShareSession {
         self.pool.pick_live().await
     }
 
-    /// Run a one-shot read open/stat with bounded retry on transient resets,
-    /// each attempt on a freshly-picked live connection. A non-reset error (e.g.
-    /// a genuine NotFound) returns immediately; a reset backs off the adaptive
-    /// read size. The op receives the picked connection and returns whatever the
-    /// caller needs (typically the picked `(client, tree_id)` plus the result).
+    /// Run a one-shot read open/stat with bounded retry on transient errors —
+    /// connection resets and `ResourceBusy` (SMB sharing violations) — each
+    /// attempt on a freshly-picked live connection. A non-retryable error (e.g. a
+    /// genuine NotFound) returns immediately; a reset backs off the adaptive read
+    /// size and a busy error backs off before retrying. The op receives the picked
+    /// connection and returns whatever the caller needs (typically the picked
+    /// `(client, tree_id)` plus the result).
     async fn retry_read_open<T, F, Fut>(&self, mut op: F) -> io::Result<T>
     where
         F: FnMut(Arc<SmbClient>, u32) -> Fut,
@@ -657,8 +689,11 @@ impl ShareSession {
                     if is_reset(&e) {
                         self.pool.note_read_reset();
                     }
-                    if !is_reset(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
                         return Err(e);
+                    }
+                    if is_busy(&e) {
+                        busy_backoff(attempt).await;
                     }
                     attempt += 1;
                 }
@@ -760,8 +795,11 @@ impl ShareSession {
                     if is_reset(&e) {
                         self.pool.note_read_reset();
                     }
-                    if !is_reset(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
                         break 'read Err(e);
+                    }
+                    if is_busy(&e) {
+                        busy_backoff(attempt).await;
                     }
                     attempt += 1;
                     let _ = client.close(tree_id, &file_id).await;
@@ -884,8 +922,11 @@ impl ShareSession {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
-                    if !is_reset(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
                         return Err(e);
+                    }
+                    if is_busy(&e) {
+                        busy_backoff(attempt).await;
                     }
                     attempt += 1;
                 }
@@ -1223,6 +1264,36 @@ pub(crate) fn is_reset(e: &io::Error) -> bool {
     )
 }
 
+/// True if the error is transient SMB *back-pressure* — a sharing violation
+/// (another handle conflicts) or a server-capacity rejection of a file op — both
+/// surfaced as `ResourceBusy` by `smb_status_to_io_error`. Unlike `is_reset` (a
+/// dropped connection, cleared by reconnecting), a busy error means the server
+/// is momentarily refusing the op, so the retry waits briefly in place rather
+/// than reconnecting.
+pub(crate) fn is_busy(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::ResourceBusy
+}
+
+/// Either failure class the create/write/rename paths absorb internally: a
+/// dropped connection (`is_reset` — reconnect and retry) or transient
+/// contention (`is_busy` — back off and retry). Anything else is a real error
+/// surfaced to the client. Both share the `MAX_RESET_RETRIES` attempt budget.
+pub(crate) fn should_retry(e: &io::Error) -> bool {
+    is_reset(e) || is_busy(e)
+}
+
+/// Brief, bounded back-off before retrying a `ResourceBusy` op. Exponential
+/// from ~4ms, capped at ~128ms: a sharing violation clears as soon as the
+/// conflicting handle closes (typically sub-millisecond to milliseconds), so a
+/// short wait absorbs concurrent-load contention on a shared directory or temp
+/// file internally — instead of spending the client's small retry budget on a
+/// 503. Worst-case cumulative wait over `MAX_RESET_RETRIES` attempts stays well
+/// within a client request timeout.
+async fn busy_backoff(attempt: u32) {
+    let ms = 4u64 << attempt.min(5); // 4, 8, 16, 32, 64, 128, 128, …
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 /// Monotonic counter for unique WAL file names within this process.
 static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1398,8 +1469,11 @@ impl WalWriter {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
-                    if !is_reset(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
                         break Err(e);
+                    }
+                    if is_busy(&e) {
+                        busy_backoff(attempt).await;
                     }
                     attempt += 1;
                     // Reconnect and re-open the temp to retry. If the temp is
@@ -1555,6 +1629,53 @@ fn guess_content_type(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── transient-error classification (retry policy) ────────────────
+
+    #[test]
+    fn is_busy_matches_only_resource_busy() {
+        // A sharing violation and a server-capacity file-op rejection both map
+        // to ResourceBusy (see smb_status_to_io_error) and are transient.
+        assert!(is_busy(&io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "sharing violation"
+        )));
+        // A dropped connection is a reset, not busy; a genuine error is neither.
+        assert!(!is_busy(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "x"
+        )));
+        assert!(!is_busy(&io::Error::new(io::ErrorKind::NotFound, "x")));
+    }
+
+    #[test]
+    fn should_retry_covers_resets_and_busy_not_real_errors() {
+        // Dropped connections — reconnect and retry.
+        for k in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(should_retry(&io::Error::new(k, "reset")), "{k:?}");
+        }
+        // Transient contention — back off and retry.
+        assert!(should_retry(&io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            "busy"
+        )));
+        // Real, non-transient outcomes are surfaced to the client, not retried.
+        for k in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert!(!should_retry(&io::Error::new(k, "real")), "{k:?}");
+        }
+    }
 
     // ── to_smb_path ──────────────────────────────────────────────────
 
