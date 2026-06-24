@@ -1264,12 +1264,12 @@ pub(crate) fn is_reset(e: &io::Error) -> bool {
     )
 }
 
-/// True if the error is a transient SMB *contention* condition — a sharing
-/// violation, or a server-capacity rejection of a file op — both surfaced as
-/// `ResourceBusy` by `smb_status_to_io_error`. Unlike `is_reset` (a dropped
-/// connection, cleared by reconnecting), a busy error means the server is
-/// momentarily refusing the op because another handle conflicts, so the retry
-/// waits briefly in place rather than reconnecting.
+/// True if the error is transient SMB *back-pressure* — a sharing violation
+/// (another handle conflicts) or a server-capacity rejection of a file op — both
+/// surfaced as `ResourceBusy` by `smb_status_to_io_error`. Unlike `is_reset` (a
+/// dropped connection, cleared by reconnecting), a busy error means the server
+/// is momentarily refusing the op, so the retry waits briefly in place rather
+/// than reconnecting.
 pub(crate) fn is_busy(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::ResourceBusy
 }
