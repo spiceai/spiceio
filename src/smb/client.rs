@@ -23,8 +23,10 @@ const SMB_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for the initial TCP handshake to the SMB server. Without this,
 /// a server that drops SYNs leaves the OS waiting ~75-90s, which stalls
-/// pool initialization past any sensible CI window.
-const SMB_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// pool initialization past any sensible CI window. Kept short; the whole
+/// connect (TCP + handshake) is additionally capped by the pool's per-attempt
+/// timeout so a stalled SMB session-setup fails fast and retries.
+const SMB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use super::auth;
 use super::protocol::*;

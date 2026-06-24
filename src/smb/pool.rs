@@ -19,13 +19,21 @@ const CONNECT_RETRY_BACKOFF: &[Duration] = &[
     Duration::from_millis(2000),
 ];
 
+/// Hard cap on a single connect attempt (TCP + SMB negotiate + auth). A NAS at
+/// its session limit often completes the TCP handshake but then stalls the SMB
+/// session-setup; without this cap that stall burns the per-op read timeout
+/// (tens of seconds) before a retry can run, blowing the caller's startup
+/// budget. Kept short so the `CONNECT_RETRY_BACKOFF` retries actually get to run
+/// (4 attempts + backoff stays well under a typical ~60s startup budget).
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Generic retry-with-backoff helper. Runs `op` until it succeeds, sleeping
 /// the corresponding `backoff` interval between failures. After `backoff.len()`
 /// retries (i.e. `backoff.len() + 1` total attempts), returns the final error.
 ///
-/// `op` is responsible for logging the error detail on each failed attempt;
-/// this helper only emits a short retry notice ("retrying in Nms") so the
-/// log isn't doubled up under flaky conditions.
+/// Each failed attempt is logged with its error (and a final give-up notice on
+/// the last attempt), so a flaky or saturated server is visible in the log
+/// without `op` needing to log internally.
 async fn retry_with_backoff<T, F, Fut>(
     label: &str,
     backoff: &[Duration],
@@ -45,10 +53,12 @@ where
                     let delay = backoff[attempt - 1];
                     let next = attempt + 1;
                     crate::slog!(
-                        "[spiceio] {label} retrying (attempt {next}/{max_attempts}) in {}ms",
+                        "[spiceio] {label} attempt {attempt}/{max_attempts} failed: {e}; retrying (attempt {next}) in {}ms",
                         delay.as_millis()
                     );
                     tokio::time::sleep(delay).await;
+                } else {
+                    crate::serr!("[spiceio] {label} failed after {max_attempts} attempts: {e}");
                 }
                 last_err = Some(e);
             }
@@ -59,7 +69,22 @@ where
 
 async fn connect_with_retry(config: SmbConfig) -> io::Result<Arc<SmbClient>> {
     retry_with_backoff("smb connect", CONNECT_RETRY_BACKOFF, || {
-        SmbClient::connect(config.clone())
+        let cfg = config.clone();
+        async move {
+            // Cap the whole attempt (TCP + negotiate + auth). A saturated NAS
+            // completes TCP but stalls the SMB handshake; without this cap that
+            // stall would burn the per-op read timeout before a retry can run.
+            match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, SmbClient::connect(cfg)).await {
+                Ok(res) => res,
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "connect exceeded {}s — TCP reachable but the SMB handshake stalled (NAS overloaded or at its session limit?)",
+                        CONNECT_ATTEMPT_TIMEOUT.as_secs()
+                    ),
+                )),
+            }
+        }
     })
     .await
 }
