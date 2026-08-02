@@ -244,10 +244,9 @@ pub fn xml_decode(s: &str) -> String {
 fn decode_numeric_entity(ent: &str) -> Option<char> {
     let code = if let Some(hex) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
         u32::from_str_radix(hex, 16).ok()?
-    } else if let Some(dec) = ent.strip_prefix('#') {
-        dec.parse::<u32>().ok()?
     } else {
-        return None;
+        let dec = ent.strip_prefix('#')?;
+        dec.parse::<u32>().ok()?
     };
     char::from_u32(code)
 }

@@ -168,6 +168,21 @@ struct StreamGuard<'a> {
     stream: tokio::sync::MutexGuard<'a, TcpStream>,
 }
 
+/// Holds the in-flight count for an operation that is still waiting for the
+/// stream lock, so a cancelled caller cannot leak it. Defused (`client` set to
+/// `None`) once the lock is acquired and `StreamGuard` takes over.
+struct PendingIo<'a> {
+    client: Option<&'a SmbClient>,
+}
+
+impl Drop for PendingIo<'_> {
+    fn drop(&mut self) {
+        if let Some(client) = self.client {
+            client.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl std::ops::Deref for StreamGuard<'_> {
     type Target = TcpStream;
     fn deref(&self) -> &TcpStream {
@@ -327,10 +342,21 @@ impl SmbClient {
     async fn lock_stream(&self) -> StreamGuard<'_> {
         // Counted before the await: an operation waiting for the lock is load
         // on this connection, and `pick` should steer new work elsewhere.
+        //
+        // That leaves a window where the count is owned by neither guard — if
+        // the caller is dropped while waiting for the lock (an HTTP client
+        // disconnecting mid-request), `StreamGuard` is never built and the
+        // increment would leak, permanently inflating this connection's
+        // apparent load and, since keepalive only probes at depth zero,
+        // silently disabling its liveness probe. `PendingIo` owns the count
+        // across the await and hands it over only once the lock is held.
         self.inflight.fetch_add(1, Ordering::Relaxed);
+        let mut pending = PendingIo { client: Some(self) };
+        let stream = self.stream.lock().await;
+        pending.client = None; // handed off to StreamGuard below
         StreamGuard {
             client: self,
-            stream: self.stream.lock().await,
+            stream,
         }
     }
 

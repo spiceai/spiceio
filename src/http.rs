@@ -115,8 +115,13 @@ pub async fn serve<F, Fut, B>(
     let graceful = GracefulShutdown::new();
     // spiceio has no client authentication, so the accept log is the only
     // record of who reached it. Logging every connection would drown the log
-    // (an sccache build opens hundreds), so log each distinct peer once:
-    // forensically useful, and bounded by the number of client hosts.
+    // (an sccache build opens hundreds), so log each distinct peer once.
+    //
+    // Capped: on a trusted LAN the set is small, but nothing stops a peer from
+    // arriving with fresh source addresses, and an unbounded set would then be
+    // a slow memory leak driven by remote input. Past the cap the proxy stops
+    // tracking and stops logging new peers rather than growing.
+    const MAX_TRACKED_PEERS: usize = 1024;
     let mut seen_peers: HashSet<IpAddr> = HashSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
 
@@ -132,7 +137,7 @@ pub async fn serve<F, Fut, B>(
                     }
                 };
                 configure_socket(&stream);
-                if seen_peers.insert(peer_addr.ip()) {
+                if seen_peers.len() < MAX_TRACKED_PEERS && seen_peers.insert(peer_addr.ip()) {
                     slog!("[spiceio] first connection from {}", peer_addr.ip());
                 }
 

@@ -1043,7 +1043,7 @@ impl ShareSession {
         }
     }
 
-    /// `expected_size`, when given, is the length the caller already promised    /// `expected_size`, when given, is the length the caller already promised
+    /// `expected_size`, when given, is the length the caller already promised
     /// for this source (a multipart part's acknowledged size). A mismatch means
     /// the file changed on the share since then, so splicing it would build an
     /// object that is not what the client uploaded — fail before writing a byte.
