@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use spiceio::smb::protocol::*;
 
@@ -45,7 +45,7 @@ fn bench_encode_read_request(c: &mut Criterion) {
     c.bench_function("encode_read_request", |b| {
         b.iter(|| {
             let mut buf = BytesMut::with_capacity(64);
-            encode_read_request(&mut buf, black_box(&file_id), 0, 131072);
+            encode_read_request(&mut buf, black_box(&file_id), 0, 131072, 0);
             buf
         })
     });
@@ -81,33 +81,18 @@ fn bench_decode_create_response(c: &mut Criterion) {
     });
 }
 
-fn bench_decode_read_response(c: &mut Criterion) {
-    let mut group = c.benchmark_group("decode_read_response");
+fn bench_decode_read_response_bytes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_read_response_bytes");
     for size in [64, 1024, 65536] {
         let data_offset = (SMB2_HEADER_SIZE + 16) as u16;
         let mut body = vec![0u8; 16 + size];
         body[2..4].copy_from_slice(&data_offset.to_le_bytes());
         body[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        let body = Bytes::from(body);
         group.bench_with_input(
             criterion::BenchmarkId::from_parameter(size),
             &body,
-            |b, body| b.iter(|| decode_read_response(black_box(body))),
-        );
-    }
-    group.finish();
-}
-
-fn bench_decode_read_response_owned(c: &mut Criterion) {
-    let mut group = c.benchmark_group("decode_read_response_owned");
-    for size in [64, 1024, 65536] {
-        let data_offset = (SMB2_HEADER_SIZE + 16) as u16;
-        let mut body = vec![0u8; 16 + size];
-        body[2..4].copy_from_slice(&data_offset.to_le_bytes());
-        body[4..8].copy_from_slice(&(size as u32).to_le_bytes());
-        group.bench_with_input(
-            criterion::BenchmarkId::from_parameter(size),
-            &body,
-            |b, body| b.iter(|| decode_read_response_owned(black_box(body.clone()))),
+            |b, body| b.iter(|| decode_read_response_bytes(black_box(body))),
         );
     }
     group.finish();
@@ -175,6 +160,7 @@ fn bench_parse_compound_response(c: &mut Criterion) {
                 *b = 0xAB;
             }
         }
+        let data = Bytes::from(data);
         group.bench_with_input(
             criterion::BenchmarkId::from_parameter(n),
             &data,
@@ -185,7 +171,7 @@ fn bench_parse_compound_response(c: &mut Criterion) {
 }
 
 /// Build one framed SMB2 read response message (header + read response body +
-/// data) ready for `Header::decode` + `decode_read_response_owned`.
+/// data) ready for `Header::decode` + `decode_read_response_from_msg`.
 fn build_read_response_msg(msg_id: u64, data_len: usize) -> Vec<u8> {
     let body_len = 16 + data_len;
     let mut msg = vec![0u8; SMB2_HEADER_SIZE + body_len];
@@ -208,44 +194,10 @@ fn build_read_response_msg(msg_id: u64, data_len: usize) -> Vec<u8> {
     msg
 }
 
-/// Bench the CPU-bound per-batch work of `pipelined_read`: header decode,
-/// slot computation from message_id, and `decode_read_response_owned`. This
-/// is the inner loop of GetObject streaming once the wire bytes are in.
-fn bench_pipelined_read_decode(c: &mut Criterion) {
-    let mut group = c.benchmark_group("pipelined_read_decode");
-    // (depth, chunk_size) — depth=64 matches PIPELINE_DEPTH in ops.rs.
-    let cases = [(8usize, 65536usize), (64, 65536), (64, 8192)];
-    for (depth, chunk_size) in cases {
-        let base_msg_id = 1_000u64;
-        let messages: Vec<Vec<u8>> = (0..depth)
-            .map(|i| build_read_response_msg(base_msg_id + i as u64, chunk_size))
-            .collect();
-        group.throughput(criterion::Throughput::Bytes((depth * chunk_size) as u64));
-        group.bench_with_input(
-            criterion::BenchmarkId::from_parameter(format!("d{depth}_c{chunk_size}")),
-            &messages,
-            |b, messages| {
-                b.iter(|| {
-                    let n = messages.len();
-                    let mut slots: Vec<Option<bytes::Bytes>> = (0..n).map(|_| None).collect();
-                    for msg in messages.iter() {
-                        let header = Header::decode(black_box(msg)).unwrap();
-                        let slot = header.message_id.wrapping_sub(base_msg_id) as usize;
-                        let body = msg[SMB2_HEADER_SIZE..].to_vec();
-                        slots[slot] = decode_read_response_owned(body);
-                    }
-                    slots
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-/// Bench the zero-copy `decode_read_response_from_msg` path used after the
-/// pipelined-read optimization. Compared to `bench_pipelined_read_decode` this
-/// avoids the per-response body `to_vec()` — for a 64-deep 64 KiB batch that's
-/// ~4 MiB of memcpy per batch eliminated.
+/// Bench the zero-copy `decode_read_response_from_msg` path — the inner loop
+/// of GetObject streaming once the wire bytes are in. Slicing the payload out
+/// of the owned frame instead of copying the body out first saves ~4 MiB of
+/// memcpy per 64-deep 64 KiB batch.
 fn bench_pipelined_read_decode_zerocopy(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipelined_read_decode_zerocopy");
     let cases = [(8usize, 65536usize), (64, 65536), (64, 8192)];
@@ -261,7 +213,7 @@ fn bench_pipelined_read_decode_zerocopy(c: &mut Criterion) {
             |b, messages| {
                 b.iter(|| {
                     let n = messages.len();
-                    let mut slots: Vec<Option<bytes::Bytes>> = (0..n).map(|_| None).collect();
+                    let mut slots: Vec<Option<Bytes>> = (0..n).map(|_| None).collect();
                     for msg in messages.iter() {
                         let header = Header::decode(black_box(msg)).unwrap();
                         let slot = header.message_id.wrapping_sub(base_msg_id) as usize;
@@ -393,11 +345,9 @@ criterion_group!(
     bench_encode_write_request,
     bench_encode_set_info_rename,
     bench_decode_create_response,
-    bench_decode_read_response,
-    bench_decode_read_response_owned,
+    bench_decode_read_response_bytes,
     bench_build_request,
     bench_parse_compound_response,
-    bench_pipelined_read_decode,
     bench_pipelined_read_decode_zerocopy,
     bench_pipelined_write_encode,
     bench_pipelined_write_encode_coalesced,

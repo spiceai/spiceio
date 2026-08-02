@@ -2,9 +2,6 @@
 
 use hyper::Request;
 use hyper::body::Incoming;
-use hyper_util::rt::TokioIo;
-use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 
 use spiceio::crash;
+use spiceio::http;
 use spiceio::log;
 use spiceio::s3;
 use spiceio::serr;
@@ -47,8 +45,12 @@ struct Config {
     region: String,
     /// Number of SMB TCP connections in the pool (default 8)
     smb_connections: usize,
-    /// Max I/O size for standalone read/write operations (default 1MB)
+    /// Max I/O size for standalone read/write operations (default 256KB)
     smb_max_io: u32,
+    /// TTL after which an abandoned multipart upload is reaped
+    multipart_ttl_secs: u64,
+    /// Age below which startup cleanup leaves a WAL temp / upload dir alone
+    cleanup_grace_secs: u64,
 }
 
 /// Exit nonzero after draining the async logger. The log writer thread dies
@@ -113,6 +115,11 @@ impl Config {
             region: env::var("SPICEIO_REGION").unwrap_or_else(|_| "us-east-1".into()),
             smb_connections: parse_env_or("SPICEIO_SMB_CONNECTIONS", default_pool_size()),
             smb_max_io: parse_env_or("SPICEIO_SMB_MAX_IO", 0),
+            multipart_ttl_secs: parse_env_or("SPICEIO_MULTIPART_TTL_SECS", 86_400u64),
+            cleanup_grace_secs: parse_env_or(
+                "SPICEIO_CLEANUP_GRACE_SECS",
+                smb::ops::DEFAULT_CLEANUP_GRACE_SECS,
+            ),
         }
     }
 }
@@ -228,21 +235,21 @@ async fn main() {
         }
     };
 
-    let share = match ShareSession::connect(pool, &config.smb_share).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            serr!(
-                "[spiceio] failed to connect to SMB share '{}': {e}",
-                config.smb_share
-            );
-            flush_and_exit(1);
-        }
-    };
+    let share =
+        match ShareSession::connect(pool, &config.smb_share, config.cleanup_grace_secs).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                serr!(
+                    "[spiceio] failed to connect to SMB share '{}': {e}",
+                    config.smb_share
+                );
+                flush_and_exit(1);
+            }
+        };
 
     // Clean up orphaned WAL temp files and stale multipart upload dirs from
     // prior crashes (the in-memory upload map does not survive a restart).
-    share.cleanup_wal().await;
-    share.cleanup_uploads().await;
+    share.cleanup_previous_runs().await;
 
     let state = Arc::new(AppState {
         share,
@@ -259,13 +266,16 @@ async fn main() {
     );
 
     // Background pool healer — reconnect SMB connections poisoned by a
-    // transient outage so the pool recovers instead of degrading to a wedge.
+    // transient outage so the pool recovers instead of degrading to a wedge,
+    // and probe idle connections so a session dropped during a quiet period is
+    // found (and healed) here rather than by the next client request.
     {
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 state.share.heal().await;
+                state.share.keepalive();
             }
         });
     }
@@ -274,13 +284,16 @@ async fn main() {
     // freeing their in-memory entry and temp files.
     {
         let state = Arc::clone(&state);
-        let ttl = env::var("SPICEIO_MULTIPART_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(86_400u64);
+        let ttl = config.multipart_ttl_secs;
+        // The heartbeat below is what keeps a live upload's marker looking
+        // recent, so its cadence must stay comfortably inside the cleanup
+        // grace period — otherwise lowering `SPICEIO_CLEANUP_GRACE_SECS`
+        // would silently reinstate the very bug the grace exists to prevent.
+        // Deriving it from the grace makes the two impossible to drift apart.
+        let reaper_interval = Duration::from_secs((config.cleanup_grace_secs / 3).clamp(30, 300));
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(300)).await;
+                tokio::time::sleep(reaper_interval).await;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -293,18 +306,45 @@ async fn main() {
                     // Delete the initiate-time marker file too — without this
                     // the directory is never empty and remove_dir fails, so
                     // reaped upload dirs would pile up until the next restart.
-                    let temp_dir = MultipartStore::temp_dir(&upload.upload_id);
                     state
                         .share
-                        .delete_temp(&format!("{temp_dir}\\marker"))
+                        .delete_temp(&MultipartStore::marker_path(&upload.upload_id))
                         .await;
-                    state.share.remove_dir(&temp_dir).await;
+                    state
+                        .share
+                        .remove_dir(&MultipartStore::temp_dir(&upload.upload_id))
+                        .await;
                 }
                 if !expired.is_empty() {
                     slog!(
                         "[spiceio] reaped {} abandoned multipart upload(s)",
                         expired.len()
                     );
+                }
+
+                // Heartbeat the uploads that survived: refreshing each marker
+                // keeps its directory looking recent, which is how another
+                // spiceio instance's startup cleanup tells "a live process
+                // owns this upload" from "leftovers of a crashed run" — even
+                // when a client goes quiet between parts. Touches run
+                // concurrently: they are independent, and serializing them
+                // would put N round trips back-to-back on connections the
+                // client requests are also using.
+                // Bounded fan-out: enough to overlap the round trips, not so
+                // much that a share with thousands of live uploads floods the
+                // pool the client requests are also using.
+                const MARKER_TOUCH_CONCURRENCY: usize = 8;
+                let live = state.multipart.upload_ids().await;
+                for batch in live.chunks(MARKER_TOUCH_CONCURRENCY) {
+                    let mut set = tokio::task::JoinSet::new();
+                    for id in batch {
+                        let state = Arc::clone(&state);
+                        let path = MultipartStore::marker_path(id);
+                        set.spawn(async move {
+                            let _ = state.share.write_temp(&path, b"").await;
+                        });
+                    }
+                    while set.join_next().await.is_some() {}
                 }
             }
         });
@@ -313,10 +353,8 @@ async fn main() {
     // SIGTERM (the standard service-manager stop signal) triggers the same
     // graceful shutdown as Ctrl-C. Registration failing is exceptional; fall
     // back to a never-resolving future so SIGINT still works.
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
-
-    // Accept loop
-    loop {
+    let shutdown = async {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
         let term = async {
             match sigterm.as_mut() {
                 Some(s) => {
@@ -326,48 +364,22 @@ async fn main() {
             }
         };
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, peer_addr) = match accepted {
-                    Ok(v) => {
-                        slog!("[spiceio] client connected: {}", v.1);
-                        v
-                    }
-                    Err(e) => {
-                        serr!("[spiceio] accept error: {e}");
-                        continue;
-                    }
-                };
-
-                let state = Arc::clone(&state);
-
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let state = Arc::clone(&state);
-                        async move {
-                            let resp = s3::router::handle_request(req, &state).await;
-                            Ok::<_, Infallible>(resp)
-                        }
-                    });
-
-                    if let Err(e) = ConnBuilder::new(hyper_util::rt::TokioExecutor::new())
-                        .serve_connection(io, service)
-                        .await
-                        && !e.to_string().contains("connection reset") {
-                            serr!("[spiceio] connection error from {peer_addr}: {e}");
-                        }
-                });
-            }
-            _ = signal::ctrl_c() => {
-                slog!("\n[spiceio] shutting down (SIGINT)");
-                break;
-            }
-            _ = term => {
-                slog!("[spiceio] shutting down (SIGTERM)");
-                break;
-            }
+            _ = signal::ctrl_c() => slog!("\n[spiceio] shutting down (SIGINT)"),
+            () = term => slog!("[spiceio] shutting down (SIGTERM)"),
         }
-    }
+    };
+
+    // Serve until a stop signal arrives, then drain in-flight requests.
+    http::serve(
+        listener,
+        http::ServeConfig::default(),
+        shutdown,
+        move |req: Request<Incoming>| {
+            let state = Arc::clone(&state);
+            async move { s3::router::handle_request(req, &state).await }
+        },
+    )
+    .await;
 
     // Push the final log lines (including the shutdown notice) to disk before
     // the process exits and takes the writer thread with it.

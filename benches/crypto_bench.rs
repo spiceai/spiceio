@@ -51,8 +51,9 @@ fn bench_hmac_sha256(c: &mut Criterion) {
 fn bench_aes128_cmac(c: &mut Criterion) {
     let key = [0u8; 16];
     let mut group = c.benchmark_group("aes128_cmac");
-    for size in [64, 256, 1024] {
+    for size in [64, 256, 1024, 65536, 262144] {
         let data = vec![0u8; size];
+        group.throughput(criterion::Throughput::Bytes(size as u64));
         group.bench_with_input(
             criterion::BenchmarkId::from_parameter(size),
             &data,

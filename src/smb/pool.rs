@@ -1,6 +1,6 @@
 //! SMB connection pool — multiple authenticated TCP connections to the same
-//! server, round-robin dispatched. Eliminates the single-connection mutex
-//! bottleneck under concurrent S3 requests.
+//! server, dispatched to the least-loaded healthy one. Eliminates the
+//! single-connection mutex bottleneck under concurrent S3 requests.
 
 use std::future::Future;
 use std::io;
@@ -145,7 +145,7 @@ struct Slot {
 
 /// A pool of authenticated SMB connections to the same server.
 ///
-/// Requests are distributed across connections via round-robin. Each connection
+/// Requests go to the connection with the shallowest queue. Each connection
 /// is an independently authenticated SMB session with its own TCP stream, so
 /// concurrent operations don't serialize on a single mutex.
 pub struct SmbPool {
@@ -184,6 +184,11 @@ pub struct SmbPool {
     /// Without this the healer could grow the size back mid-retry-burst, making
     /// a client's retry hit a too-large chunk that resets again.
     reset_since_grow: AtomicBool,
+    /// Cleared the first time a server rejects a server-side-copy IOCTL, so
+    /// the fallback is taken directly from then on instead of paying a failed
+    /// round trip per copy. Pool-wide: every connection talks to the same
+    /// server, so one answer applies to all of them.
+    copychunk_ok: AtomicBool,
     /// Serializes connection healing so a burst of concurrent retries triggers
     /// one reconnect pass, not N competing ones that pile reconnect load onto an
     /// already-struggling server (a retry storm). The per-slot `is_poisoned`
@@ -191,6 +196,13 @@ pub struct SmbPool {
     /// it already restored.
     heal_lock: tokio::sync::Mutex<()>,
 }
+
+/// How long a connection may sit idle before the healer probes it with an
+/// SMB2 ECHO. Servers and firewalls typically evict idle SMB sessions on a
+/// multi-minute timer, so probing well inside that window keeps sessions warm
+/// and turns "the first request after a quiet period fails" into a silent
+/// reconnect. Cheap: one 68-byte round trip per idle connection per interval.
+const IDLE_KEEPALIVE: Duration = Duration::from_secs(45);
 
 /// Floor for the adaptive streaming in-flight size — one conservative op the
 /// server handles even under heavy load (the same size the compound small-file
@@ -203,6 +215,31 @@ const IO_FLOOR: u32 = 65536;
 /// so single-stream throughput saturates; the chunk size (capped separately at
 /// the negotiated max) determines how many ops make up the batch.
 const INFLIGHT_MAX: u32 = 4 * 1024 * 1024;
+
+/// Choose which of `n` slots to dispatch to, scanning in rotation from
+/// `start`. `depth_of(idx)` returns the slot's queue depth, or `None` if it is
+/// unusable (poisoned). Picks the shallowest usable slot, returning early on
+/// the first idle one — so the all-idle case costs one probe and rotates,
+/// exactly like the round-robin it replaces. Ties go to the earliest slot in
+/// rotation order, which keeps equal-depth dispatch fair. `None` means every
+/// slot is unusable.
+///
+/// Pure (the depth source is injected) so the policy is unit-testable without
+/// live connections.
+fn choose_slot(start: usize, n: usize, depth_of: impl Fn(usize) -> Option<usize>) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for i in 0..n {
+        let idx = (start.wrapping_add(i)) % n;
+        let Some(depth) = depth_of(idx) else { continue };
+        if depth == 0 {
+            return Some(idx);
+        }
+        if best.is_none_or(|(_, best_depth)| depth < best_depth) {
+            best = Some((idx, depth));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
 
 /// Multiplicative decrease: halve `cur`, never below the floor (and never above
 /// `cur`). Pure for testability.
@@ -301,6 +338,7 @@ impl SmbPool {
             write_inflight: AtomicU32::new(INFLIGHT_MAX),
             read_inflight: AtomicU32::new(INFLIGHT_MAX),
             reset_since_grow: AtomicBool::new(false),
+            copychunk_ok: AtomicBool::new(true),
             heal_lock: tokio::sync::Mutex::new(()),
         }))
     }
@@ -401,9 +439,17 @@ impl SmbPool {
         Ok(())
     }
 
-    /// Pick the next healthy connection via round-robin, skipping poisoned ones.
-    /// Returns an owned `Arc` and its tree id. Falls back to a poisoned slot if
-    /// all (current active) are poisoned — the I/O fails fast and `heal` reconnects it.
+    /// Pick the healthy connection with the shallowest queue, skipping poisoned
+    /// ones. Returns an owned `Arc` and its tree id. Falls back to a poisoned
+    /// slot if all (current active) are poisoned — the I/O fails fast and
+    /// `heal` reconnects it.
+    ///
+    /// Each connection owns its stream for a whole request/response round trip,
+    /// so blind round-robin can hand a one-round-trip HEAD to a connection
+    /// already carrying a multi-megabyte pipelined batch while another sits
+    /// idle. Dispatching on queue depth removes that head-of-line wait; the
+    /// rotation start makes equal-depth connections (the common all-idle case)
+    /// round-robin exactly as before.
     pub fn pick(&self) -> (Arc<SmbClient>, u32) {
         let slots = self.slots.read().unwrap();
         let mut current_n = self.n.load(Ordering::Relaxed).min(slots.len());
@@ -415,14 +461,12 @@ impl SmbPool {
             current_n = 1;
         }
         let start = self.next.fetch_add(1, Ordering::Relaxed);
-        for i in 0..current_n {
-            let idx = (start + i) % current_n;
-            if !slots[idx].client.is_poisoned() {
-                return (slots[idx].client.clone(), slots[idx].tree_id);
-            }
-        }
+        let chosen = choose_slot(start, current_n, |idx| {
+            let client = &slots[idx].client;
+            (!client.is_poisoned()).then(|| client.inflight())
+        });
         // All (current) poisoned — return a round-robin pick; the I/O will fail fast.
-        let idx = start % current_n;
+        let idx = chosen.unwrap_or(start % current_n);
         (slots[idx].client.clone(), slots[idx].tree_id)
     }
 
@@ -538,6 +582,63 @@ impl SmbPool {
         self.grow_io();
     }
 
+    /// Probe connections that have gone idle with an SMB2 ECHO, so a session
+    /// the server (or a NAT/firewall) dropped while idle is discovered here
+    /// instead of by the next client request.
+    ///
+    /// Without this the pool only learns a connection is dead when a request
+    /// fails on it: the client eats a 503 (or a mid-stream abort) that a
+    /// proactive probe would have healed during the idle window. A probe that
+    /// fails at the transport level poisons its connection, so the *next*
+    /// healer tick reconnects it — no request ever touches the dead socket.
+    ///
+    /// Probes run detached: a stalled connection's ECHO can take up to the
+    /// SMB read timeout, and the healer loop must not be held up behind it.
+    /// Busy connections are skipped entirely — traffic is its own liveness
+    /// proof, and a probe would just add load to a connection under strain.
+    pub fn keepalive(&self) {
+        let idle: Vec<Arc<SmbClient>> = {
+            let guard = self.slots.read().unwrap();
+            let cur = self.n.load(Ordering::Relaxed).min(guard.len());
+            guard[..cur]
+                .iter()
+                .map(|s| &s.client)
+                .filter(|c| {
+                    !c.is_poisoned()
+                        && c.echoes_ok()
+                        && c.inflight() == 0
+                        && c.idle() >= IDLE_KEEPALIVE
+                })
+                .cloned()
+                .collect()
+        };
+        for client in idle {
+            tokio::spawn(async move {
+                if let Err(e) = client.echo().await {
+                    // Either the transport failed or the server reported the
+                    // session gone; `echo` has poisoned the connection either
+                    // way, so the next healer tick reconnects it. One line so
+                    // an idle-drop pattern is visible rather than silent.
+                    crate::slog!("[spiceio] smb keepalive failed, connection poisoned: {e}");
+                }
+            });
+        }
+    }
+
+    /// Whether server-side copy is still worth attempting.
+    pub fn copychunk_supported(&self) -> bool {
+        self.copychunk_ok.load(Ordering::Relaxed)
+    }
+
+    /// Note that the server does not implement server-side copy.
+    pub fn note_copychunk_unsupported(&self) {
+        if self.copychunk_ok.swap(false, Ordering::Relaxed) {
+            crate::slog!(
+                "[spiceio] smb server does not support server-side copy; falling back to streaming copies"
+            );
+        }
+    }
+
     /// Current number of (active) connections in the pool. May be smaller than
     /// originally requested if the server indicated capacity limits.
     pub fn size(&self) -> usize {
@@ -576,6 +677,66 @@ mod tests {
             io = io_after_grow(io, max);
         }
         assert_eq!(io, max);
+    }
+
+    // ── dispatch policy (least-loaded with round-robin tiebreak) ─────
+
+    /// `choose_slot` over a fixed depth table; `None` entries are poisoned.
+    fn choose(start: usize, depths: &[Option<usize>]) -> Option<usize> {
+        choose_slot(start, depths.len(), |i| depths[i])
+    }
+
+    #[test]
+    fn choose_slot_all_idle_round_robins() {
+        // Every slot idle: successive picks rotate, preserving the old
+        // round-robin behavior (and the single-probe fast path).
+        let depths = vec![Some(0); 4];
+        for start in 0..8 {
+            assert_eq!(choose(start, &depths), Some(start % 4));
+        }
+    }
+
+    #[test]
+    fn choose_slot_prefers_shallowest_queue() {
+        // Slot 2 is idle while the rotation would have started at 0.
+        assert_eq!(choose(0, &[Some(3), Some(5), Some(0), Some(9)]), Some(2));
+        // No idle slot — the shallowest wins regardless of rotation.
+        assert_eq!(choose(0, &[Some(4), Some(1), Some(7)]), Some(1));
+        assert_eq!(choose(2, &[Some(4), Some(1), Some(7)]), Some(1));
+    }
+
+    #[test]
+    fn choose_slot_breaks_ties_by_rotation() {
+        // Equal depths: the first slot in rotation order wins, so concurrent
+        // picks spread across connections instead of piling onto slot 0.
+        let depths = vec![Some(2); 3];
+        assert_eq!(choose(0, &depths), Some(0));
+        assert_eq!(choose(1, &depths), Some(1));
+        assert_eq!(choose(2, &depths), Some(2));
+        assert_eq!(choose(3, &depths), Some(0));
+    }
+
+    #[test]
+    fn choose_slot_skips_poisoned_slots() {
+        // A poisoned idle slot is never chosen, even at depth 0.
+        assert_eq!(choose(0, &[None, Some(6), Some(2)]), Some(2));
+        // Poisoned slots don't hide a healthy idle one later in the rotation.
+        assert_eq!(choose(1, &[Some(5), None, None, Some(0)]), Some(3));
+    }
+
+    #[test]
+    fn choose_slot_none_when_all_poisoned() {
+        assert_eq!(choose(0, &[None, None]), None);
+        assert_eq!(choose(7, &[None]), None);
+    }
+
+    #[test]
+    fn choose_slot_handles_start_wraparound() {
+        // `next` is a free-running counter; a start near usize::MAX must not
+        // overflow or skew the selection.
+        let depths = vec![Some(0); 4];
+        assert_eq!(choose(usize::MAX, &depths), Some(usize::MAX % 4));
+        assert_eq!(choose(usize::MAX - 1, &[Some(3), Some(1)]), Some(1));
     }
 
     fn make_io_err(msg: &str) -> io::Error {

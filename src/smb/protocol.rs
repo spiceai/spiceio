@@ -23,6 +23,8 @@ pub enum Command {
     Close = 0x0006,
     Read = 0x0008,
     Write = 0x0009,
+    Ioctl = 0x000B,
+    Echo = 0x000D,
     QueryDirectory = 0x000E,
     SetInfo = 0x0011,
 }
@@ -483,7 +485,17 @@ pub fn encode_close_request(buf: &mut BytesMut, file_id: &[u8; 16]) {
 
 // ── Read ────────────────────────────────────────────────────────────────────
 
-pub fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, length: u32) {
+/// `remaining_after` tells the server how many more bytes the client intends
+/// to read past this request — MS-SMB2 provides it so the server can start
+/// reading ahead from its own storage instead of waiting for the next request.
+/// Streaming GETs know exactly how much is left, so the hint is free to supply.
+pub fn encode_read_request(
+    buf: &mut BytesMut,
+    file_id: &[u8; 16],
+    offset: u64,
+    length: u32,
+    remaining_after: u32,
+) {
     buf.put_u16_le(49); // StructureSize
     buf.put_u8(0); // Padding
     buf.put_u8(0); // Flags
@@ -492,46 +504,37 @@ pub fn encode_read_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, 
     buf.put_slice(file_id); // FileId
     buf.put_u32_le(1); // MinimumCount
     buf.put_u32_le(0); // Channel
-    buf.put_u32_le(0); // RemainingBytes
+    buf.put_u32_le(remaining_after); // RemainingBytes (read-ahead hint)
     buf.put_u16_le(0); // ReadChannelInfoOffset
     buf.put_u16_le(0); // ReadChannelInfoLength
     buf.put_u8(0); // Buffer (padding byte)
 }
 
-pub fn decode_read_response(body: &[u8]) -> Option<Bytes> {
-    if body.len() < READ_RESPONSE_FIXED_PART + 1 {
-        return None;
-    }
-    let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
-    let data_length = (&body[4..8]).get_u32_le() as usize;
-
-    // Reject offsets that fall inside the SMB2 header or the read response's
-    // fixed fields — same bound as `decode_read_response_from_msg`. The
-    // earlier `saturating_sub(SMB2_HEADER_SIZE)` would otherwise let an
-    // offset of e.g. SMB2_HEADER_SIZE + 4 slice into DataLength and return
-    // those bytes as the file payload.
-    let min_offset = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
-    if data_offset < min_offset {
-        return None;
-    }
-    let start = data_offset - SMB2_HEADER_SIZE;
-    let end = start.checked_add(data_length)?;
-    if end > body.len() {
-        return None;
-    }
-    Some(Bytes::copy_from_slice(&body[start..end]))
-}
-
-/// Zero-copy variant of `decode_read_response` — takes ownership of the
-/// response body Vec and slices into it without copying the data.
-pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
+/// Locate a read response's payload within its body (the bytes following the
+/// 64-byte SMB2 header), as a `start..end` range into `body`.
+///
+/// `DataOffset` on the wire is absolute from the start of the SMB2 message, so
+/// the minimum legitimate value points at the first byte of the Buffer field.
+/// Anything below that overlaps the header or the read response's own fixed
+/// fields (StructureSize, DataOffset, Reserved, DataLength, DataRemaining,
+/// Flags = 16 bytes), and a malformed server response could otherwise make us
+/// return header bytes — or the length fields themselves — as file payload.
+/// Every read decoder below shares this one bounds check.
+/// A successful READ must also carry at least one byte: MS-SMB2 requires the
+/// response Buffer to be non-empty and signals "nothing left" with
+/// `STATUS_END_OF_FILE`, which callers handle separately. Accepting a
+/// zero-length payload here would hand the streaming loops a chunk that
+/// advances their offset by nothing — a request for the same range, forever.
+fn read_payload_range(body: &[u8]) -> Option<std::ops::Range<usize>> {
     if body.len() < READ_RESPONSE_FIXED_PART + 1 {
         return None;
     }
     let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
     let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
 
-    // Same bound as `decode_read_response` / `decode_read_response_from_msg`.
+    if data_length == 0 {
+        return None;
+    }
     let min_offset = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
     if data_offset < min_offset {
         return None;
@@ -541,47 +544,31 @@ pub fn decode_read_response_owned(body: Vec<u8>) -> Option<Bytes> {
     if end > body.len() {
         return None;
     }
-    let mut bytes = Bytes::from(body);
-    bytes = bytes.slice(start..end);
-    Some(bytes)
+    Some(start..end)
+}
+
+/// Zero-copy read decode — slices the payload out of a body that is already
+/// reference-counted, without copying it. This is the form the transport uses:
+/// every SMB response is read into one allocation and handed out as `Bytes`,
+/// so a 256 KiB read costs one allocation and no payload memcpy.
+pub fn decode_read_response_bytes(body: &Bytes) -> Option<Bytes> {
+    let range = read_payload_range(body)?;
+    Some(body.slice(range))
 }
 
 /// Zero-copy decode that takes ownership of the full SMB2 message (header +
-/// body) and returns a `Bytes` slice referencing the response payload. Avoids
-/// the extra body-copy that `decode_read_response_owned` would require if the
-/// caller had to split body off first.
-///
-/// Treats `data_offset` as an absolute offset from the start of the SMB2
-/// message and rejects offsets that fall inside the 64-byte header *or*
-/// inside the 16 bytes of fixed read-response fields that precede the data
-/// buffer. A malformed server response with an offset short of
-/// `SMB2_HEADER_SIZE + 16` would otherwise let us return header bytes — or
-/// the response's own StructureSize/DataOffset/DataLength/etc — as the file
-/// payload.
+/// body) and returns a `Bytes` slice referencing the response payload — for
+/// the pipelined reader, which owns each frame as a `Vec` and would otherwise
+/// have to split the body off first.
 pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
-    if msg.len() < SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART {
+    if msg.len() < SMB2_HEADER_SIZE {
         return None;
     }
-    let body = &msg[SMB2_HEADER_SIZE..];
-    let data_offset = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
-    let data_length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
-
-    // `data_offset` is from the start of the SMB2 message. The minimum
-    // legitimate value points at the first byte of the read response's
-    // Buffer field — anything before that overlaps the SMB2 header or the
-    // read response's fixed fields (StructureSize, DataOffset, Reserved,
-    // DataLength, DataRemaining, Flags = 16 bytes).
-    let min_offset = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
-    if data_offset < min_offset {
-        return None;
-    }
-    let start = data_offset;
-    let end = start.checked_add(data_length)?;
-    if end > msg.len() {
-        return None;
-    }
-    let bytes = Bytes::from(msg);
-    Some(bytes.slice(start..end))
+    let range = read_payload_range(&msg[SMB2_HEADER_SIZE..])?;
+    // Shift the body-relative range to absolute message offsets.
+    let start = range.start + SMB2_HEADER_SIZE;
+    let end = range.end + SMB2_HEADER_SIZE;
+    Some(Bytes::from(msg).slice(start..end))
 }
 
 /// Size of the read response's fixed fields (preceding the Buffer):
@@ -611,6 +598,148 @@ pub fn decode_write_response(body: &[u8]) -> Option<u32> {
         return None;
     }
     Some((&body[4..8]).get_u32_le()) // Count (bytes written)
+}
+
+// ── IOCTL / server-side copy ───────────────────────────────────────────────
+
+/// Fetch an opaque 24-byte token identifying an open file, to be handed to the
+/// server as the *source* of a server-side copy.
+pub const FSCTL_SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
+
+/// Ask the server to copy ranges from the resume-key'd source into the file the
+/// request is issued on. The bytes never traverse the client connection.
+pub const FSCTL_SRV_COPYCHUNK_WRITE: u32 = 0x0014_80F2;
+
+/// `SMB2_0_IOCTL_IS_FSCTL` — the request is a file-system control code.
+const SMB2_0_IOCTL_IS_FSCTL: u32 = 0x0000_0001;
+
+/// One range to copy, as carried in an `SRV_COPYCHUNK_COPY` request.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyChunk {
+    pub source_offset: u64,
+    pub target_offset: u64,
+    pub length: u32,
+}
+
+/// Server's answer to a copychunk request. On success `total_bytes_written`
+/// is what actually landed; on `STATUS_INVALID_PARAMETER` the same structure
+/// carries the server's limits instead, which is how a client discovers how
+/// to re-chunk the request (MS-SMB2 2.2.32.1).
+#[derive(Debug, Clone, Copy)]
+pub struct CopyChunkResponse {
+    pub chunks_written: u32,
+    pub chunk_bytes_written: u32,
+    pub total_bytes_written: u32,
+}
+
+/// Encode an SMB2 IOCTL request carrying `input` for `ctl_code` on `file_id`.
+///
+/// `max_output_response` bounds what the server may return; callers charge
+/// credits for it the same way reads do.
+pub fn encode_ioctl_request(
+    buf: &mut BytesMut,
+    ctl_code: u32,
+    file_id: &[u8; 16],
+    input: &[u8],
+    max_output_response: u32,
+) {
+    let input_offset = (SMB2_HEADER_SIZE + 56) as u32;
+    buf.put_u16_le(57); // StructureSize
+    buf.put_u16_le(0); // Reserved
+    buf.put_u32_le(ctl_code); // CtlCode
+    buf.put_slice(file_id); // FileId
+    buf.put_u32_le(if input.is_empty() { 0 } else { input_offset }); // InputOffset
+    buf.put_u32_le(input.len() as u32); // InputCount
+    buf.put_u32_le(0); // MaxInputResponse
+    buf.put_u32_le(0); // OutputOffset
+    buf.put_u32_le(0); // OutputCount
+    buf.put_u32_le(max_output_response); // MaxOutputResponse
+    buf.put_u32_le(SMB2_0_IOCTL_IS_FSCTL); // Flags
+    buf.put_u32_le(0); // Reserved2
+    if input.is_empty() {
+        // The fixed part claims 57 bytes, i.e. one byte of Buffer.
+        buf.put_u8(0);
+    } else {
+        buf.put_slice(input);
+    }
+}
+
+/// Extract an IOCTL response's output buffer.
+///
+/// Field layout (MS-SMB2 2.2.32): StructureSize(2) Reserved(2) CtlCode(4)
+/// FileId(16) InputOffset(4) InputCount(4) OutputOffset(4) OutputCount(4)
+/// Flags(4) Reserved2(4) — so OutputOffset starts at 32 and OutputCount at 36.
+pub fn decode_ioctl_output(body: &[u8]) -> Option<&[u8]> {
+    const IOCTL_RESPONSE_FIXED_PART: usize = 48;
+    if body.len() < IOCTL_RESPONSE_FIXED_PART {
+        return None;
+    }
+    let output_offset = u32::from_le_bytes(body[32..36].try_into().unwrap()) as usize;
+    let output_count = u32::from_le_bytes(body[36..40].try_into().unwrap()) as usize;
+    if output_count == 0 {
+        return Some(&[]);
+    }
+    // OutputOffset is absolute from the start of the SMB2 message; anything
+    // inside the header or the response's own fixed fields is malformed.
+    if output_offset < SMB2_HEADER_SIZE + IOCTL_RESPONSE_FIXED_PART {
+        return None;
+    }
+    let start = output_offset - SMB2_HEADER_SIZE;
+    let end = start.checked_add(output_count)?;
+    if end > body.len() {
+        return None;
+    }
+    Some(&body[start..end])
+}
+
+/// The 24-byte resume key from an `FSCTL_SRV_REQUEST_RESUME_KEY` response.
+pub fn decode_resume_key(output: &[u8]) -> Option<[u8; 24]> {
+    if output.len() < 24 {
+        return None;
+    }
+    let mut key = [0u8; 24];
+    key.copy_from_slice(&output[..24]);
+    Some(key)
+}
+
+/// Encode an `SRV_COPYCHUNK_COPY` structure: the source's resume key followed
+/// by the ranges to copy (MS-SMB2 2.2.31.1).
+pub fn encode_copychunk_input(buf: &mut BytesMut, resume_key: &[u8; 24], chunks: &[CopyChunk]) {
+    buf.put_slice(resume_key); // SourceKey
+    buf.put_u32_le(chunks.len() as u32); // ChunkCount
+    buf.put_u32_le(0); // Reserved
+    for c in chunks {
+        buf.put_u64_le(c.source_offset);
+        buf.put_u64_le(c.target_offset);
+        buf.put_u32_le(c.length);
+        buf.put_u32_le(0); // Reserved
+    }
+}
+
+/// Decode an `SRV_COPYCHUNK_RESPONSE` (MS-SMB2 2.2.32.1).
+pub fn decode_copychunk_response(output: &[u8]) -> Option<CopyChunkResponse> {
+    if output.len() < 12 {
+        return None;
+    }
+    Some(CopyChunkResponse {
+        chunks_written: u32::from_le_bytes(output[0..4].try_into().unwrap()),
+        chunk_bytes_written: u32::from_le_bytes(output[4..8].try_into().unwrap()),
+        total_bytes_written: u32::from_le_bytes(output[8..12].try_into().unwrap()),
+    })
+}
+
+// ── Echo (keepalive) ───────────────────────────────────────────────────────
+
+/// SMB2 ECHO request — the protocol's keepalive. Body is just
+/// `StructureSize(2) + Reserved(2)`; the server answers with the same shape.
+/// Sent on connections that have been idle long enough for a server (or a
+/// NAT/firewall in between) to have dropped the session without telling us:
+/// the round trip proves the connection still carries traffic, and a transport
+/// failure poisons it so the healer reconnects *before* a client request lands
+/// on a dead connection.
+pub fn encode_echo_request(buf: &mut BytesMut) {
+    buf.put_u16_le(4); // StructureSize
+    buf.put_u16_le(0); // Reserved
 }
 
 // ── Set Info (rename) ──────────────────────────────────────────────────────
@@ -666,12 +795,20 @@ pub fn encode_set_info_rename(
 
 pub const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 0x25;
 
+/// `output_buffer_length` is how much directory data the server may return in
+/// one response. It is the dominant cost of a large listing: at 64 KiB a
+/// directory of ten thousand entries needs dozens of round trips, and each one
+/// is a full RTT to the NAS. Callers pass the negotiated transact size (capped
+/// — see `QUERY_DIR_BUFFER_MAX`) and must charge credits for the response they are
+/// asking for, since the SMB2 credit charge is computed from the *expected
+/// response* size, not the request.
 pub fn encode_query_directory_request(
     buf: &mut BytesMut,
     file_id: &[u8; 16],
     pattern: &str,
     info_class: u8,
     restart: bool,
+    output_buffer_length: u32,
 ) {
     let pattern_bytes: Vec<u8> = pattern
         .encode_utf16()
@@ -689,7 +826,7 @@ pub fn encode_query_directory_request(
     buf.put_slice(file_id); // FileId
     buf.put_u16_le(name_offset); // FileNameOffset
     buf.put_u16_le(pattern_bytes.len() as u16); // FileNameLength
-    buf.put_u32_le(65536); // OutputBufferLength
+    buf.put_u32_le(output_buffer_length); // OutputBufferLength
     buf.put_slice(&pattern_bytes);
 }
 
@@ -833,11 +970,13 @@ where
 }
 
 /// Parse an SMB2 compound response (multiple chained messages in one frame).
-/// Each returned tuple is `(header, body)` where `body` is the per-message
-/// payload following the 64-byte header. Returns the messages successfully
-/// parsed up to the first malformed boundary (callers rely on this for partial
-/// recovery).
-pub fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
+/// Each returned tuple is `(header, body)` where `body` is a zero-copy view of
+/// the per-message payload following the 64-byte header — the whole frame
+/// stays in the single allocation the transport read it into, so a compound
+/// create+read+close does not memcpy its 64 KiB payload out. Returns the
+/// messages successfully parsed up to the first malformed boundary (callers
+/// rely on this for partial recovery).
+pub fn parse_compound_response(msg: &Bytes) -> Vec<(Header, Bytes)> {
     let mut results = Vec::new();
     let mut offset = 0;
 
@@ -865,8 +1004,7 @@ pub fn parse_compound_response(msg: &[u8]) -> Vec<(Header, Vec<u8>)> {
             break;
         }
 
-        let body = msg[body_start..body_end].to_vec();
-        results.push((header, body));
+        results.push((header, msg.slice(body_start..body_end)));
 
         if next == 0 {
             break;
@@ -1054,54 +1192,136 @@ mod tests {
         assert_ne!(opts & FILE_DELETE_ON_CLOSE, 0, "DELETE_ON_CLOSE bit set");
     }
 
-    #[test]
-    fn decode_read_response_valid() {
-        // data_offset at body[2..4], data_length at body[4..8]
-        let mut body = vec![0u8; 32];
-        let data_offset = (SMB2_HEADER_SIZE + 16) as u16; // offset within full msg
-        body[2..4].copy_from_slice(&data_offset.to_le_bytes());
-        body[4..8].copy_from_slice(&5u32.to_le_bytes()); // 5 bytes of data
-        body[16..21].copy_from_slice(b"hello");
+    /// Build a read-response body carrying `payload` at the minimum legal
+    /// data offset — the shape every read decoder is expected to accept.
+    fn read_response_body(payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; READ_RESPONSE_FIXED_PART + payload.len()];
+        let offset = (SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART) as u16;
+        body[2..4].copy_from_slice(&offset.to_le_bytes());
+        body[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        body[READ_RESPONSE_FIXED_PART..].copy_from_slice(payload);
+        body
+    }
 
-        let data = decode_read_response(&body).unwrap();
-        assert_eq!(&data[..], b"hello");
+    /// Build an IOCTL response body carrying `output` at the minimum legal
+    /// offset, per MS-SMB2 2.2.32.
+    fn ioctl_response_body(output: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; 48 + output.len()];
+        body[0..2].copy_from_slice(&49u16.to_le_bytes()); // StructureSize
+        let offset = (SMB2_HEADER_SIZE + 48) as u32;
+        body[32..36].copy_from_slice(&offset.to_le_bytes()); // OutputOffset
+        body[36..40].copy_from_slice(&(output.len() as u32).to_le_bytes()); // OutputCount
+        body[48..].copy_from_slice(output);
+        body
     }
 
     #[test]
-    fn decode_read_response_too_short() {
-        assert!(decode_read_response(&[0u8; 5]).is_none());
+    fn decode_ioctl_output_reads_the_output_buffer() {
+        // Guards the field offsets: landing on Flags/Reserved2 instead of
+        // OutputOffset/OutputCount yields a zero-length or rejected buffer,
+        // which is exactly how a wrong layout shows up against a real server.
+        let body = ioctl_response_body(b"payload-bytes");
+        assert_eq!(decode_ioctl_output(&body).unwrap(), b"payload-bytes");
+
+        // An offset inside the response's own fixed fields is rejected.
+        let mut bad = ioctl_response_body(b"payload-bytes");
+        bad[32..36].copy_from_slice(&((SMB2_HEADER_SIZE + 4) as u32).to_le_bytes());
+        assert!(decode_ioctl_output(&bad).is_none());
+
+        // A length running past the body is rejected.
+        let mut over = ioctl_response_body(b"short");
+        over[36..40].copy_from_slice(&9999u32.to_le_bytes());
+        assert!(decode_ioctl_output(&over).is_none());
     }
 
     #[test]
-    fn decode_read_response_rejects_offset_in_response_fixed_fields() {
-        // Same regression as `decode_read_response_from_msg`: an offset
-        // pointing inside the 16-byte read-response fixed fields would
-        // otherwise leak those bytes as the file payload.
-        let mut body = vec![0u8; 32];
-        let bad_offset = (SMB2_HEADER_SIZE + 4) as u16;
-        body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
-        body[4..8].copy_from_slice(&4u32.to_le_bytes());
-        assert!(decode_read_response(&body).is_none());
+    fn decode_resume_key_needs_24_bytes() {
+        let key: Vec<u8> = (0..24u8).collect();
+        let body = ioctl_response_body(&key);
+        let decoded = decode_resume_key(decode_ioctl_output(&body).unwrap()).unwrap();
+        assert_eq!(&decoded[..], &key[..]);
+        assert!(decode_resume_key(&key[..23]).is_none());
     }
 
     #[test]
-    fn decode_read_response_owned_rejects_offset_in_response_fixed_fields() {
-        let mut body = vec![0u8; 32];
-        let bad_offset = (SMB2_HEADER_SIZE + 4) as u16;
-        body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
-        body[4..8].copy_from_slice(&4u32.to_le_bytes());
-        assert!(decode_read_response_owned(body).is_none());
+    fn copychunk_round_trips_through_the_wire_format() {
+        let key = [7u8; 24];
+        let chunks = [
+            CopyChunk {
+                source_offset: 0,
+                target_offset: 0,
+                length: 1024,
+            },
+            CopyChunk {
+                source_offset: 1024,
+                target_offset: 1024,
+                length: 512,
+            },
+        ];
+        let mut buf = BytesMut::new();
+        encode_copychunk_input(&mut buf, &key, &chunks);
+        // SourceKey(24) + ChunkCount(4) + Reserved(4) + 2 * Chunk(24)
+        assert_eq!(buf.len(), 24 + 8 + 2 * 24);
+        assert_eq!(&buf[..24], &key[..]);
+        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(buf[32..40].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(buf[48..52].try_into().unwrap()), 1024);
+
+        let mut out = vec![0u8; 12];
+        out[0..4].copy_from_slice(&2u32.to_le_bytes());
+        out[4..8].copy_from_slice(&1024u32.to_le_bytes());
+        out[8..12].copy_from_slice(&1536u32.to_le_bytes());
+        let resp = decode_copychunk_response(&out).unwrap();
+        assert_eq!(resp.chunks_written, 2);
+        assert_eq!(resp.total_bytes_written, 1536);
     }
 
     #[test]
-    fn decode_read_response_owned_accepts_minimum_valid_offset() {
-        let mut body = vec![0u8; READ_RESPONSE_FIXED_PART + 4];
-        let min_offset = (SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART) as u16;
-        body[2..4].copy_from_slice(&min_offset.to_le_bytes());
-        body[4..8].copy_from_slice(&4u32.to_le_bytes());
-        body[READ_RESPONSE_FIXED_PART..READ_RESPONSE_FIXED_PART + 4].copy_from_slice(b"data");
-        let data = decode_read_response_owned(body).unwrap();
-        assert_eq!(&data[..], b"data");
+    fn decode_read_response_bytes_valid() {
+        let shared = Bytes::from(read_response_body(b"hello"));
+        assert_eq!(&decode_read_response_bytes(&shared).unwrap()[..], b"hello");
+    }
+
+    #[test]
+    fn decode_read_response_bytes_too_short() {
+        assert!(decode_read_response_bytes(&Bytes::from_static(&[0u8; 5])).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_bytes_rejects_offset_in_response_fixed_fields() {
+        // An offset pointing inside the 16-byte read-response fixed fields
+        // would otherwise leak those bytes as the file payload.
+        let mut bad = read_response_body(b"payload");
+        bad[2..4].copy_from_slice(&((SMB2_HEADER_SIZE + 4) as u16).to_le_bytes());
+        assert!(decode_read_response_bytes(&Bytes::from(bad)).is_none());
+    }
+
+    #[test]
+    fn decode_read_response_bytes_is_a_view_not_a_copy() {
+        // The whole point of the Bytes variant: the payload must alias the
+        // response buffer rather than allocate a second copy of it.
+        let shared = Bytes::from(read_response_body(b"aliased"));
+        let payload = decode_read_response_bytes(&shared).unwrap();
+        assert_eq!(
+            payload.as_ptr(),
+            shared[READ_RESPONSE_FIXED_PART..].as_ptr(),
+            "payload should point into the response buffer"
+        );
+    }
+
+    #[test]
+    fn decode_read_response_rejects_zero_length_payload() {
+        // MS-SMB2 requires a successful READ to carry at least one byte and
+        // reports "nothing left" as STATUS_END_OF_FILE. Accepting a
+        // zero-length payload would hand the streaming loops a chunk that
+        // advances their offset by nothing — re-reading the same range
+        // forever. Both decoders must refuse it.
+        let body = read_response_body(b"");
+        assert!(decode_read_response_bytes(&Bytes::from(body.clone())).is_none());
+
+        let mut msg = vec![0u8; SMB2_HEADER_SIZE];
+        msg.extend_from_slice(&body);
+        assert!(decode_read_response_from_msg(msg).is_none());
     }
 
     #[test]
@@ -1358,7 +1578,7 @@ mod tests {
     #[test]
     fn encode_read_request_size() {
         let mut buf = BytesMut::new();
-        encode_read_request(&mut buf, &[0u8; 16], 0, 65536);
+        encode_read_request(&mut buf, &[0u8; 16], 0, 65536, 0);
         assert_eq!(buf.len(), 49);
     }
 
@@ -1498,7 +1718,7 @@ mod tests {
     /// Build a synthetic compound response payload of `n` chained messages,
     /// each carrying `body_len` bytes of body. Returns the wire-format bytes
     /// (with each message's `next_command` set to point at the next).
-    fn build_compound(n: usize, body_len: usize) -> Vec<u8> {
+    fn build_compound(n: usize, body_len: usize) -> Bytes {
         let entry_size = SMB2_HEADER_SIZE + body_len;
         let mut out = Vec::with_capacity(entry_size * n);
         for i in 0..n {
@@ -1509,7 +1729,7 @@ mod tests {
             buf.extend_from_slice(&vec![0xABu8; body_len]);
             out.extend_from_slice(&buf);
         }
-        out
+        Bytes::from(out)
     }
 
     #[test]
@@ -1535,15 +1755,15 @@ mod tests {
 
     #[test]
     fn parse_compound_response_empty_input() {
-        assert!(parse_compound_response(&[]).is_empty());
+        assert!(parse_compound_response(&Bytes::new()).is_empty());
     }
 
     #[test]
     fn parse_compound_response_truncated_header() {
         let msg = build_compound(2, 16);
         // Lop off bytes inside the second message's header — should yield only the first.
-        let truncated = &msg[..SMB2_HEADER_SIZE + 16 + 32];
-        let parts = parse_compound_response(truncated);
+        let truncated = msg.slice(..SMB2_HEADER_SIZE + 16 + 32);
+        let parts = parse_compound_response(&truncated);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].0.message_id, 0);
     }
@@ -1551,10 +1771,10 @@ mod tests {
     #[test]
     fn parse_compound_response_bad_next_command_yields_no_parts() {
         // Forge a next_command that points past end of buffer.
-        let mut msg = build_compound(2, 8);
+        let mut msg = build_compound(2, 8).to_vec();
         // next_command field is at byte offset 20 (header offset of next_command).
         msg[20..24].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        let parts = parse_compound_response(&msg);
+        let parts = parse_compound_response(&Bytes::from(msg));
         // When the first message's `next_command` overflows the buffer, the
         // parser bails before pushing anything — both messages are dropped.
         // This documents the current behavior rather than implying partial

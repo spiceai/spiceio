@@ -20,6 +20,10 @@ S3 client  --->  spiceio (HTTP :8333)  --->  SMB server (TCP :445)
 - **SMB2 compounding** -- batches Create+Read+Close or Create+Write+Close into single round trips for small file performance
 - **Credit-window flow control** -- tracks the server's SMB2 credit grants per connection and sizes pipelined batches to the granted window, so sustained bursts never violate the protocol's sequence window
 - **Streaming I/O** -- GetObject and PutObject stream directly between HTTP and SMB without buffering entire files
+- **Load-aware connection pool** -- requests are dispatched to the least-busy SMB connection, so a one-round-trip HEAD never queues behind a multi-megabyte pipelined batch
+- **Proactive keepalive** -- idle connections are probed with SMB2 ECHO (and TCP keepalive), so a session the server dropped while idle is reconnected before a client request ever lands on it
+- **Server-side copy** -- CopyObject, UploadPartCopy and multipart assembly use SMB's `FSCTL_SRV_COPYCHUNK`, so the file server copies the bytes itself and they never cross the proxy (falls back to streaming if the server lacks it)
+- **Verified before publish** -- every streamed write (PutObject, CopyObject, multipart assembly) is size-checked *before* it replaces the destination, so a failed check leaves the existing object untouched
 - **Non-blocking logging** -- timestamped stdout/stderr with optional file tee via `SPICEIO_LOG_FILE`; dedicated writer thread, never stalls the proxy
 - **Crash reporting built in** -- panics and fatal signals (SIGSEGV/SIGBUS/...) always leave a diagnosable report on stderr and in the log file: version, uptime, panic location, registers, fault address, and a backtrace with the info needed to symbolize stripped release builds offline
 - **Simple config** -- everything via environment variables, single binary, `--version` flag
@@ -74,18 +78,22 @@ cargo build   # artifacts cached on your NAS via spiceio
 
 All configuration is via environment variables:
 
-| Variable             | Required | Default             | Description               |
-| -------------------- | -------- | ------------------- | ------------------------- |
-| `SPICEIO_SMB_SERVER` | yes      |                     | SMB server hostname or IP |
-| `SPICEIO_SMB_USER`   | yes      |                     | SMB username              |
-| `SPICEIO_SMB_PASS`   | yes      |                     | SMB password              |
-| `SPICEIO_SMB_SHARE`  | yes      |                     | SMB share name            |
-| `SPICEIO_BIND`       | no       | `0.0.0.0:8333`      | Listen address            |
-| `SPICEIO_SMB_PORT`   | no       | `445`               | SMB port                  |
-| `SPICEIO_SMB_DOMAIN` | no       | *(empty)*           | SMB domain                |
-| `SPICEIO_BUCKET`     | no       | `SPICEIO_SMB_SHARE` | Virtual S3 bucket name    |
-| `SPICEIO_REGION`     | no       | `us-east-1`         | AWS region to advertise   |
-| `SPICEIO_LOG_FILE`   | no       | *(none)*            | Append logs to file (non-blocking) |
+| Variable                      | Required | Default             | Description               |
+| ----------------------------- | -------- | ------------------- | ------------------------- |
+| `SPICEIO_SMB_SERVER`          | yes      |                     | SMB server hostname or IP |
+| `SPICEIO_SMB_USER`            | yes      |                     | SMB username              |
+| `SPICEIO_SMB_PASS`            | yes      |                     | SMB password              |
+| `SPICEIO_SMB_SHARE`           | yes      |                     | SMB share name            |
+| `SPICEIO_BIND`                | no       | `0.0.0.0:8333`      | Listen address            |
+| `SPICEIO_SMB_PORT`            | no       | `445`               | SMB port                  |
+| `SPICEIO_SMB_DOMAIN`          | no       | *(empty)*           | SMB domain                |
+| `SPICEIO_BUCKET`              | no       | `SPICEIO_SMB_SHARE` | Virtual S3 bucket name    |
+| `SPICEIO_REGION`              | no       | `us-east-1`         | AWS region to advertise   |
+| `SPICEIO_SMB_CONNECTIONS`     | no       | CPU count (4–12)    | SMB connections in the pool |
+| `SPICEIO_SMB_MAX_IO`          | no       | `262144`            | Max standalone read/write I/O size, bytes |
+| `SPICEIO_MULTIPART_TTL_SECS`  | no       | `86400`             | Age at which an abandoned multipart upload is reaped |
+| `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
+| `SPICEIO_LOG_FILE`            | no       | *(none)*            | Append logs to file (non-blocking) |
 
 ## Supported S3 operations
 
@@ -95,7 +103,7 @@ All configuration is via environment variables:
 - **Bucket**: HeadBucket, GetBucketLocation, CreateBucket, DeleteBucket
 - **Stubs**: ACL, tagging, versioning, encryption, lifecycle, CORS (returns valid empty responses)
 
-Path-style addressing only (no virtual-hosted-style).
+Path-style addressing only (no virtual-hosted-style), over HTTP/1.1.
 
 ListObjects without a `delimiter` walks subdirectories recursively (full S3
 semantics — `aws s3 ls --recursive` and `aws s3 sync` see every key); with
@@ -119,18 +127,21 @@ atos -o target/release/spiceio.dSYM/Contents/Resources/DWARF/spiceio \
      -l <image base from the report> <addresses...>
 ```
 
-`SIGTERM` and `SIGINT` (Ctrl-C) both shut down gracefully, flushing the log
-file before exit. Startup/config errors (missing env vars, unreachable SMB
-server) exit cleanly with a one-line reason — only genuine bugs produce crash
-reports.
+`SIGTERM` and `SIGINT` (Ctrl-C) both shut down gracefully: the listener stops
+accepting, in-flight requests are given up to 30 seconds to finish (so a
+transfer in progress is not cut off and a half-written object is never left
+behind), then the log file is flushed before exit. Startup/config errors
+(missing env vars, unreachable SMB server) exit cleanly with a one-line reason
+— only genuine bugs produce crash reports.
 
 ## Architecture
 
-Four modules:
+Five modules:
 
 - **`s3`** -- HTTP layer. Parses S3 requests, produces XML responses. Router dispatches to the appropriate handler. Small files (<64KB) use compound fast paths; large files stream.
 - **`smb`** -- Wire protocol client. Manages TCP connection, negotiate/session-setup handshake, and file operations. Supports SMB2 compounding for batching multiple operations in a single round trip.
 - **`crypto`** -- FFI bindings to macOS CommonCrypto. MD4, SHA-256, SHA-512, HMAC-MD5, HMAC-SHA256, AES-128-CMAC. No Rust crypto crates.
+- **`http`** -- HTTP front-end tuning for the listener: HTTP/1.1 connection builder, header-read timeout, accept backoff, and shutdown grace. Factored out of the accept loop so the integration tests exercise the same settings the server runs with.
 - **`crash`** -- Crash reporting. Panic hook plus async-signal-safe fatal-signal handler; reports go to stderr and the log file synchronously, bypassing the async logger.
 
 ```
