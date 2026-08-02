@@ -22,5 +22,6 @@ macro_rules! serr {
 
 pub mod crash;
 pub mod crypto;
+pub mod http;
 pub mod s3;
 pub mod smb;

@@ -23,6 +23,12 @@ const MAX_RESET_RETRIES: u32 = 16;
 #[derive(Clone)]
 pub struct ShareSession {
     pool: Arc<SmbPool>,
+    /// Grace period, in FILETIME ticks, before startup cleanup will remove a
+    /// WAL temp or upload directory. Passed in rather than read from the
+    /// environment here: every other knob is parsed once into `Config` at
+    /// startup, and a hidden `env::var` in this layer could not be set per
+    /// session or exercised by a test.
+    cleanup_grace_ft: u64,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -42,15 +48,31 @@ pub struct FileHandle {
 
 impl ShareSession {
     /// Connect to a share on every connection in the pool.
-    pub async fn connect(pool: Arc<SmbPool>, share: &str) -> io::Result<Self> {
+    ///
+    /// `cleanup_grace_secs` bounds how recent a WAL temp / upload directory
+    /// may be and still be swept at startup — see `DEFAULT_CLEANUP_GRACE_SECS`.
+    pub async fn connect(
+        pool: Arc<SmbPool>,
+        share: &str,
+        cleanup_grace_secs: u64,
+    ) -> io::Result<Self> {
         pool.connect_share(share).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            cleanup_grace_ft: cleanup_grace_secs.saturating_mul(FILETIME_TICKS_PER_SEC),
+        })
     }
 
     /// Reconnect any poisoned pool connections. Run periodically by a
     /// background task so the pool recovers from transient SMB outages.
     pub async fn heal(&self) {
         self.pool.heal().await;
+    }
+
+    /// Probe idle pool connections with an SMB2 ECHO so a session dropped
+    /// during a quiet period is healed before a client request finds it.
+    pub fn keepalive(&self) {
+        self.pool.keepalive();
     }
 
     /// Pick the next connection + tree_id via round-robin (owned `Arc`).
@@ -512,9 +534,24 @@ impl ShareSession {
             ));
         }
 
-        if let Err(e) = self.stream_part_into_wal(&mut wal, &src_path).await {
-            wal.abort().await;
-            return Err(e);
+        // Prefer the server-side copy: the NAS reads and writes the bytes
+        // itself and nothing crosses this connection. Falls back to streaming
+        // when the server does not implement it (learned once per process).
+        match self.copychunk_into_wal(&mut wal, &src_path, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // No expected size: the copy source's own length is the
+                // target, and `stream_part_into_wal` already fails if the
+                // source shrinks mid-copy.
+                if let Err(e) = self.stream_part_into_wal(&mut wal, &src_path, None).await {
+                    wal.abort().await;
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                wal.abort().await;
+                return Err(e);
+            }
         }
 
         let meta = wal.commit(self).await?;
@@ -706,7 +743,16 @@ impl ShareSession {
     /// Reads each temp part using pipelined reads and writes through a WalWriter
     /// (pipelined writes + atomic rename). Never holds more than one pipeline
     /// buffer in memory — supports arbitrarily large files.
-    pub async fn assemble_parts(&self, key: &str, temp_paths: &[&str]) -> io::Result<ObjectMeta> {
+    ///
+    /// Each entry is `(temp_path, size_acknowledged_to_the_client)`, and a part
+    /// whose file no longer matches the size we acknowledged aborts the whole
+    /// assembly. Verifying *here* — before the WAL is renamed into place — is
+    /// what keeps a corrupt object from ever being published: the destination
+    /// key is untouched and only the unpublished temp is removed. Checking
+    /// after the rename instead would leave the bad object live under the
+    /// client's key, and "delete it again" is both racy against a concurrent
+    /// writer and not a rollback.
+    pub async fn assemble_parts(&self, key: &str, parts: &[(&str, u64)]) -> io::Result<ObjectMeta> {
         let mut wal = self.open_wal_write(key).await?;
 
         // Guard before the per-part `remaining.div_ceil(max_read as u64)` in
@@ -721,8 +767,28 @@ impl ShareSession {
             ));
         }
 
-        for &temp_path in temp_paths {
-            if let Err(e) = self.stream_part_into_wal(&mut wal, temp_path).await {
+        for &(temp_path, expected_size) in parts {
+            // Server-side copy first. Assembly is the other half of a large
+            // object copy: without it, UploadPartCopy moves no bytes through
+            // the proxy and then completion reads every part back and writes
+            // it out again, giving the saving straight back.
+            let spliced = match self
+                .copychunk_into_wal(&mut wal, temp_path, Some(expected_size))
+                .await
+            {
+                Ok(done) => done,
+                Err(e) => {
+                    wal.abort().await;
+                    return Err(e);
+                }
+            };
+            if spliced {
+                continue;
+            }
+            if let Err(e) = self
+                .stream_part_into_wal(&mut wal, temp_path, Some(expected_size))
+                .await
+            {
                 // Release the WAL handle and delete its temp file before bailing.
                 wal.abort().await;
                 return Err(e);
@@ -742,7 +808,251 @@ impl ShareSession {
     /// assembly and CopyObject survive a degraded NAS internally instead of
     /// failing back to the client. Bounded by MAX_RESET_RETRIES, refreshed by
     /// each batch that lands.
-    async fn stream_part_into_wal(&self, wal: &mut WalWriter, src_path: &str) -> io::Result<()> {
+    /// Copy `[src_start, src_start+len)` of `src_path` into an already-open
+    /// destination at `dst_start`, using the server's copy engine.
+    ///
+    /// Returns `Ok(None)` when the server has no server-side copy, so callers
+    /// fall back to streaming; `Ok(Some(bytes))` when the copy landed. The
+    /// source and destination handles must live on the same connection — the
+    /// resume key is scoped to the session that issued it — which is why the
+    /// caller supplies the client rather than this picking one.
+    ///
+    /// `expect_len` is the length the caller already promised for this source
+    /// (a multipart part's acknowledged size). A source that no longer matches
+    /// fails before a byte is copied, exactly as the streaming path does.
+    async fn copychunk_from_path(
+        &self,
+        client: &SmbClient,
+        tree_id: u32,
+        spec: CopySpec<'_>,
+    ) -> io::Result<Option<u64>> {
+        let CopySpec {
+            src_path,
+            dst_file_id,
+            src_start,
+            dst_start,
+            len,
+            expect_src_size,
+        } = spec;
+        if !self.pool.copychunk_supported() {
+            return Ok(None);
+        }
+        let src = client
+            .create(
+                tree_id,
+                src_path,
+                DesiredAccess::GenericRead as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await?;
+
+        let out = async {
+            if let Some(expected) = expect_src_size
+                && src.file_size != expected
+            {
+                return Err(source_size_changed(src_path, src.file_size, expected));
+            }
+            let len = len.unwrap_or_else(|| src.file_size.saturating_sub(src_start));
+            // The range must still fit inside the source: one that shrank
+            // between the caller's stat and now would be copied short.
+            if src_start.saturating_add(len) > src.file_size {
+                return Err(source_size_changed(
+                    src_path,
+                    src.file_size,
+                    src_start.saturating_add(len),
+                ));
+            }
+            if len == 0 {
+                return Ok(Some(0));
+            }
+            let key = match client.request_resume_key(tree_id, &src.file_id).await {
+                Ok(k) => k,
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let copied = copychunk_range(
+                client,
+                tree_id,
+                dst_file_id,
+                &key,
+                src_start,
+                dst_start,
+                len,
+            )
+            .await?;
+            Ok(copied.then_some(len))
+        }
+        .await;
+
+        let _ = client.close(tree_id, &src.file_id).await;
+        if matches!(out, Ok(None)) {
+            self.pool.note_copychunk_unsupported();
+        }
+        out
+    }
+
+    /// Copy a byte range of `src_key` into `temp_path` for UploadPartCopy,
+    /// returning the resulting part's metadata.
+    ///
+    /// `Ok(None)` means the server has no server-side copy and the caller
+    /// should read and write the range itself. This is the path `aws s3
+    /// cp`/`sync` take for any object above the multipart threshold, so it is
+    /// where server-side copy is worth the most: the bytes never leave the NAS.
+    ///
+    /// Verification lives here rather than at the call site, so every caller
+    /// gets it: a short server-side copy removes the temp and fails, exactly as
+    /// `WalWriter::commit` does for the streaming paths.
+    pub async fn copy_range_to_temp(
+        &self,
+        src_key: &str,
+        start: u64,
+        len: u64,
+        temp_path: &str,
+    ) -> io::Result<Option<ObjectMeta>> {
+        if !self.pool.copychunk_supported() || len == 0 {
+            return Ok(None);
+        }
+        let src_path = to_smb_path(src_key);
+
+        // The shared uploads directory is a contention hot spot, so the whole
+        // setup rides the same retry envelope every other temp write uses.
+        let mut attempt = 0u32;
+        let meta = loop {
+            let (client, tree_id) = self.pick_live().await;
+            let r: io::Result<Option<ObjectMeta>> = async {
+                self.ensure_parent_dirs_on(&client, tree_id, temp_path)
+                    .await?;
+                let dst = create_exclusive_temp(&client, tree_id, temp_path).await?;
+                let copied = self
+                    .copychunk_from_path(
+                        &client,
+                        tree_id,
+                        CopySpec {
+                            src_path: &src_path,
+                            dst_file_id: &dst.file_id,
+                            src_start: start,
+                            dst_start: 0,
+                            len: Some(len),
+                            expect_src_size: None,
+                        },
+                    )
+                    .await;
+                // Close before stat: the post-query attributes come back with
+                // the close, so the part's size and timestamp cost no extra
+                // round trip.
+                let closed = client.close_query(tree_id, &dst.file_id).await;
+                let copied = copied?;
+                if copied.is_none() {
+                    return Ok(None);
+                }
+                let size = match closed {
+                    Ok(c) if c.file_size > 0 || len == 0 => c,
+                    // Server declined to fill in post-query attributes — fall
+                    // back to an explicit stat rather than trusting zeroes.
+                    _ => {
+                        let m = self.head_object_smb(temp_path).await?;
+                        CloseResponse {
+                            last_write_time: 0,
+                            file_size: m.size,
+                        }
+                    }
+                };
+                if size.file_size != len {
+                    return Err(io::Error::other(format!(
+                        "server-side copy wrote {} of {len} bytes for '{temp_path}'",
+                        size.file_size
+                    )));
+                }
+                let meta = if size.last_write_time > 0 {
+                    ObjectMeta {
+                        size: size.file_size,
+                        last_modified: filetime_to_epoch_secs(size.last_write_time),
+                        etag: etag_for(size.file_size, size.last_write_time),
+                        content_type: String::new(),
+                    }
+                } else {
+                    self.head_object_smb(temp_path).await?
+                };
+                Ok(Some(meta))
+            }
+            .await;
+            match r {
+                Ok(v) => break v,
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    }
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                        self.delete_temp(temp_path).await;
+                        return Err(e);
+                    }
+                    if is_busy(&e) {
+                        busy_backoff(attempt).await;
+                    }
+                    attempt += 1;
+                }
+            }
+        };
+        if meta.is_none() {
+            // Unsupported after all — leave nothing behind for the fallback.
+            self.delete_temp(temp_path).await;
+        }
+        Ok(meta)
+    }
+
+    /// Splice one source into the WAL temp with the server's copy engine,
+    /// appending at the writer's current offset. `Ok(false)` means the server
+    /// cannot do it and the caller should stream instead.
+    async fn copychunk_into_wal(
+        &self,
+        wal: &mut WalWriter,
+        src_path: &str,
+        expect_src_size: Option<u64>,
+    ) -> io::Result<bool> {
+        // Anything still buffered has to land first, or the server would copy
+        // over the range this writer is about to write.
+        wal.flush_buffered().await?;
+        let client = Arc::clone(&wal.client);
+        let tree_id = wal.tree_id;
+        let dst_offset = wal.offset;
+        match self
+            .copychunk_from_path(
+                &client,
+                tree_id,
+                CopySpec {
+                    src_path,
+                    dst_file_id: &wal.file_id,
+                    src_start: 0,
+                    dst_start: dst_offset,
+                    len: None,
+                    expect_src_size,
+                },
+            )
+            .await?
+        {
+            Some(copied) => {
+                // The writer tracks what it believes the temp contains; the
+                // server wrote behind its back, so tell it. `commit` checks
+                // this against the file the server actually has.
+                wal.note_external_write(copied);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// `expected_size`, when given, is the length the caller already promised    /// `expected_size`, when given, is the length the caller already promised
+    /// for this source (a multipart part's acknowledged size). A mismatch means
+    /// the file changed on the share since then, so splicing it would build an
+    /// object that is not what the client uploaded — fail before writing a byte.
+    async fn stream_part_into_wal(
+        &self,
+        wal: &mut WalWriter,
+        src_path: &str,
+        expected_size: Option<u64>,
+    ) -> io::Result<()> {
         let (mut client, mut tree_id) = self.pick_live().await;
         let cr = client
             .create(
@@ -756,6 +1066,13 @@ impl ShareSession {
             .await?;
         let mut file_id = cr.file_id;
         let file_size = cr.file_size;
+
+        if let Some(expected) = expected_size
+            && file_size != expected
+        {
+            let _ = client.close(tree_id, &file_id).await;
+            return Err(source_size_changed(src_path, file_size, expected));
+        }
 
         let mut offset = 0u64;
         let mut attempt = 0u32;
@@ -771,7 +1088,7 @@ impl ShareSession {
             let remaining = file_size - offset;
             let batch = remaining.div_ceil(max_read as u64).min(read_depth) as usize;
             match client
-                .pipelined_read(tree_id, &file_id, offset, max_read, batch)
+                .pipelined_read(tree_id, &file_id, offset, max_read, batch, remaining)
                 .await
             {
                 Ok(chunks) if chunks.is_empty() => {
@@ -783,11 +1100,22 @@ impl ShareSession {
                     ));
                 }
                 Ok(chunks) => {
+                    let before = offset;
                     for chunk in &chunks {
                         if let Err(e) = wal.write(chunk).await {
                             break 'read Err(e);
                         }
                         offset += chunk.len() as u64;
+                    }
+                    // A batch that lands but moves the offset by nothing would
+                    // re-request the same range forever, refreshing the retry
+                    // budget each time. The decoder rejects zero-length READ
+                    // payloads, so this is belt-and-braces — but it is the
+                    // difference between a wedged request and a clean error.
+                    if offset == before {
+                        break 'read Err(io::Error::other(format!(
+                            "no progress streaming '{src_path}' at offset {offset} of {file_size}"
+                        )));
                     }
                     attempt = 0; // forward progress refreshes the retry budget
                 }
@@ -903,12 +1231,18 @@ impl ShareSession {
                     .await?;
                 self.ensure_parent_dirs_on(&client, tree_id, &wal_path)
                     .await?;
+                // Share read but *not* delete: while this handle is open no
+                // other process can unlink the temp, so a peer instance's
+                // startup cleanup gets a sharing violation instead of deleting
+                // an upload that is still being written. That makes liveness a
+                // property the server enforces, rather than an inference from
+                // a timestamp the server may not refresh until close.
                 let file = client
                     .create(
                         tree_id,
                         &wal_path,
                         DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
-                        ShareAccess::Read as u32 | ShareAccess::Delete as u32,
+                        ShareAccess::Read as u32,
                         CreateDisposition::OverwriteIf as u32,
                         CreateOptions::NonDirectoryFile as u32,
                     )
@@ -953,8 +1287,9 @@ impl ShareSession {
         })
     }
 
-    /// Head object by raw SMB path (no S3 key conversion).
-    async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
+    /// Head a file by raw SMB path (no S3 key conversion) — for callers that
+    /// already hold an internal path, such as a multipart part temp file.
+    pub async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
         // Resilient stat: retry the one-shot compound probe on a transient reset
         // (fresh connection each attempt) so a HEAD — and the post-rename
         // metadata read in WAL commit — survives a degraded NAS. A genuine
@@ -986,9 +1321,83 @@ impl ShareSession {
         })
     }
 
+    /// Sweep both sets of leftovers from previous runs (WAL temps and
+    /// multipart upload dirs), reading the server's clock once for both.
+    ///
+    /// Cleanup decides what to delete by age, so it needs a "now" it can trust;
+    /// probing once here keeps that decision consistent between the two sweeps
+    /// and halves the startup round trips. A probe that fails means we know
+    /// nothing about the server's clock — sweep nothing rather than risk
+    /// judging live files ancient.
+    pub async fn cleanup_previous_runs(&self) {
+        let (client, tree_id) = self.pick();
+        // The probe needs somewhere to write. `.spiceio-wal` may not exist yet
+        // on a share this instance has never written to, and a probe that
+        // fails there would skip *both* sweeps — including the uploads
+        // directory, which can hold a crashed run's parts. `ensure_dirs` is
+        // OpenIf, so this is a no-op when the directory is already there, and
+        // `cleanup_wal` removes it again if it turns out to be empty.
+        let _ = client.ensure_dirs(tree_id, &[WAL_DIR.to_string()]).await;
+        let Some(now_ft) = self.server_filetime(&client, tree_id, WAL_DIR).await else {
+            crate::slog!("[spiceio] startup cleanup skipped: could not read server time");
+            return;
+        };
+        self.cleanup_wal(now_ft).await;
+        self.cleanup_uploads(now_ft).await;
+    }
+
+    /// Read the SMB server's own clock, as a FILETIME, by writing a probe file
+    /// in `dir` and taking the timestamp the server stamped on it.
+    ///
+    /// Startup cleanup decides what to delete by file age, and comparing the
+    /// server's timestamps against the *local* clock makes that decision only
+    /// as trustworthy as the skew between two machines — a NAS whose clock
+    /// lags could make live files look ancient and get them deleted. Measuring
+    /// both ends on the server's clock removes skew from the equation
+    /// entirely. Returns `None` if the probe cannot be written, which callers
+    /// treat as "don't delete anything".
+    async fn server_filetime(&self, client: &SmbClient, tree_id: u32, dir: &str) -> Option<u64> {
+        let path = format!("{dir}\\.spiceio-probe-{}", std::process::id());
+        client.create_write_close(tree_id, &path, b"").await.ok()?;
+        // Stat it rather than trusting the close response's post-query
+        // attributes, which a server may decline to fill in. A zero timestamp
+        // means we learned nothing, and "delete files older than epoch zero"
+        // would sweep the whole directory — report it as a failed probe so the
+        // caller skips cleanup entirely.
+        let stat = client
+            .create_close(
+                tree_id,
+                &path,
+                DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await
+            .ok();
+        let _ = Self::delete_object_path_on(client, tree_id, &path).await;
+        match stat {
+            Some((cr, _)) if cr.last_write_time > 0 => Some(cr.last_write_time),
+            _ => None,
+        }
+    }
+
     /// Clean up orphaned WAL temp files from prior crashes.
     /// Best-effort — logs errors but does not fail.
-    pub async fn cleanup_wal(&self) {
+    ///
+    /// Several spiceio processes can serve one share, so this must never touch
+    /// a peer's in-flight temp. Two independent guards make that safe:
+    ///
+    /// 1. A live writer holds its temp open denying delete-sharing, so the
+    ///    delete simply fails with a sharing violation. This is the strong
+    ///    guarantee — the server enforces it, regardless of timestamps.
+    /// 2. Temps newer than the cleanup grace period are skipped outright,
+    ///    which covers the window between a temp being created and its first
+    ///    write, and servers whose sharing semantics are laxer than MS-FSA.
+    ///
+    /// Only a temp that is both old *and* unlocked — the signature of a
+    /// crashed run — is removed.
+    pub async fn cleanup_wal(&self, now_ft: u64) {
         let (client, tree_id) = self.pick();
 
         // Try to open the WAL directory
@@ -1016,21 +1425,34 @@ impl ShareSession {
         };
 
         let mut count = 0u32;
+        let mut skipped = 0u32;
         for entry in &entries {
             if entry.is_directory() {
                 continue;
             }
+            if is_recent(now_ft, entry.last_write_time, self.cleanup_grace_ft) {
+                skipped += 1;
+                continue;
+            }
             let path = format!("{WAL_DIR}\\{}", entry.file_name);
-            if Self::delete_object_path_on(&client, tree_id, &path)
-                .await
-                .is_ok()
-            {
-                count += 1;
+            match Self::delete_object_path_on(&client, tree_id, &path).await {
+                Ok(()) => count += 1,
+                // Sharing violation: a live writer still holds this temp open.
+                // Its age was misleading (a server that only refreshes
+                // last-write-time on close), and the lock is the authority.
+                Err(e) if is_busy(&e) => skipped += 1,
+                Err(_) => {}
             }
         }
 
         if count > 0 {
             crate::slog!("[spiceio] wal cleanup: removed {count} orphaned temp file(s)");
+        }
+        if skipped > 0 {
+            crate::slog!(
+                "[spiceio] wal cleanup: left {skipped} in-use temp file(s) alone (another instance is writing them)"
+            );
+            return; // Directory is in use — don't try to remove it.
         }
 
         // Try to remove the now-empty WAL directory (best effort)
@@ -1049,7 +1471,12 @@ impl ShareSession {
     /// Clean up orphaned multipart upload temp dirs from prior runs (best
     /// effort). Removes `.spiceio-uploads/<id>/part-*` files, each per-upload
     /// directory, and the parent. Run at startup; logs but never fails.
-    pub async fn cleanup_uploads(&self) {
+    ///
+    /// An upload directory is only swept once *everything* in it is older than
+    /// the cleanup grace period. A live instance keeps its uploads' marker
+    /// markers fresh (the reaper heartbeat in `main`), so a peer collecting parts for
+    /// a slow client is never mistaken for abandoned garbage.
+    pub async fn cleanup_uploads(&self, now_ft: u64) {
         let (client, tree_id) = self.pick();
 
         let root = match client
@@ -1066,6 +1493,7 @@ impl ShareSession {
             Ok(d) => d,
             Err(_) => return, // No uploads directory — nothing to clean up
         };
+
         let subdirs = client.query_directory(tree_id, &root.file_id, "*").await;
         let _ = client.close(tree_id, &root.file_id).await;
         let subdirs = match subdirs {
@@ -1074,13 +1502,18 @@ impl ShareSession {
         };
 
         let mut removed = 0u32;
+        let mut skipped = 0u32;
         for entry in &subdirs {
             if !entry.is_directory() || entry.file_name == "." || entry.file_name == ".." {
                 continue;
             }
             let subpath = format!("{UPLOADS_DIR}\\{}", entry.file_name);
 
-            // Delete the part files inside this upload directory.
+            // List the upload's files, tracking the newest timestamp in it —
+            // the directory's own mtime only moves when entries are added or
+            // removed, so a part still being written would otherwise look old.
+            let mut newest = entry.last_write_time;
+            let mut contents: Vec<String> = Vec::new();
             if let Ok(sub) = client
                 .create(
                     tree_id,
@@ -1099,10 +1532,29 @@ impl ShareSession {
                         if f.is_directory() {
                             continue;
                         }
-                        let fpath = format!("{subpath}\\{}", f.file_name);
-                        let _ = Self::delete_object_path_on(&client, tree_id, &fpath).await;
+                        newest = newest.max(f.last_write_time);
+                        contents.push(format!("{subpath}\\{}", f.file_name));
                     }
                 }
+            }
+
+            if is_recent(now_ft, newest, self.cleanup_grace_ft) {
+                skipped += 1;
+                continue;
+            }
+
+            let mut in_use = false;
+            for fpath in &contents {
+                if let Err(e) = Self::delete_object_path_on(&client, tree_id, fpath).await
+                    && is_busy(&e)
+                {
+                    // A peer instance is still writing a part into this upload.
+                    in_use = true;
+                }
+            }
+            if in_use {
+                skipped += 1;
+                continue;
             }
 
             // Remove the now-empty upload directory. Only count it as removed
@@ -1126,6 +1578,12 @@ impl ShareSession {
 
         if removed > 0 {
             crate::slog!("[spiceio] uploads cleanup: removed {removed} stale upload dir(s)");
+        }
+        if skipped > 0 {
+            crate::slog!(
+                "[spiceio] uploads cleanup: left {skipped} recent upload dir(s) alone (another instance may own them)"
+            );
+            return; // Root is in use — don't try to remove it.
         }
 
         // Remove the now-empty uploads root.
@@ -1207,7 +1665,14 @@ impl FileHandle {
         let count = remaining.div_ceil(chunk_size as u64).min(batch) as usize;
         let r = self
             .client
-            .pipelined_read(self.tree_id, &self.file_id, offset, chunk_size, count)
+            .pipelined_read(
+                self.tree_id,
+                &self.file_id,
+                offset,
+                chunk_size,
+                count,
+                remaining,
+            )
             .await;
         if let Err(e) = &r
             && is_reset(e)
@@ -1239,6 +1704,140 @@ const WAL_DIR: &str = ".spiceio-wal";
 
 /// Directory on the SMB share where multipart upload parts are stored.
 const UPLOADS_DIR: &str = ".spiceio-uploads";
+
+/// Default grace period, in seconds, before startup cleanup will remove a WAL
+/// temp file or a multipart upload directory. Overridable via
+/// `SPICEIO_CLEANUP_GRACE_SECS` (parsed into `Config` at startup).
+///
+/// Several spiceio processes can serve the same SMB share, and startup runs
+/// before any of them can know what the others are doing. Sweeping every temp
+/// unconditionally would delete a live peer's in-flight WAL file mid-PutObject
+/// or the parts of an upload it is still collecting. 15 minutes is far longer
+/// than the gap between writes to a file that is genuinely in use — an active
+/// WAL temp is written continuously and a live upload's marker is refreshed
+/// every reaper tick — while still reclaiming a crashed run's leftovers at the
+/// next start.
+pub const DEFAULT_CLEANUP_GRACE_SECS: u64 = 900;
+
+/// True if `stamp` is recent enough (within `grace`) that startup cleanup must
+/// leave the file alone. All three values are FILETIMEs on the *server's*
+/// clock, so no local/remote skew enters the comparison.
+///
+/// Saturating: a stamp ahead of `now` — a file written between the probe and
+/// the listing, or a server clock nudge — counts as recent rather than
+/// underflowing into "ancient" and being deleted.
+fn is_recent(now_ft: u64, stamp_ft: u64, grace_ft: u64) -> bool {
+    now_ft.saturating_sub(stamp_ft) < grace_ft
+}
+
+/// One server-side copy: which file to read, which open handle to write into,
+/// and which range. Grouped so the copy paths pass one intent rather than a
+/// row of bare offsets that are easy to transpose.
+struct CopySpec<'a> {
+    src_path: &'a str,
+    dst_file_id: &'a [u8; 16],
+    /// First byte to read from the source.
+    src_start: u64,
+    /// Offset in the destination to write it at — non-zero when appending, as
+    /// multipart assembly does.
+    dst_start: u64,
+    /// How many bytes to copy. `None` means "the rest of the source from
+    /// `src_start`".
+    len: Option<u64>,
+    /// The source's *total* size, if the caller already promised one (a
+    /// multipart part's acknowledged size). A source that no longer matches
+    /// fails before any bytes move. Distinct from `len`: a ranged copy takes a
+    /// slice of a source whose overall size it makes no claim about.
+    expect_src_size: Option<u64>,
+}
+
+/// Open a temp file for exclusive writing: share read but *not* delete, so no
+/// other instance can unlink it while it is being written (see
+/// `open_wal_write` for why that matters).
+async fn create_exclusive_temp(
+    client: &SmbClient,
+    tree_id: u32,
+    path: &str,
+) -> io::Result<CreateResponse> {
+    client
+        .create(
+            tree_id,
+            path,
+            DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+            ShareAccess::Read as u32,
+            CreateDisposition::OverwriteIf as u32,
+            CreateOptions::NonDirectoryFile as u32,
+        )
+        .await
+}
+
+/// The error for a source that is no longer the size the caller promised —
+/// splicing it would build an object that is not what the client uploaded.
+fn source_size_changed(src_path: &str, actual: u64, expected: u64) -> io::Error {
+    crate::serr!("[spiceio] source '{src_path}' is {actual} bytes, {expected} were acknowledged");
+    io::Error::other(format!(
+        "source '{src_path}' is {actual} bytes but {expected} were acknowledged"
+    ))
+}
+
+/// Drive an `FSCTL_SRV_COPYCHUNK_WRITE` over `[src_start, src_start+len)`,
+/// writing to the destination from offset 0, in server-sized batches.
+///
+/// `Ok(false)` means the server reported the FSCTL unsupported partway in.
+async fn copychunk_range(
+    client: &SmbClient,
+    tree_id: u32,
+    dst_file_id: &[u8; 16],
+    resume_key: &[u8; 24],
+    src_start: u64,
+    dst_start: u64,
+    len: u64,
+) -> io::Result<bool> {
+    let mut done = 0u64;
+    let mut chunks = Vec::with_capacity(COPYCHUNK_MAX_CHUNKS);
+    while done < len {
+        chunks.clear();
+        let mut batch = 0u64;
+        while done + batch < len && chunks.len() < COPYCHUNK_MAX_CHUNKS {
+            let remaining = len - done - batch;
+            let chunk_len = remaining.min(COPYCHUNK_CHUNK_SIZE as u64) as u32;
+            chunks.push(CopyChunk {
+                source_offset: src_start + done + batch,
+                target_offset: dst_start + done + batch,
+                length: chunk_len,
+            });
+            batch += u64::from(chunk_len);
+        }
+        match client
+            .copychunk(tree_id, dst_file_id, resume_key, &chunks)
+            .await
+        {
+            Ok(resp) => {
+                let written = u64::from(resp.total_bytes_written);
+                if written == 0 {
+                    return Err(io::Error::other(
+                        "copychunk reported 0 bytes written; refusing to loop",
+                    ));
+                }
+                done += written;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// Bytes per copychunk range. MS-SMB2 sets the server's default maximum at
+/// 1 MiB per chunk; staying at the documented default avoids a round trip
+/// spent discovering the limit from an error response.
+const COPYCHUNK_CHUNK_SIZE: u32 = 1024 * 1024;
+
+/// Ranges per copychunk request (the documented server default is 16).
+const COPYCHUNK_MAX_CHUNKS: usize = 16;
+
+/// Windows FILETIME ticks per second (100ns units).
+pub(crate) const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
 
 /// True if the error means the SMB server dropped/reset the connection (or timed
 /// out) on a write — the signal to back off the adaptive write size so the next
@@ -1334,6 +1933,20 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    /// Flush whatever is buffered, so a server-side copy appended after this
+    /// point cannot overlap bytes this writer still owes the file.
+    async fn flush_buffered(&mut self) -> io::Result<()> {
+        self.flush().await
+    }
+
+    /// Record bytes written into the temp by the *server* (a copychunk), which
+    /// bypassed this writer entirely. Keeps `total_size` — and therefore the
+    /// verification in `commit` — honest about what the file should contain.
+    fn note_external_write(&mut self, bytes: u64) {
+        self.offset += bytes;
+        self.total_size += bytes;
+    }
+
     /// Append data to the write buffer. Flushes automatically when the buffer
     /// fills to the in-flight burst budget (`flush_cap`).
     pub async fn write(&mut self, data: &[u8]) -> io::Result<()> {
@@ -1430,7 +2043,8 @@ impl WalWriter {
                 tree_id,
                 &self.wal_path,
                 DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
-                ShareAccess::Read as u32 | ShareAccess::Delete as u32,
+                // Same share mode as the original open (see `open_wal_write`).
+                ShareAccess::Read as u32,
                 CreateDisposition::Open as u32,
                 CreateOptions::NonDirectoryFile as u32,
             )
@@ -1441,22 +2055,60 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Flush remaining data, close the WAL file, and rename it to the final path.
-    /// Returns the object metadata from a head_object on the final path.
+    /// Flush remaining data, verify the temp, then rename it to the final path.
+    /// Returns the object's metadata.
     pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
-        // Flush all buffered data (windowed retry inside flush), then rename the
-        // temp to the final path. The rename retries on a transient reset by
-        // reconnecting and re-opening the temp file (which still exists until the
-        // rename completes), so a single PUT is not lost at the finish line. On
+        // Flush all buffered data (windowed retry inside flush). On
         // unrecoverable failure, close the handle and best-effort delete the
         // temp — the caller cannot abort() after commit takes self. The delete
-        // ignores errors (a poisoned connection may make it fail); any temp left
-        // behind is swept up by the startup WAL cleanup.
+        // ignores errors (a poisoned connection may make it fail); any temp
+        // left behind is swept up by the startup WAL cleanup.
         if let Err(e) = self.flush().await {
             self.discard_temp().await;
             return Err(e);
         }
 
+        // Verify the temp *before* publishing it. Every write path (streaming
+        // PutObject, CopyObject, multipart assembly) funnels through here, so
+        // this one check covers them all: if the file the server stored is
+        // shorter than the bytes it acknowledged, the object is truncated and
+        // must never reach the client's key. Checking after the rename would
+        // be too late — the destination would already be replaced, and
+        // deleting the bad object afterwards is both racy against a concurrent
+        // writer and not a rollback. Failing here leaves any existing object
+        // at `final_path` untouched.
+        //
+        // Stat by path rather than trusting the close response's post-query
+        // attributes, which a server may decline to fill in. Attribute-only
+        // opens bypass share-mode checks, so our own write handle does not
+        // conflict. `last_write_time` is preserved across the rename, so this
+        // stat also supplies the metadata returned to the client — no second
+        // round trip after publishing.
+        let meta = match share.head_object_smb(&self.wal_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.discard_temp().await;
+                return Err(e);
+            }
+        };
+        if meta.size != self.total_size {
+            crate::serr!(
+                "[spiceio] wal temp for {} is {} bytes, wrote {}; refusing to publish",
+                self.final_path,
+                meta.size,
+                self.total_size
+            );
+            self.discard_temp().await;
+            return Err(io::Error::other(format!(
+                "refusing to publish '{}': wrote {} bytes but the temp file is {} bytes",
+                self.final_path, self.total_size, meta.size
+            )));
+        }
+
+        // The temp is verified — publish it. The rename retries on a transient
+        // reset by reconnecting and re-opening the temp file (which still
+        // exists until the rename completes), so a single PUT is not lost at
+        // the finish line.
         let mut attempt = 0u32;
         let rename_result: io::Result<()> = loop {
             match self
@@ -1495,7 +2147,7 @@ impl WalWriter {
 
         // Rename succeeded — close the handle (now at the final path).
         let _ = self.client.close(self.tree_id, &self.file_id).await;
-        share.head_object_smb(&self.final_path).await
+        Ok(meta)
     }
 
     /// Close the current handle and best-effort delete the WAL temp file.
@@ -1600,7 +2252,7 @@ fn filetime_to_epoch_secs(ft: u64) -> u64 {
     if ft <= EPOCH_DIFF {
         return 0;
     }
-    (ft - EPOCH_DIFF) / 10_000_000
+    (ft - EPOCH_DIFF) / FILETIME_TICKS_PER_SEC
 }
 
 /// Very simple content type guessing based on extension.
@@ -1675,6 +2327,42 @@ mod tests {
         ] {
             assert!(!should_retry(&io::Error::new(k, "real")), "{k:?}");
         }
+    }
+
+    // ── startup-cleanup grace (multi-instance safety) ────────────────
+
+    /// One second in FILETIME ticks (100ns).
+    const SEC: u64 = 10_000_000;
+
+    #[test]
+    fn is_recent_protects_files_inside_the_grace_window() {
+        let now = 100_000 * SEC;
+        let grace = 900 * SEC;
+        // Written moments ago, or a few minutes ago: a live peer may own it.
+        assert!(is_recent(now, now, grace));
+        assert!(is_recent(now, now - 60 * SEC, grace));
+        assert!(is_recent(now, now - 899 * SEC, grace));
+        // Older than the grace: leftovers of a crashed run, safe to sweep.
+        assert!(!is_recent(now, now - 900 * SEC, grace));
+        assert!(!is_recent(now, now - 10_000 * SEC, grace));
+    }
+
+    #[test]
+    fn is_recent_treats_future_stamps_as_recent() {
+        // A file stamped after our probe (written between probe and listing,
+        // or a server clock nudge) must not underflow into "ancient".
+        let now = 1_000 * SEC;
+        assert!(is_recent(now, now + 5 * SEC, 900 * SEC));
+        assert!(is_recent(0, u64::MAX, 900 * SEC));
+    }
+
+    #[test]
+    fn is_recent_with_zero_grace_sweeps_everything() {
+        // The documented escape hatch for a single-instance deployment:
+        // SPICEIO_CLEANUP_GRACE_SECS=0 restores the old blanket sweep.
+        let now = 1_000 * SEC;
+        assert!(!is_recent(now, now, 0));
+        assert!(!is_recent(now, now - SEC, 0));
     }
 
     // ── to_smb_path ──────────────────────────────────────────────────

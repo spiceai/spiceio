@@ -2,14 +2,14 @@
 
 use bytes::Buf;
 use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// Timeout for a single SMB response read. Prevents indefinite mutex hold when
 /// the SMB server is slow or unresponsive under heavy load.
@@ -50,6 +50,27 @@ impl SmbConfig {
     }
 }
 
+/// Floor for the QUERY_DIRECTORY response buffer, and what is used before the
+/// negotiate response is known. Matches the value used before the buffer was
+/// derived from the transact size.
+const QUERY_DIR_BUFFER_FLOOR: u32 = 65536;
+
+/// Cap on the QUERY_DIRECTORY response buffer. A directory listing is
+/// round-trip bound — every response costs a full RTT to the NAS — so a bigger
+/// buffer directly cuts the round trips a large listing needs (1 MiB is 16x
+/// fewer than the old fixed 64 KiB). Capped rather than taking the server's
+/// full transact size (often 8 MiB) because the buffer is also the credit
+/// charge: 1 MiB costs 16 credits, 8 MiB would cost 128 and would starve the
+/// concurrent read/write pipelines sharing the connection. The server returns
+/// only the bytes it actually has, so this costs nothing on small directories.
+const QUERY_DIR_BUFFER_MAX: u32 = 1024 * 1024;
+
+/// Effective QUERY_DIRECTORY buffer for a negotiated transact size. A server
+/// reporting zero clamps up to the floor, same as any undersized value.
+fn query_dir_buffer(neg_max_transact: u32) -> u32 {
+    neg_max_transact.clamp(QUERY_DIR_BUFFER_FLOOR, QUERY_DIR_BUFFER_MAX)
+}
+
 /// Default I/O cap for standalone (non-compound) read/write operations.
 ///
 /// 256 KB is the measured sweet spot for streaming throughput: on a 10G link a
@@ -77,6 +98,9 @@ pub struct SmbClient {
     /// larger payloads inside compound requests).
     pub compound_max_read_size: u32,
     pub compound_max_write_size: u32,
+    /// Largest QUERY_DIRECTORY response we will ask the server for, derived
+    /// from the negotiated transact size (see `QUERY_DIR_BUFFER_MAX`).
+    query_dir_buffer: u32,
     /// 16-byte client GUID
     client_guid: [u8; 16],
     /// SMB 3.1.1 signing key (derived after auth)
@@ -97,6 +121,73 @@ pub struct SmbClient {
     /// One-shot flag so the first credit-limited batch on this connection is
     /// logged (visibility) without per-batch log spam.
     credit_clamp_logged: AtomicBool,
+    /// Operations currently holding or waiting for the stream lock. Every
+    /// request/response round trip owns the stream for its whole duration, so
+    /// this is the connection's queue depth: `SmbPool::pick` steers new work
+    /// to the shallowest connection instead of round-robining into one that a
+    /// multi-megabyte pipelined batch is already sitting on.
+    inflight: AtomicUsize,
+    /// Monotonic milliseconds (since process start) of the last completed
+    /// round trip, used to decide when a connection is idle enough to be
+    /// worth an ECHO keepalive.
+    last_active_ms: AtomicU64,
+    /// Cleared if the server answers a keepalive ECHO with an error status, so
+    /// a server that dislikes the probe is asked once rather than every idle
+    /// interval for the life of the connection.
+    echoes_ok: AtomicBool,
+}
+
+/// Process-start reference for `now_ms` — a monotonic clock immune to wall-clock
+/// jumps (NTP steps, DST), which a keepalive deadline must not follow.
+static START: OnceLock<Instant> = OnceLock::new();
+
+/// Milliseconds since process start, saturating at `u64::MAX` (~584M years).
+fn now_ms() -> u64 {
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// Exclusive access to a connection's stream, with the connection's queue
+/// depth counted for as long as it is held.
+///
+/// Binding the two together is the point: every operation owns the stream for
+/// a whole round trip, and `SmbPool::pick` dispatches on that depth. Counting
+/// at each call site instead would mean the next stream-holding operation
+/// someone adds compiles, runs, and silently under-reports its connection's
+/// load — a dispatch skew under load, not a test failure.
+///
+/// `Drop` releases the slot on every path, including an early `?` return and a
+/// caller future dropped mid-await (a disconnected HTTP client), and re-stamps
+/// the activity clock so idleness is measured from when the round trip
+/// *finished*.
+struct StreamGuard<'a> {
+    client: &'a SmbClient,
+    stream: tokio::sync::MutexGuard<'a, TcpStream>,
+}
+
+impl std::ops::Deref for StreamGuard<'_> {
+    type Target = TcpStream;
+    fn deref(&self) -> &TcpStream {
+        &self.stream
+    }
+}
+
+impl std::ops::DerefMut for StreamGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+}
+
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        self.client.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.client
+            .last_active_ms
+            .store(now_ms(), Ordering::Relaxed);
+    }
 }
 
 impl SmbClient {
@@ -129,7 +220,13 @@ impl SmbClient {
             };
         stream.set_nodelay(true)?;
 
-        // Enlarge socket buffers to 1 MB for large read/write throughput.
+        // Socket tuning: 4 MB send/receive buffers for large read/write
+        // throughput, plus TCP keepalive so the OS surfaces a peer that
+        // vanished without a FIN (NAS power-cut, cable pull, NAT eviction).
+        // Without keepalive such a half-open connection looks healthy until a
+        // request stalls on it for the full SMB read timeout; with it, the
+        // socket errors out and the pool healer reconnects. Best-effort — a
+        // failed setsockopt only forgoes the tuning, so results are ignored.
         {
             use std::os::fd::AsRawFd;
 
@@ -146,15 +243,31 @@ impl SmbClient {
             const SOL_SOCKET: i32 = 0xffff;
             const SO_SNDBUF: i32 = 0x1001;
             const SO_RCVBUF: i32 = 0x1002;
+            const SO_KEEPALIVE: i32 = 0x0008;
+            const IPPROTO_TCP: i32 = 6;
+            // macOS names: TCP_KEEPALIVE is the idle time before the first
+            // probe; TCP_KEEPINTVL/TCP_KEEPCNT pace and bound the retries.
+            const TCP_KEEPALIVE: i32 = 0x10;
+            const TCP_KEEPINTVL: i32 = 0x101;
+            const TCP_KEEPCNT: i32 = 0x102;
 
             let fd = stream.as_raw_fd();
-            let buf_size: i32 = 4 * 1024 * 1024;
-            let ptr = std::ptr::from_ref(&buf_size).cast();
             let len = size_of::<i32>() as u32;
-            unsafe {
-                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, ptr, len);
-                setsockopt(fd, SOL_SOCKET, SO_RCVBUF, ptr, len);
-            }
+            let set = |level: i32, name: i32, value: i32| {
+                let ptr = std::ptr::from_ref(&value).cast();
+                // SAFETY: `fd` is an open socket owned by `stream` for the
+                // duration of this call, and `ptr`/`len` describe the `i32`
+                // every one of these options expects.
+                unsafe { setsockopt(fd, level, name, ptr, len) };
+            };
+            set(SOL_SOCKET, SO_SNDBUF, 4 * 1024 * 1024);
+            set(SOL_SOCKET, SO_RCVBUF, 4 * 1024 * 1024);
+            set(SOL_SOCKET, SO_KEEPALIVE, 1);
+            // ~30s idle, then 3 probes 10s apart: a dead peer is detected in
+            // about a minute, well inside the pool's healer cadence.
+            set(IPPROTO_TCP, TCP_KEEPALIVE, 30);
+            set(IPPROTO_TCP, TCP_KEEPINTVL, 10);
+            set(IPPROTO_TCP, TCP_KEEPCNT, 3);
         }
 
         let mut client_guid = [0u8; 16];
@@ -175,6 +288,7 @@ impl SmbClient {
             max_write_size: 65536,
             compound_max_read_size: 65536,
             compound_max_write_size: 65536,
+            query_dir_buffer: QUERY_DIR_BUFFER_FLOOR,
             client_guid,
             signing_key: None,
             poisoned: AtomicBool::new(false),
@@ -182,6 +296,9 @@ impl SmbClient {
             // from then on replenishes the balance via `harvest_credits`.
             credits: AtomicI64::new(1),
             credit_clamp_logged: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            last_active_ms: AtomicU64::new(now_ms()),
+            echoes_ok: AtomicBool::new(true),
         };
 
         client.negotiate_and_auth().await?;
@@ -191,6 +308,30 @@ impl SmbClient {
     /// Whether this connection has been poisoned by a timeout.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// Operations currently queued on this connection's stream — the load
+    /// signal `SmbPool::pick` dispatches on.
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
+    }
+
+    /// How long since this connection last completed a round trip.
+    pub fn idle(&self) -> Duration {
+        Duration::from_millis(now_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed)))
+    }
+
+    /// Take exclusive use of the stream for one operation, counting it against
+    /// this connection's queue depth until the guard drops. This is the only
+    /// way to reach the stream, so the accounting cannot be skipped.
+    async fn lock_stream(&self) -> StreamGuard<'_> {
+        // Counted before the await: an operation waiting for the lock is load
+        // on this connection, and `pick` should steer new work elsewhere.
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        StreamGuard {
+            client: self,
+            stream: self.stream.lock().await,
+        }
     }
 
     fn next_message_id(&self) -> u64 {
@@ -373,19 +514,20 @@ impl SmbClient {
         let _ = self.stream.lock().await.shutdown().await;
     }
 
-    /// Send a packet and receive a response, also returning the raw SMB2 response bytes
-    /// (without NetBIOS header) for preauth hash computation.
-    async fn send_recv_raw(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
-        let (header, body, raw) = self.send_recv_inner(packet).await?;
-        Ok((header, body, raw))
+    /// Send a packet and receive the response header plus a zero-copy view of
+    /// its body. The whole response lives in the single buffer it was read
+    /// into — a 256 KiB read costs one allocation and no payload memcpy.
+    ///
+    /// The handshake needs the full message (header included) for the preauth
+    /// integrity hash; it calls `send_recv_inner` directly and slices the body
+    /// off itself, since one is a view of the other.
+    async fn send_recv(&self, packet: &[u8]) -> io::Result<(Header, Bytes)> {
+        let (header, msg) = self.send_recv_inner(packet).await?;
+        Ok((header, msg.slice(SMB2_HEADER_SIZE..)))
     }
 
-    async fn send_recv(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>)> {
-        let (header, body, _raw) = self.send_recv_inner(packet).await?;
-        Ok((header, body))
-    }
-
-    async fn send_recv_inner(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+    /// Send a packet and receive the full response message (header + body).
+    async fn send_recv_inner(&self, packet: &[u8]) -> io::Result<(Header, Bytes)> {
         // Poison on any transport/framing error so the connection is never
         // reused with a desynchronized stream (a partial/leftover frame would
         // otherwise be misread as the next operation's reply).
@@ -396,8 +538,8 @@ impl SmbClient {
         r
     }
 
-    async fn send_recv_io(&self, packet: &[u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
-        let mut stream = self.stream.lock().await;
+    async fn send_recv_io(&self, packet: &[u8]) -> io::Result<(Header, Bytes)> {
+        let mut stream = self.lock_stream().await;
 
         // Sign the packet if we have a signing key. We need a writable buffer
         // to sign in-place; `BytesMut::from(&[u8])` is one alloc + one copy
@@ -440,8 +582,7 @@ impl SmbClient {
                 continue;
             }
 
-            let body = msg[SMB2_HEADER_SIZE..].to_vec();
-            return Ok((header, body, msg));
+            return Ok((header, Bytes::from(msg)));
         }
     }
 
@@ -460,7 +601,8 @@ impl SmbClient {
         // Hash the negotiate request (SMB2 message, skip 4-byte NetBIOS header)
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
+        let (resp_hdr, resp_raw) = self.send_recv_inner(&packet).await?;
+        let resp_body = resp_raw.slice(SMB2_HEADER_SIZE..);
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             // A negotiate NTSTATUS failure is a protocol-level rejection over an
             // already-established TCP connection (e.g. unsupported dialect),
@@ -523,7 +665,8 @@ impl SmbClient {
         // Hash session setup request 1
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, resp_body, resp_raw) = self.send_recv_raw(&packet).await?;
+        let (resp_hdr, resp_raw) = self.send_recv_inner(&packet).await?;
+        let resp_body = resp_raw.slice(SMB2_HEADER_SIZE..);
 
         // The first session-setup leg should return MORE_PROCESSING_REQUIRED
         // carrying the NTLM challenge. The session is allocated on this leg, so a
@@ -575,7 +718,7 @@ impl SmbClient {
         // Hash session setup request 2 (this is the final hash for key derivation)
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, ..) = self.send_recv_raw(&packet).await?;
+        let (resp_hdr, _) = self.send_recv(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             return Err(handshake_error(
                 "session setup",
@@ -609,6 +752,7 @@ impl SmbClient {
         self.max_write_size = sizes.max_write;
         self.compound_max_read_size = sizes.compound_max_read;
         self.compound_max_write_size = sizes.compound_max_write;
+        self.query_dir_buffer = query_dir_buffer(neg_resp.max_transact_size);
         self.signing_key = Some(signing_key);
         Ok(())
     }
@@ -639,6 +783,166 @@ impl SmbClient {
             share
         );
         Ok(resp_hdr.tree_id)
+    }
+
+    /// Send an SMB2 ECHO and wait for the reply — the protocol's keepalive.
+    ///
+    /// Used by the pool to probe connections that have gone idle: an SMB
+    /// session dropped while idle (server timeout, NAS reboot, NAT/firewall
+    /// eviction) is otherwise invisible until a client request lands on it and
+    /// fails. A completed round trip proves the connection still carries
+    /// traffic; a transport failure poisons it (via `send_recv`) so the healer
+    /// reconnects it *before* a request arrives.
+    ///
+    /// The reply's *status* is classified rather than ignored, because the
+    /// whole point of probing is to learn that a session died:
+    ///
+    /// * A session-invalidating status means the server has forgotten this
+    ///   session — exactly the condition the probe exists to catch. Poison the
+    ///   connection so the healer replaces it; every request that lands here
+    ///   would otherwise fail forever.
+    /// * A not-supported status means the server dislikes ECHO but is fine.
+    ///   Stop probing this connection rather than repeating the complaint
+    ///   every interval.
+    /// * Anything else: the frame round-tripped, which proves liveness. Log it
+    ///   and keep probing.
+    pub async fn echo(&self) -> io::Result<()> {
+        let msg_id = self.next_message_id();
+        let mut hdr = Header::new(Command::Echo, msg_id);
+        hdr.session_id = self.session_id;
+
+        let packet = build_request(&hdr, encode_echo_request);
+        let (resp_hdr, _) = self.send_recv(&packet).await?;
+        let status = resp_hdr.status;
+        if is_session_invalid_status(status) {
+            self.poison().await;
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("smb session is no longer valid (echo returned 0x{status:08X})"),
+            ));
+        }
+        if is_echo_unsupported_status(status) {
+            self.echoes_ok.store(false, Ordering::Relaxed);
+            crate::slog!(
+                "[spiceio] smb server does not support keepalive echo (0x{status:08X}); disabling it for this connection"
+            );
+        } else if NtStatus::from_u32(status).is_error() {
+            crate::slog!("[spiceio] smb echo answered with status 0x{status:08X}");
+        }
+        Ok(())
+    }
+
+    /// Whether keepalive probes are still worth sending on this connection —
+    /// false once the server has rejected one.
+    pub fn echoes_ok(&self) -> bool {
+        self.echoes_ok.load(Ordering::Relaxed)
+    }
+
+    /// Fetch the 24-byte resume key that identifies an open file to the server
+    /// as a server-side copy *source*.
+    pub async fn request_resume_key(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+    ) -> io::Result<[u8; 24]> {
+        // 32 bytes of output is the documented response size; one credit.
+        const RESUME_KEY_OUTPUT: u32 = 32;
+        let msg_id = self.alloc_ids(1);
+        let mut hdr = Header::new(Command::Ioctl, msg_id);
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+
+        let packet = build_request(&hdr, |buf| {
+            encode_ioctl_request(
+                buf,
+                FSCTL_SRV_REQUEST_RESUME_KEY,
+                file_id,
+                &[],
+                RESUME_KEY_OUTPUT,
+            );
+        });
+
+        let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(resp_hdr.status).is_error() {
+            return Err(ioctl_error("resume key", resp_hdr.status));
+        }
+        // A reply we cannot parse is reported as unsupported rather than a hard
+        // error: the caller then streams the copy, which is always correct.
+        // Failing instead would turn a server quirk into a broken CopyObject.
+        decode_ioctl_output(&resp_body)
+            .and_then(decode_resume_key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "server returned an unparseable resume key",
+                )
+            })
+    }
+
+    /// Ask the server to copy `chunks` from the resume-key'd source into
+    /// `dst_file_id`, without the data crossing this connection.
+    ///
+    /// A server that does not implement copychunk answers with a
+    /// not-supported status, which surfaces as `Unsupported` so the caller can
+    /// fall back to streaming. `STATUS_INVALID_PARAMETER` is special-cased by
+    /// MS-SMB2: the response body then carries the server's chunk limits
+    /// rather than a result, so it is reported as `InvalidInput` with those
+    /// limits in the message.
+    pub async fn copychunk(
+        &self,
+        tree_id: u32,
+        dst_file_id: &[u8; 16],
+        resume_key: &[u8; 24],
+        chunks: &[CopyChunk],
+    ) -> io::Result<CopyChunkResponse> {
+        // The response is a 12-byte SRV_COPYCHUNK_RESPONSE; one credit covers
+        // it, but the *request* carries the chunk list, so charge for that.
+        const COPYCHUNK_OUTPUT: u32 = 64;
+        let mut input = BytesMut::with_capacity(32 + chunks.len() * 24);
+        encode_copychunk_input(&mut input, resume_key, chunks);
+
+        let msg_id = self.alloc_ids(1);
+        let mut hdr = Header::new(Command::Ioctl, msg_id);
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+
+        let packet = build_request(&hdr, |buf| {
+            encode_ioctl_request(
+                buf,
+                FSCTL_SRV_COPYCHUNK_WRITE,
+                dst_file_id,
+                &input,
+                COPYCHUNK_OUTPUT,
+            );
+        });
+
+        let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(resp_hdr.status).is_error() {
+            // On STATUS_INVALID_PARAMETER the payload is the server's limits.
+            if resp_hdr.status == 0xC000_000D
+                && let Some(limits) =
+                    decode_ioctl_output(&resp_body).and_then(decode_copychunk_response)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "copychunk limits exceeded: max {} chunks, {} bytes/chunk, {} bytes total",
+                        limits.chunks_written,
+                        limits.chunk_bytes_written,
+                        limits.total_bytes_written
+                    ),
+                ));
+            }
+            return Err(ioctl_error("copychunk", resp_hdr.status));
+        }
+        decode_ioctl_output(&resp_body)
+            .and_then(decode_copychunk_response)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "server returned an unparseable copychunk response",
+                )
+            })
     }
 
     /// Open a file or directory.
@@ -679,6 +983,37 @@ impl SmbClient {
         })
     }
 
+    /// Close a file handle and return the file's final attributes.
+    ///
+    /// SMB2 CLOSE can carry the post-close size and timestamp
+    /// (`SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB`), so a caller that needs them right
+    /// after writing gets them for free instead of paying a separate stat
+    /// round trip. Servers may decline to fill them in, in which case the
+    /// fields come back zero and the caller should stat.
+    pub async fn close_query(&self, tree_id: u32, file_id: &[u8; 16]) -> io::Result<CloseResponse> {
+        let msg_id = self.next_message_id();
+        let mut hdr = Header::new(Command::Close, msg_id);
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+
+        let packet = build_request(&hdr, |buf| {
+            encode_close_request_ex(buf, file_id, true);
+        });
+
+        let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(resp_hdr.status).is_error() {
+            crate::serr!("[spiceio] smb close failed: 0x{:08X}", resp_hdr.status);
+            return Err(io::Error::other(format!(
+                "close failed: 0x{:08X}",
+                resp_hdr.status
+            )));
+        }
+        Ok(decode_close_response(&resp_body).unwrap_or(CloseResponse {
+            last_write_time: 0,
+            file_size: 0,
+        }))
+    }
+
     /// Close a file handle.
     pub async fn close(&self, tree_id: u32, file_id: &[u8; 16]) -> io::Result<()> {
         let msg_id = self.next_message_id();
@@ -711,7 +1046,7 @@ impl SmbClient {
         file_id: &[u8; 16],
         offset: u64,
         length: u32,
-    ) -> io::Result<bytes::Bytes> {
+    ) -> io::Result<Bytes> {
         // Atomically reserve credits for (and clamp to) this read, so a
         // multi-credit read never exceeds the granted sequence window even
         // under concurrent callers (floor: one credit's worth).
@@ -725,13 +1060,13 @@ impl SmbClient {
         hdr.tree_id = tree_id;
 
         let packet = build_request(&hdr, |buf| {
-            encode_read_request(buf, file_id, offset, length);
+            encode_read_request(buf, file_id, offset, length, 0);
         });
 
         let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
         let status = NtStatus::from_u32(resp_hdr.status);
         if status == NtStatus::EndOfFile {
-            return Ok(bytes::Bytes::new());
+            return Ok(Bytes::new());
         }
         if status.is_error() {
             crate::serr!("[spiceio] smb read failed: 0x{:08X}", resp_hdr.status);
@@ -741,7 +1076,7 @@ impl SmbClient {
             )));
         }
 
-        decode_read_response_owned(resp_body).ok_or_else(|| {
+        decode_read_response_bytes(&resp_body).ok_or_else(|| {
             crate::serr!("[spiceio] smb invalid read response");
             io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
         })
@@ -758,6 +1093,10 @@ impl SmbClient {
     ///
     /// Responses may arrive out of order (SMB2 does not guarantee response
     /// ordering). Each response is matched to its request slot via message_id.
+    /// `remaining` is how many bytes the caller still wants *in total* from
+    /// this offset, which becomes the server's read-ahead hint — sized from the
+    /// transfer rather than the batch, so the hint does not reset to "nothing
+    /// follows" at every batch boundary.
     pub async fn pipelined_read(
         &self,
         tree_id: u32,
@@ -765,11 +1104,12 @@ impl SmbClient {
         start_offset: u64,
         chunk_size: u32,
         count: usize,
-    ) -> io::Result<Vec<bytes::Bytes>> {
+        remaining: u64,
+    ) -> io::Result<Vec<Bytes>> {
         // Poison on any error: a batch leaves unread responses in the socket on
         // an early return, so the connection must not be reused.
         let r = self
-            .pipelined_read_io(tree_id, file_id, start_offset, chunk_size, count)
+            .pipelined_read_io(tree_id, file_id, start_offset, chunk_size, count, remaining)
             .await;
         if r.is_err() {
             self.poison().await;
@@ -784,7 +1124,8 @@ impl SmbClient {
         start_offset: u64,
         chunk_size: u32,
         count: usize,
-    ) -> io::Result<Vec<bytes::Bytes>> {
+        remaining: u64,
+    ) -> io::Result<Vec<Bytes>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -825,6 +1166,11 @@ impl SmbClient {
         for i in 0..count {
             packet_starts.push(buf.len());
             let offset = start_offset + (i as u64) * (chunk_size as u64);
+            // Tell the server how much the caller still wants after this
+            // request, so it can read ahead instead of waiting for the next one.
+            let consumed = (i as u64 + 1).saturating_mul(u64::from(chunk_size));
+            let remaining_after =
+                u32::try_from(remaining.saturating_sub(consumed)).unwrap_or(u32::MAX);
             let msg_id = base_msg_id + i as u64 * charge;
             let mut hdr = Header::new(Command::Read, msg_id).with_credit_charge(chunk_size);
             hdr.session_id = self.session_id;
@@ -833,7 +1179,7 @@ impl SmbClient {
             let packet_smb_total = SMB2_HEADER_SIZE + READ_REQUEST_FIXED;
             buf.put_u32((packet_smb_total as u32) & 0x00FF_FFFF);
             hdr.encode(&mut buf);
-            encode_read_request(&mut buf, file_id, offset, chunk_size);
+            encode_read_request(&mut buf, file_id, offset, chunk_size, remaining_after);
         }
         packet_starts.push(buf.len());
 
@@ -845,12 +1191,12 @@ impl SmbClient {
             }
         }
 
-        let mut stream = self.stream.lock().await;
+        let mut stream = self.lock_stream().await;
         self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
         // Receive responses into ordered slots (handles out-of-order delivery).
-        let mut slots: Vec<Option<bytes::Bytes>> = (0..count).map(|_| None).collect();
+        let mut slots: Vec<Option<Bytes>> = (0..count).map(|_| None).collect();
         let mut received = 0usize;
         let mut eof_after = count; // trim to this length on EOF
 
@@ -1094,7 +1440,7 @@ impl SmbClient {
             }
         }
 
-        let mut stream = self.stream.lock().await;
+        let mut stream = self.lock_stream().await;
         self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
@@ -1185,8 +1531,15 @@ impl SmbClient {
         let mut first = true;
 
         loop {
-            let msg_id = self.next_message_id();
-            let mut hdr = Header::new(Command::QueryDirectory, msg_id);
+            // The credit charge is computed from the *expected response* size,
+            // so asking for a large directory buffer must consume the matching
+            // credits — otherwise the batch exceeds the server's sequence
+            // window and it disconnects. Reserve first, then take the matching
+            // MessageId range.
+            let out_len = self.reserve_io_len(self.query_dir_buffer);
+            let charge = credit_charge_for(out_len);
+            let msg_id = self.alloc_msg_ids(charge as u64);
+            let mut hdr = Header::new(Command::QueryDirectory, msg_id).with_credit_charge(out_len);
             hdr.session_id = self.session_id;
             hdr.tree_id = tree_id;
 
@@ -1200,6 +1553,7 @@ impl SmbClient {
                     pattern,
                     FILE_ID_BOTH_DIRECTORY_INFORMATION,
                     restart,
+                    out_len,
                 );
             });
 
@@ -1245,7 +1599,7 @@ impl SmbClient {
     async fn send_compound(
         &self,
         requests: Vec<(Header, BytesMut)>,
-    ) -> io::Result<Vec<(Header, Vec<u8>)>> {
+    ) -> io::Result<Vec<(Header, Bytes)>> {
         // Poison on any transport/framing error so a desynchronized compound
         // stream is never reused.
         let r = self.send_compound_io(requests).await;
@@ -1258,7 +1612,7 @@ impl SmbClient {
     async fn send_compound_io(
         &self,
         requests: Vec<(Header, BytesMut)>,
-    ) -> io::Result<Vec<(Header, Vec<u8>)>> {
+    ) -> io::Result<Vec<(Header, Bytes)>> {
         let n = requests.len();
 
         // Padded message sizes (8-byte aligned except last).
@@ -1300,7 +1654,7 @@ impl SmbClient {
         }
 
         // Send and receive under the stream lock
-        let mut stream = self.stream.lock().await;
+        let mut stream = self.lock_stream().await;
         self.write_all_timeout(&mut stream, &buf).await?;
         stream.flush().await?;
 
@@ -1331,7 +1685,7 @@ impl SmbClient {
             }
 
             // Each message of the compound chain carries its own grant.
-            let responses = parse_compound_response(&msg);
+            let responses = parse_compound_response(&Bytes::from(msg));
             for (h, _) in &responses {
                 self.harvest_credits(h);
             }
@@ -1408,7 +1762,7 @@ impl SmbClient {
         tree_id: u32,
         path: &str,
         max_read: u32,
-    ) -> io::Result<(CreateResponse, bytes::Bytes)> {
+    ) -> io::Result<(CreateResponse, Bytes)> {
         // Compound reads are capped at 64 KiB (charge 1), so the three chained
         // messages charge 3 credits and stride 3 MessageIds.
         let base = self.alloc_ids(3);
@@ -1431,7 +1785,7 @@ impl SmbClient {
         h2.tree_id = tree_id;
         h2.flags |= SMB2_FLAGS_RELATED;
         let mut b2 = BytesMut::with_capacity(64);
-        encode_read_request(&mut b2, &SENTINEL_FILE_ID, 0, max_read);
+        encode_read_request(&mut b2, &SENTINEL_FILE_ID, 0, max_read, 0);
 
         let mut h3 = Header::new(Command::Close, base + 2);
         h3.session_id = self.session_id;
@@ -1457,14 +1811,14 @@ impl SmbClient {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid create response"))?;
 
         let data = if NtStatus::from_u32(resp[1].0.status) == NtStatus::EndOfFile {
-            bytes::Bytes::new()
+            Bytes::new()
         } else if NtStatus::from_u32(resp[1].0.status).is_error() {
             return Err(io::Error::other(format!(
                 "read failed: 0x{:08X}",
                 resp[1].0.status
             )));
         } else {
-            decode_read_response(&resp[1].1).ok_or_else(|| {
+            decode_read_response_bytes(&resp[1].1).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
             })?
         };
@@ -1780,6 +2134,49 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
             io::Error::other(format!("SMB error 0x{status:08X} for {path}"))
         }
     }
+}
+
+/// Classify an IOCTL failure. A server that does not implement the FSCTL says
+/// so with one of a small set of statuses; those become `Unsupported` so the
+/// caller falls back to its own implementation rather than failing the
+/// request. Everything else keeps its usual mapping.
+fn ioctl_error(what: &str, status: u32) -> io::Error {
+    if is_echo_unsupported_status(status) || status == 0xC000_00CB
+    /* STATUS_INVALID_DEVICE_STATE */
+    {
+        return io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{what} not supported by this server (0x{status:08X})"),
+        );
+    }
+    smb_status_to_io_error(status, what)
+}
+
+/// True for NTSTATUS values meaning the server no longer recognizes this
+/// session or tree, so every subsequent request on the connection will fail
+/// until it is re-established. Treated as a dead connection (poison + heal),
+/// not as a per-request error — an expired session that merely logged would
+/// leave the pool slot failing indefinitely.
+fn is_session_invalid_status(status: u32) -> bool {
+    matches!(
+        status,
+        0xC000_0203 // STATUS_USER_SESSION_DELETED
+        | 0xC000_035C // STATUS_NETWORK_SESSION_EXPIRED
+        | 0xC000_020C // STATUS_CONNECTION_DISCONNECTED
+        | 0xC000_00C9 // STATUS_NETWORK_NAME_DELETED (tree is gone)
+    )
+}
+
+/// True for NTSTATUS values meaning the server understood the ECHO but does
+/// not implement it. The connection is healthy; only the probe is pointless,
+/// so it is switched off for that connection.
+fn is_echo_unsupported_status(status: u32) -> bool {
+    matches!(
+        status,
+        0xC000_0002 // STATUS_NOT_IMPLEMENTED
+        | 0xC000_00BB // STATUS_NOT_SUPPORTED
+        | 0xC000_0010 // STATUS_INVALID_DEVICE_REQUEST
+    )
 }
 
 /// True for NTSTATUS values that indicate the SMB server has hit a connection,

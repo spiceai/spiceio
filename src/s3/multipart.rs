@@ -135,6 +135,23 @@ impl MultipartStore {
     pub fn temp_part_path(upload_id: &str, part_number: u32) -> String {
         format!(".spiceio-uploads\\{}\\part-{:05}", upload_id, part_number)
     }
+
+    /// Path of an upload's liveness marker — written when the upload is
+    /// initiated and refreshed while it stays active, so another spiceio
+    /// instance's startup cleanup can tell a live upload from a crashed run's
+    /// leftovers. One owner for the name: it is load-bearing for cross-instance
+    /// safety, and a site that spelled it differently would be a silent
+    /// liveness bug.
+    pub fn marker_path(upload_id: &str) -> String {
+        format!(".spiceio-uploads\\{}\\marker", upload_id)
+    }
+
+    /// IDs of every live upload. Used by the reaper's marker heartbeat, which
+    /// needs only the ids — `list` would clone each upload's entire part map
+    /// (two `String`s per part) under the lock to hand back one field.
+    pub async fn upload_ids(&self) -> Vec<String> {
+        self.uploads.read().await.keys().cloned().collect()
+    }
 }
 
 fn epoch_secs() -> u64 {
@@ -261,5 +278,29 @@ mod tests {
             MultipartStore::temp_part_path("abc123", 3),
             ".spiceio-uploads\\abc123\\part-00003"
         );
+        assert_eq!(
+            MultipartStore::marker_path("abc123"),
+            ".spiceio-uploads\\abc123\\marker"
+        );
+        // The marker must sit inside the upload's own directory — cleanup
+        // judges a directory live by the freshness of what is inside it.
+        assert!(
+            MultipartStore::marker_path("abc123").starts_with(&MultipartStore::temp_dir("abc123"))
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_ids_lists_every_live_upload() {
+        let store = MultipartStore::new();
+        let a = store.create("a.txt").await;
+        let b = store.create("b.txt").await;
+        let mut ids = store.upload_ids().await;
+        ids.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(ids, want);
+
+        store.complete(&want[0]).await;
+        assert_eq!(store.upload_ids().await, vec![want[1].clone()]);
     }
 }

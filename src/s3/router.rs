@@ -38,27 +38,34 @@ pub struct AppState {
 /// buffering the entire payload. Operations that need the full body (multipart,
 /// multi-delete, copy) collect it internally.
 pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Response<SpiceioBody> {
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-    let method = req.method().clone();
-    let hdrs = req.headers().clone();
+    // Split the request once, up front. The handlers below need the headers
+    // and the body independently, and the only way to have both from an intact
+    // `Request` is to deep-clone the HeaderMap (every name and value) on every
+    // request — pure overhead on the hottest path. Splitting also lets the
+    // path and query stay borrowed instead of copied into two Strings.
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
+    let method = &parts.method;
+    let hdrs = &parts.headers;
+    let declared_len: Option<u64> = get_header(hdrs, "content-length").and_then(|v| v.parse().ok());
     let request_id = generate_request_id();
 
     // CORS preflight
-    if method == Method::OPTIONS {
+    if *method == Method::OPTIONS {
         return cors_preflight(&request_id, &state.region);
     }
 
     // Parse bucket and key from path-style: /{bucket}/{key...}
     // Percent-decode the key so encoded characters (spaces, Unicode, `%`, …)
     // map to the real object name instead of a literal `%XX` filename.
-    let (req_bucket, raw_key) = parse_path(&path);
+    let (req_bucket, raw_key) = parse_path(path);
     let key_decoded = percent_decode(raw_key);
     let key: &str = &key_decoded;
 
     // Service-level operations (no bucket)
     if req_bucket.is_empty() {
-        match method {
+        match *method {
             Method::GET | Method::HEAD => {
                 return with_common_headers(
                     list_buckets_response(&state.bucket),
@@ -110,30 +117,32 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
 
     // ── Bucket-level operations (no key) ────────────────────────────────
     if key.is_empty() {
-        let resp = match method {
-            Method::GET | Method::HEAD if has_query_flag(&query, "location") => {
+        let resp = match *method {
+            Method::GET | Method::HEAD if has_query_flag(query, "location") => {
                 handle_get_bucket_location(&state.region)
             }
-            Method::GET if has_query_flag(&query, "versioning") => handle_get_bucket_versioning(),
-            Method::GET if has_query_flag(&query, "acl") => handle_get_bucket_acl(),
-            Method::PUT if has_query_flag(&query, "acl") => ok_empty(),
-            Method::GET if has_query_flag(&query, "tagging") => handle_get_bucket_tagging(),
-            Method::PUT if has_query_flag(&query, "tagging") => ok_empty(),
-            Method::DELETE if has_query_flag(&query, "tagging") => ok_no_content(),
-            Method::GET if has_query_flag(&query, "cors") => handle_get_bucket_cors(),
-            Method::PUT if has_query_flag(&query, "cors") => ok_empty(),
-            Method::DELETE if has_query_flag(&query, "cors") => ok_no_content(),
-            Method::GET if has_query_flag(&query, "lifecycle") => handle_get_bucket_lifecycle(),
-            Method::GET if has_query_flag(&query, "policy") => handle_get_bucket_policy(),
-            Method::GET if has_query_flag(&query, "encryption") => handle_get_bucket_encryption(),
-            Method::GET if has_query_flag(&query, "uploads") => {
-                handle_list_multipart_uploads(state, &query).await
+            Method::GET if has_query_flag(query, "versioning") => handle_get_bucket_versioning(),
+            Method::GET if has_query_flag(query, "acl") => handle_get_bucket_acl(),
+            Method::PUT if has_query_flag(query, "acl") => ok_empty(),
+            Method::GET if has_query_flag(query, "tagging") => handle_get_bucket_tagging(),
+            Method::PUT if has_query_flag(query, "tagging") => ok_empty(),
+            Method::DELETE if has_query_flag(query, "tagging") => ok_no_content(),
+            Method::GET if has_query_flag(query, "cors") => handle_get_bucket_cors(),
+            Method::PUT if has_query_flag(query, "cors") => ok_empty(),
+            Method::DELETE if has_query_flag(query, "cors") => ok_no_content(),
+            Method::GET if has_query_flag(query, "lifecycle") => handle_get_bucket_lifecycle(),
+            Method::GET if has_query_flag(query, "policy") => handle_get_bucket_policy(),
+            Method::GET if has_query_flag(query, "encryption") => handle_get_bucket_encryption(),
+            Method::GET if has_query_flag(query, "uploads") => {
+                handle_list_multipart_uploads(state, query).await
             }
-            Method::POST if has_query_flag(&query, "delete") => match collect_body(req).await {
-                Ok(body) => handle_delete_objects(body, share).await,
-                Err(resp) => resp,
-            },
-            Method::GET => handle_list_objects(share, &state.bucket, &query).await,
+            Method::POST if has_query_flag(query, "delete") => {
+                match collect_body(body, declared_len).await {
+                    Ok(body) => handle_delete_objects(body, share).await,
+                    Err(resp) => resp,
+                }
+            }
+            Method::GET => handle_list_objects(share, &state.bucket, query).await,
             Method::HEAD => head_bucket_response(&state.region),
             Method::PUT => ok_empty(),         // CreateBucket — noop
             Method::DELETE => ok_no_content(), // DeleteBucket — noop
@@ -149,11 +158,11 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     // ── Object-level operations ─────────────────────────────────────────
 
     // Multipart: POST with ?uploads (initiate) or ?uploadId=... (complete)
-    if method == Method::POST {
-        let resp = if has_query_flag(&query, "uploads") && !has_query_flag(&query, "uploadId") {
-            handle_create_multipart_upload(&hdrs, state, key).await
-        } else if let Some(upload_id) = extract_query_param(&query, "uploadId") {
-            match collect_body(req).await {
+    if *method == Method::POST {
+        let resp = if has_query_flag(query, "uploads") && !has_query_flag(query, "uploadId") {
+            handle_create_multipart_upload(hdrs, state, key).await
+        } else if let Some(upload_id) = extract_query_param(query, "uploadId") {
+            match collect_body(body, declared_len).await {
                 Ok(body) => handle_complete_multipart_upload(body, state, key, &upload_id).await,
                 Err(resp) => resp,
             }
@@ -168,44 +177,44 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Multipart: PUT with ?partNumber=...&uploadId=...
-    if method == Method::PUT
-        && has_query_flag(&query, "partNumber")
-        && has_query_flag(&query, "uploadId")
+    if *method == Method::PUT
+        && has_query_flag(query, "partNumber")
+        && has_query_flag(query, "uploadId")
     {
-        let part_number: u32 = extract_query_param(&query, "partNumber")
+        let part_number: u32 = extract_query_param(query, "partNumber")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let upload_id = extract_query_param(&query, "uploadId").unwrap_or_default();
+        let upload_id = extract_query_param(query, "uploadId").unwrap_or_default();
         // UploadPartCopy: a part sourced from another object carries
         // x-amz-copy-source (no body) — the form `aws s3 cp` / `sync` use for
         // any object over the multipart threshold (~8 MiB). Without this
         // branch the copy-source PUT falls through to a normal UploadPart,
         // which reads an empty body and returns the wrong response shape.
         let resp = if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-            handle_upload_part_copy(&hdrs, state, key, &upload_id, part_number).await
+            handle_upload_part_copy(hdrs, state, key, &upload_id, part_number).await
         } else {
-            handle_upload_part(req, state, key, &upload_id, part_number).await
+            handle_upload_part(body, declared_len, state, key, &upload_id, part_number).await
         };
         return with_common_headers(resp, &request_id, &state.region);
     }
 
     // Multipart: GET with ?uploadId=... (list parts)
-    if method == Method::GET && has_query_flag(&query, "uploadId") {
-        let upload_id = extract_query_param(&query, "uploadId").unwrap_or_default();
+    if *method == Method::GET && has_query_flag(query, "uploadId") {
+        let upload_id = extract_query_param(query, "uploadId").unwrap_or_default();
         let resp = handle_list_parts(state, key, &upload_id).await;
         return with_common_headers(resp, &request_id, &state.region);
     }
 
     // Multipart: DELETE with ?uploadId=... (abort)
-    if method == Method::DELETE && has_query_flag(&query, "uploadId") {
-        let upload_id = extract_query_param(&query, "uploadId").unwrap_or_default();
+    if *method == Method::DELETE && has_query_flag(query, "uploadId") {
+        let upload_id = extract_query_param(query, "uploadId").unwrap_or_default();
         let resp = handle_abort_multipart_upload(state, key, &upload_id).await;
         return with_common_headers(resp, &request_id, &state.region);
     }
 
     // Object ACL
-    if has_query_flag(&query, "acl") {
-        let resp = match method {
+    if has_query_flag(query, "acl") {
+        let resp = match *method {
             Method::GET => handle_get_object_acl(),
             Method::PUT => ok_empty(),
             _ => error_response(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
@@ -214,8 +223,8 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Object tagging
-    if has_query_flag(&query, "tagging") {
-        let resp = match method {
+    if has_query_flag(query, "tagging") {
+        let resp = match *method {
             Method::GET => handle_get_object_tagging(),
             Method::PUT => ok_empty(),
             Method::DELETE => ok_no_content(),
@@ -225,11 +234,11 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Object legal-hold, retention, torrent — stubs
-    if has_query_flag(&query, "legal-hold")
-        || has_query_flag(&query, "retention")
-        || has_query_flag(&query, "torrent")
+    if has_query_flag(query, "legal-hold")
+        || has_query_flag(query, "retention")
+        || has_query_flag(query, "torrent")
     {
-        let resp = match method {
+        let resp = match *method {
             Method::GET | Method::PUT => ok_empty(),
             _ => error_response(StatusCode::NOT_IMPLEMENTED, "NotImplemented", ""),
         };
@@ -237,7 +246,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // Object restore — stub
-    if method == Method::POST && has_query_flag(&query, "restore") {
+    if *method == Method::POST && has_query_flag(query, "restore") {
         return with_common_headers(
             Response::builder()
                 .status(StatusCode::ACCEPTED)
@@ -249,7 +258,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     // SelectObjectContent — not supported
-    if method == Method::POST && has_query_flag(&query, "select") {
+    if *method == Method::POST && has_query_flag(query, "select") {
         return with_common_headers(
             error_response(
                 StatusCode::NOT_IMPLEMENTED,
@@ -261,18 +270,18 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         );
     }
 
-    let resp = match method {
-        Method::GET => handle_get_object(&hdrs, share, key).await,
+    let resp = match *method {
+        Method::GET => handle_get_object(hdrs, share, key).await,
         Method::PUT => {
             // CopyObject: PUT with x-amz-copy-source header
             if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-                handle_copy_object(&hdrs, state, key).await
+                handle_copy_object(hdrs, state, key).await
             } else {
-                handle_put_object(req, &hdrs, share, key).await
+                handle_put_object(body, declared_len, hdrs, share, key).await
             }
         }
         Method::DELETE => handle_delete_object(share, key).await,
-        Method::HEAD => handle_head_object(&hdrs, share, key).await,
+        Method::HEAD => handle_head_object(hdrs, share, key).await,
         _ => error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "MethodNotAllowed",
@@ -896,7 +905,8 @@ async fn handle_get_object(
 // ── PutObject (streaming, with conditional-write via If-None-Match) ─────────
 
 async fn handle_put_object(
-    req: Request<Incoming>,
+    mut body: Incoming,
+    content_length: Option<u64>,
     hdrs: &http::HeaderMap,
     share: &ShareSession,
     key: &str,
@@ -918,33 +928,28 @@ async fn handle_put_object(
     }
 
     // ── Fast path: collect small bodies and use compound write ──────
-    let content_length: Option<u64> =
-        get_header(hdrs, "content-length").and_then(|s| s.parse().ok());
     let max_write = share.compound_max_write_size() as u64;
 
     if let Some(cl) = content_length
         && cl <= max_write
     {
-        // Collect the (small) body
-        match BodyExt::collect(req.into_body()).await {
-            Ok(collected) => {
-                let data = collected.to_bytes();
-                match share.put_object(key, &data).await {
-                    Ok(meta) => {
-                        let mut builder = Response::builder()
-                            .status(StatusCode::OK)
-                            .header("ETag", format!("\"{}\"", meta.etag));
-                        if let Some(ct) = content_type {
-                            builder = builder.header("Content-Type", ct);
-                        }
-                        return builder.body(SpiceioBody::empty()).unwrap();
-                    }
-                    Err(e) => return io_to_s3_error(&e),
+        // Collect the (small) body — through the shared collector, so the
+        // size cap and the Content-Length check apply here too.
+        let data = match collect_body(body, content_length).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        match share.put_object(key, &data).await {
+            Ok(meta) => {
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("ETag", format!("\"{}\"", meta.etag));
+                if let Some(ct) = content_type {
+                    builder = builder.header("Content-Type", ct);
                 }
+                return builder.body(SpiceioBody::empty()).unwrap();
             }
-            Err(e) => {
-                return io_to_s3_error(&io::Error::other(format!("body read error: {e}")));
-            }
+            Err(e) => return io_to_s3_error(&e),
         }
     }
 
@@ -954,7 +959,6 @@ async fn handle_put_object(
         Err(e) => return io_to_s3_error(&e),
     };
 
-    let mut body = req.into_body();
     let mut write_err = None;
 
     while let Some(frame) = body.frame().await {
@@ -979,6 +983,26 @@ async fn handle_put_object(
     if let Some(e) = write_err {
         wal.abort().await;
         return io_to_s3_error(&e);
+    }
+
+    // A body that ended short of its declared Content-Length must not be
+    // published as a complete object. Hyper normally surfaces a truncated
+    // HTTP/1.1 body as a frame error (handled above), but this makes the
+    // guarantee explicit at the point of no return — after commit, the object
+    // is live under the client's key.
+    if let Some(cl) = content_length
+        && wal.total_size != cl
+    {
+        crate::serr!(
+            "[spiceio] putobject body was {} bytes, Content-Length said {cl}",
+            wal.total_size
+        );
+        wal.abort().await;
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            "The request body was shorter or longer than the declared Content-Length.",
+        );
     }
 
     // Commit: flush remaining buffer, rename WAL temp → final path
@@ -1266,11 +1290,10 @@ async fn handle_create_multipart_upload(
     let _content_type = get_header(hdrs, "content-type");
     let upload_id = state.multipart.create(key).await;
 
-    // Create the temp directory on the share
-    let temp_dir = MultipartStore::temp_dir(&upload_id);
+    // Create the temp directory on the share, and its liveness marker.
     let _ = state
         .share
-        .write_temp(&format!("{}\\marker", temp_dir), b"")
+        .write_temp(&MultipartStore::marker_path(&upload_id), b"")
         .await;
 
     let mut w = XmlWriter::new();
@@ -1284,7 +1307,8 @@ async fn handle_create_multipart_upload(
 }
 
 async fn handle_upload_part(
-    req: Request<Incoming>,
+    req_body: Incoming,
+    declared_len: Option<u64>,
     state: &AppState,
     key: &str,
     upload_id: &str,
@@ -1313,7 +1337,7 @@ async fn handle_upload_part(
         }
     }
 
-    let body = match collect_body(req).await {
+    let body = match collect_body(req_body, declared_len).await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
@@ -1373,6 +1397,49 @@ async fn handle_upload_part(
         .header("ETag", format!("\"{}\"", etag))
         .body(SpiceioBody::empty())
         .unwrap()
+}
+
+/// Record a finished part and build the `CopyPartResult` response, shared by
+/// the server-side-copy and streaming paths.
+async fn finish_part_copy(
+    state: &AppState,
+    upload_id: &str,
+    part_number: u32,
+    temp_path: &str,
+    size: u64,
+    etag: String,
+    last_modified: u64,
+) -> Response<SpiceioBody> {
+    // The upload may have been completed/aborted/reaped while the source was
+    // being copied; acknowledging a part no completion can reference would be
+    // a lie, so surface NoSuchUpload and drop the orphaned temp.
+    if state
+        .multipart
+        .put_part(
+            upload_id,
+            part_number,
+            size,
+            etag.clone(),
+            temp_path.to_string(),
+        )
+        .await
+        .is_none()
+    {
+        state.share.delete_temp(temp_path).await;
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        );
+    }
+
+    let mut w = XmlWriter::new();
+    w.declaration();
+    w.open_ns("CopyPartResult", S3_XMLNS);
+    w.element("LastModified", &xml::epoch_to_iso8601(last_modified));
+    w.element("ETag", &format!("\"{etag}\""));
+    w.close("CopyPartResult");
+    xml_response(StatusCode::OK, w.finish())
 }
 
 /// UploadPartCopy — a multipart part whose content is a (range of a) source
@@ -1492,6 +1559,38 @@ async fn handle_upload_part_copy(
         );
     }
 
+    let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
+
+    // Server-side copy first: the NAS copies the range into the part file
+    // itself, so nothing crosses this proxy. This is the dominant cost of
+    // `aws s3 cp`/`sync` on a large object, which copies it part by part.
+    //
+    // The part's ETag is then derived from its size and timestamp rather than
+    // a content hash, because the content never passes through us. Both forms
+    // are opaque — the completion identifies parts by number, and integrity is
+    // enforced by the per-part size check in `assemble_parts` — but the ETag
+    // for a given part does depend on which path produced it.
+    match state
+        .share
+        .copy_range_to_temp(&src_key, start, span, &temp_path)
+        .await
+    {
+        Ok(Some(meta)) => {
+            return finish_part_copy(
+                state,
+                upload_id,
+                part_number,
+                &temp_path,
+                meta.size,
+                meta.etag,
+                meta.last_modified,
+            )
+            .await;
+        }
+        Ok(None) => {} // Not supported — fall through to streaming.
+        Err(e) => return io_to_s3_error(&e),
+    }
+
     // Read exactly the validated range — bounded by the check above, so memory
     // is capped regardless of the source object's size.
     let data = if span == 0 {
@@ -1537,43 +1636,19 @@ async fn handle_upload_part_copy(
         }
     };
 
-    let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
     if let Err(e) = state.share.write_temp(&temp_path, &data).await {
         return io_to_s3_error(&e);
     }
-
-    // Same race guard as UploadPart: the upload may have been completed/aborted
-    // while the source was being copied.
-    if state
-        .multipart
-        .put_part(
-            upload_id,
-            part_number,
-            data.len() as u64,
-            etag.clone(),
-            temp_path.clone(),
-        )
-        .await
-        .is_none()
-    {
-        state.share.delete_temp(&temp_path).await;
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "The specified upload does not exist.",
-        );
-    }
-
-    let mut w = XmlWriter::new();
-    w.declaration();
-    w.open_ns("CopyPartResult", S3_XMLNS);
-    w.element(
-        "LastModified",
-        &xml::epoch_to_iso8601(src_meta.last_modified),
-    );
-    w.element("ETag", &format!("\"{etag}\""));
-    w.close("CopyPartResult");
-    xml_response(StatusCode::OK, w.finish())
+    finish_part_copy(
+        state,
+        upload_id,
+        part_number,
+        &temp_path,
+        data.len() as u64,
+        etag,
+        src_meta.last_modified,
+    )
+    .await
 }
 
 async fn handle_complete_multipart_upload(
@@ -1647,12 +1722,21 @@ async fn handle_complete_multipart_upload(
 
     // Stream parts through a WAL writer (pipelined reads → pipelined writes
     // → atomic rename). Never buffers the whole file in memory.
-    let temp_paths: Vec<&str> = part_numbers
+    //
+    // Each part is paired with the size we acknowledged to the client when it
+    // was uploaded. `assemble_parts` checks every part against that size while
+    // streaming and aborts before the WAL is renamed into place, so a part that
+    // changed on the share since upload fails the completion without ever
+    // publishing a corrupt object — and without a compensating delete that
+    // could race a concurrent writer for the same key. The validation loop
+    // above already proved every part number resolves.
+    let parts: Vec<(&str, u64)> = part_numbers
         .iter()
-        .filter_map(|pn| upload.parts.get(pn).map(|p| p.temp_path.as_str()))
+        .filter_map(|pn| upload.parts.get(pn))
+        .map(|p| (p.temp_path.as_str(), p.size))
         .collect();
 
-    let meta = match state.share.assemble_parts(key, &temp_paths).await {
+    let meta = match state.share.assemble_parts(key, &parts).await {
         Ok(m) => m,
         Err(e) => return io_to_s3_error(&e),
     };
@@ -1666,7 +1750,7 @@ async fn handle_complete_multipart_upload(
             state.share.delete_temp(&part.temp_path).await;
         }
     }
-    let marker_path = format!("{}\\marker", MultipartStore::temp_dir(upload_id));
+    let marker_path = MultipartStore::marker_path(upload_id);
     state.share.delete_temp(&marker_path).await;
     state
         .share
@@ -1697,7 +1781,7 @@ async fn handle_abort_multipart_upload(
     for part in upload.parts.values() {
         state.share.delete_temp(&part.temp_path).await;
     }
-    let marker_path = format!("{}\\marker", MultipartStore::temp_dir(upload_id));
+    let marker_path = MultipartStore::marker_path(upload_id);
     state.share.delete_temp(&marker_path).await;
     state
         .share
@@ -2130,9 +2214,32 @@ const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
 /// Collect an `Incoming` body into `Bytes` for operations that need the full
 /// payload, rejecting bodies over [`MAX_BUFFERED_BODY`] with `EntityTooLarge`
 /// instead of buffering them unbounded.
-async fn collect_body(req: Request<Incoming>) -> Result<Bytes, Response<SpiceioBody>> {
-    let mut body = req.into_body();
-    let mut buf: Vec<u8> = Vec::new();
+///
+/// `declared_len` is the request's `Content-Length`, when it sent one. A body
+/// that does not match it is refused here rather than by each handler: every
+/// buffered path (UploadPart, CompleteMultipartUpload, multi-delete, the small
+/// PutObject fast path) is a point of no return that would otherwise record a
+/// short body as if it were whole — an UploadPart in particular would
+/// acknowledge a part size that no later completion can reproduce.
+async fn collect_body(
+    mut body: Incoming,
+    declared_len: Option<u64>,
+) -> Result<Bytes, Response<SpiceioBody>> {
+    if let Some(declared) = declared_len
+        && declared > MAX_BUFFERED_BODY as u64
+    {
+        // Knowable before a byte is read — no reason to buffer 256 MiB first.
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "EntityTooLarge",
+            "Request body exceeds the maximum buffered size",
+        ));
+    }
+    // Size the buffer from the declared length so a large part does not walk
+    // up through ~20 reallocations. Bounded, so a lying Content-Length cannot
+    // force a big allocation up front.
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(declared_len.unwrap_or(0).min(8 * 1024 * 1024) as usize);
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(f) => {
@@ -2160,6 +2267,19 @@ async fn collect_body(req: Request<Incoming>) -> Result<Bytes, Response<SpiceioB
                 ));
             }
         }
+    }
+    if let Some(declared) = declared_len
+        && buf.len() as u64 != declared
+    {
+        crate::serr!(
+            "[spiceio] request body was {} bytes, Content-Length said {declared}",
+            buf.len()
+        );
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            "The request body did not match the declared Content-Length.",
+        ));
     }
     Ok(Bytes::from(buf))
 }
