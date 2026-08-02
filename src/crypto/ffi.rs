@@ -16,6 +16,9 @@ const K_CC_HMAC_ALG_SHA256: c_uint = 2;
 const K_CC_ENCRYPT: u32 = 0;
 const K_CC_ALGORITHM_AES128: u32 = 0;
 const K_CC_OPTION_ECB_MODE: u32 = 2;
+/// Neither the ECB bit nor the PKCS7-padding bit: CBC with no padding.
+const K_CC_OPTION_CBC_NO_PADDING: u32 = 0;
+const K_CC_SUCCESS: i32 = 0;
 
 const AES_BLOCK_SIZE: usize = 16;
 
@@ -54,6 +57,27 @@ unsafe extern "C" {
         data_length: usize,
         mac_out: *mut c_void,
     );
+
+    // CCCryptor — streaming encrypt. One key schedule for a whole message,
+    // instead of one per block through the single-shot API.
+    fn CCCryptorCreate(
+        op: u32,
+        alg: u32,
+        options: u32,
+        key: *const c_void,
+        key_length: usize,
+        iv: *const c_void,
+        cryptor_ref: *mut CcCryptorRef,
+    ) -> i32;
+    fn CCCryptorUpdate(
+        cryptor_ref: CcCryptorRef,
+        data_in: *const c_void,
+        data_in_length: usize,
+        data_out: *mut c_void,
+        data_out_available: usize,
+        data_out_moved: *mut usize,
+    ) -> i32;
+    fn CCCryptorRelease(cryptor_ref: CcCryptorRef) -> i32;
 
     // CCCrypt — single-shot encrypt/decrypt
     fn CCCrypt(
@@ -206,6 +230,9 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Opaque `CCCryptorRef`.
+type CcCryptorRef = *mut c_void;
+
 /// AES-ECB encrypt a single 16-byte block.
 fn aes128_ecb_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -226,6 +253,94 @@ fn aes128_ecb_block(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
         );
     }
     out
+}
+
+/// How much ciphertext the CBC-MAC pass asks CommonCrypto to write at a time.
+/// Only the final block is the MAC, so everything else is discarded — this
+/// just bounds the scratch buffer. A multiple of the AES block size, so every
+/// update is block-aligned and CommonCrypto never buffers a partial block.
+const CMAC_CHUNK: usize = 4096;
+
+/// One-shot log if the streaming path ever fails, so the resulting ~10x
+/// slowdown is visible rather than silent.
+static CMAC_FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// CBC-MAC `head` (a whole number of AES blocks) followed by `last`, with a
+/// zero IV, returning the final ciphertext block.
+///
+/// This is the whole trick behind CMAC's speed. The textbook loop
+/// `x = AES(key, x ^ M_i)` *is* CBC mode, so one streaming CBC pass replaces a
+/// per-block trip through the single-shot API — and each of those trips
+/// re-expands the AES-128 key schedule, which costs far more than the 16 bytes
+/// of AES it performs. Signing a 256 KiB SMB write is 16,384 blocks, so that
+/// overhead is the difference between ~106 MiB/s and the hardware's speed.
+///
+/// Returns `None` if CommonCrypto refuses the operation, so the caller falls
+/// back to the per-block path rather than returning a wrong MAC.
+fn cbc_mac(key: &[u8; 16], head: &[u8], last: &[u8; 16]) -> Option<[u8; 16]> {
+    debug_assert!(head.len().is_multiple_of(AES_BLOCK_SIZE));
+    let iv = [0u8; AES_BLOCK_SIZE];
+    let mut cryptor: CcCryptorRef = std::ptr::null_mut();
+    // SAFETY: `key` and `iv` are the 16 bytes AES-128-CBC expects, and
+    // `cryptor` is an out-parameter released on every path below.
+    let status = unsafe {
+        CCCryptorCreate(
+            K_CC_ENCRYPT,
+            K_CC_ALGORITHM_AES128,
+            K_CC_OPTION_CBC_NO_PADDING,
+            key.as_ptr() as *const c_void,
+            AES_BLOCK_SIZE,
+            iv.as_ptr() as *const c_void,
+            &mut cryptor,
+        )
+    };
+    if status != K_CC_SUCCESS || cryptor.is_null() {
+        return None;
+    }
+
+    let mut scratch = [0u8; CMAC_CHUNK];
+    let mut moved = 0usize;
+    let mut ok = true;
+    for chunk in head.chunks(CMAC_CHUNK) {
+        // SAFETY: `chunk` is block-aligned and `scratch` is at least as large,
+        // which is what CBC-without-padding needs to emit its ciphertext.
+        let s = unsafe {
+            CCCryptorUpdate(
+                cryptor,
+                chunk.as_ptr() as *const c_void,
+                chunk.len(),
+                scratch.as_mut_ptr() as *mut c_void,
+                scratch.len(),
+                &mut moved,
+            )
+        };
+        if s != K_CC_SUCCESS {
+            ok = false;
+            break;
+        }
+    }
+
+    let mut mac = [0u8; AES_BLOCK_SIZE];
+    if ok {
+        // The last block's ciphertext is the MAC.
+        // SAFETY: one block in, one block of space out.
+        let s = unsafe {
+            CCCryptorUpdate(
+                cryptor,
+                last.as_ptr() as *const c_void,
+                AES_BLOCK_SIZE,
+                mac.as_mut_ptr() as *mut c_void,
+                AES_BLOCK_SIZE,
+                &mut moved,
+            )
+        };
+        ok = s == K_CC_SUCCESS && moved == AES_BLOCK_SIZE;
+    }
+
+    // SAFETY: `cryptor` came from a successful create and is not used after.
+    unsafe { CCCryptorRelease(cryptor) };
+    ok.then_some(mac)
 }
 
 /// Compute AES-128-CMAC (RFC 4493). Used for SMB 3.x message signing.
@@ -261,7 +376,17 @@ pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
         xor_block(&mut last, &k2);
     }
 
-    // Step 4: CBC-MAC — XOR in-place into x to avoid per-block allocation
+    // Step 4: CBC-MAC every block but the last, then the tweaked last block.
+    let head = &data[..(n - 1) * AES_BLOCK_SIZE];
+    if let Some(mac) = cbc_mac(key, head, &last) {
+        return mac;
+    }
+
+    // Fallback: the same computation block by block. Correct but ~10x slower,
+    // so it is announced once rather than degrading silently.
+    if !CMAC_FALLBACK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::serr!("[spiceio] AES-CMAC streaming path unavailable; signing will be slow");
+    }
     let mut x = [0u8; AES_BLOCK_SIZE];
     for i in 0..n - 1 {
         let start = i * AES_BLOCK_SIZE;
