@@ -1,8 +1,9 @@
 //! High-level SMB file operations used by the S3 layer.
 
+use std::collections::HashSet;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -14,6 +15,12 @@ use super::protocol::*;
 /// giving up — enough halving steps (4 MiB → 64 KiB) plus headroom, while still
 /// terminating well within a client's request timeout if the server is down.
 const MAX_RESET_RETRIES: u32 = 16;
+
+/// Cap on the process-lifetime directory existence cache. Hot prefixes
+/// (sccache, multi-file uploads under one tree) fit comfortably; past the cap
+/// we stop inserting rather than grow without bound under a pathological
+/// client that writes into a fresh directory every request.
+const ENSURED_DIRS_CAP: usize = 16_384;
 
 /// A connected share session backed by a pool of SMB connections.
 ///
@@ -29,6 +36,12 @@ pub struct ShareSession {
     /// startup, and a hidden `env::var` in this layer could not be set per
     /// session or exercised by a test.
     cleanup_grace_ft: u64,
+    /// SMB directory paths we have successfully ensured this process. PutObject
+    /// / multipart / WAL open all call `ensure_parent_dirs` for every write;
+    /// without a cache that is a Create+Close compound round trip per parent
+    /// directory per object — dominant cost for many small files under one
+    /// prefix. Shared across clones of the session (one set per process).
+    ensured_dirs: Arc<Mutex<HashSet<String>>>,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -60,6 +73,7 @@ impl ShareSession {
         Ok(Self {
             pool,
             cleanup_grace_ft: cleanup_grace_secs.saturating_mul(FILETIME_TICKS_PER_SEC),
+            ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -73,6 +87,17 @@ impl ShareSession {
     /// during a quiet period is healed before a client request finds it.
     pub fn keepalive(&self) {
         self.pool.keepalive();
+    }
+
+    /// True while the backend is overloaded (recent resets/busy, or half the
+    /// pool poisoned). HTTP admission uses this to fail fast with 503.
+    pub fn is_overloaded(&self) -> bool {
+        self.pool.is_overloaded()
+    }
+
+    /// Concurrent SMB-touching request budget for HTTP admission control.
+    pub fn admission_limit(&self) -> usize {
+        self.pool.admission_limit()
     }
 
     /// Pick the next connection + tree_id via round-robin (owned `Arc`).
@@ -95,15 +120,21 @@ impl ShareSession {
     /// Compound Create+Read+Close. Returns metadata and data bytes.
     /// File handle is already closed on return. For files larger than
     /// `compound_max_read_size`, only the first chunk is returned.
+    ///
+    /// Retries transient SMB failures (reset / busy) on a fresh connection so
+    /// a one-shot sccache GET hit does not surface a 503 the client may treat
+    /// as fatal (sccache fails server startup on temporary storage errors).
     pub async fn get_object_compound(
         &self,
         key: &str,
         max_read: u32,
     ) -> io::Result<(ObjectMeta, Bytes)> {
-        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let (cr, data) = client
-            .create_read_close(tree_id, &smb_path, max_read)
+        let (cr, data) = self
+            .retry_read_open(|client, tree_id| {
+                let smb_path = smb_path.clone();
+                async move { client.create_read_close(tree_id, &smb_path, max_read).await }
+            })
             .await?;
 
         let meta = ObjectMeta {
@@ -406,58 +437,85 @@ impl ShareSession {
 
     /// Put object (write file). Uses compound Create+Write+Close for small
     /// files, falling back to sequential for larger files.
+    ///
+    /// Transient SMB failures (reset / sharing-violation busy) are retried on a
+    /// fresh connection — sccache's startup probe (`.sccache_check`) and the
+    /// many small artifact PUTs of a multi-client build must not burn the
+    /// client's thin retry budget on a single dropped NAS session.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
-        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        self.ensure_parent_dirs_on(&client, tree_id, &smb_path)
-            .await?;
-
         let compound_max = self.pool.compound_max_write_size as usize;
-        let chunk_size = self.pool.write_chunk_size() as usize;
+        let content_type = guess_content_type(key);
 
         if data.len() <= compound_max {
-            // Compound Create+Write+Close — 1 round trip, metadata from Close
-            let cl = client.create_write_close(tree_id, &smb_path, data).await?;
+            // Compound Create+Write+Close — 1 round trip, metadata from Close.
+            // Parent dirs are ensured inside the retry so a reset after
+            // ensure_dirs still lands the write on a healthy connection.
+            let data = data.to_vec(); // ≤64 KiB compound cap
+            let session = self.clone();
+            let cl = self
+                .retry_write_op(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    let data = data.clone();
+                    let session = session.clone();
+                    async move {
+                        session
+                            .ensure_parent_dirs_on(&client, tree_id, &smb_path)
+                            .await?;
+                        client.create_write_close(tree_id, &smb_path, &data).await
+                    }
+                })
+                .await?;
             return Ok(ObjectMeta {
                 size: data.len() as u64,
                 last_modified: filetime_to_epoch_secs(cl.last_write_time),
                 etag: etag_for(data.len() as u64, cl.last_write_time),
-                content_type: guess_content_type(key),
+                content_type,
             });
         }
 
-        // Large file — sequential write
-        let file = client
-            .create(
-                tree_id,
-                &smb_path,
-                DesiredAccess::GenericWrite as u32,
-                ShareAccess::Read as u32,
-                CreateDisposition::OverwriteIf as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
-
-        // Write all chunks, then close the handle on every path. On a write
-        // error, also remove the partial/corrupt file rather than leaking the
-        // handle and leaving torn data on the share.
-        let write_result: io::Result<()> = async {
-            let mut offset = 0u64;
-            for chunk in data.chunks(chunk_size) {
-                client.write(tree_id, &file.file_id, offset, chunk).await?;
-                offset += chunk.len() as u64;
-            }
-            Ok(())
-        }
-        .await;
-        let _ = client.close(tree_id, &file.file_id).await;
-        if let Err(e) = write_result {
-            if is_reset(&e) {
-                self.pool.note_write_reset();
-            }
-            // Clean up the partial object on a fresh connection — the one that
-            // just failed is likely poisoned, so reusing it would no-op the
-            // delete and leave the torn file behind.
+        // Large file — sequential write with the same transient-retry wrapper
+        // around open+write so a mid-body reset reconnects rather than 503s.
+        let data_owned = data.to_vec();
+        let chunk_size = self.pool.write_chunk_size() as usize;
+        let session = self.clone();
+        let write_ok = self
+            .retry_write_op(|client, tree_id| {
+                let smb_path = smb_path.clone();
+                let data = data_owned.clone();
+                let session = session.clone();
+                async move {
+                    session
+                        .ensure_parent_dirs_on(&client, tree_id, &smb_path)
+                        .await?;
+                    let file = client
+                        .create(
+                            tree_id,
+                            &smb_path,
+                            DesiredAccess::GenericWrite as u32,
+                            ShareAccess::Read as u32,
+                            CreateDisposition::OverwriteIf as u32,
+                            CreateOptions::NonDirectoryFile as u32,
+                        )
+                        .await?;
+                    let write_result: io::Result<()> = async {
+                        let mut offset = 0u64;
+                        for chunk in data.chunks(chunk_size.max(1)) {
+                            client.write(tree_id, &file.file_id, offset, chunk).await?;
+                            offset += chunk.len() as u64;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = client.close(tree_id, &file.file_id).await;
+                    write_result?;
+                    Ok(())
+                }
+            })
+            .await;
+        if let Err(e) = write_ok {
+            // Final failure: remove any partial/corrupt object rather than
+            // leaving torn data under the client's key.
             let (dc, dt) = self.pick_live().await;
             let _ = Self::delete_object_path_on(&dc, dt, &smb_path).await;
             return Err(e);
@@ -468,40 +526,58 @@ impl ShareSession {
             size: data.len() as u64,
             last_modified: meta.last_modified,
             etag: meta.etag,
-            content_type: guess_content_type(key),
+            content_type,
         })
     }
 
     /// Delete an object. Compound Create(DELETE_ON_CLOSE)+Close in 1 round trip.
+    /// Retries transient reset/busy so a single dropped connection does not
+    /// surface as a hard failure to the client.
     pub async fn delete_object(&self, key: &str) -> io::Result<()> {
-        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let _ = client
-            .create_close(
-                tree_id,
-                &smb_path,
-                DesiredAccess::Delete as u32,
-                ShareAccess::Delete as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
-            )
-            .await?;
-        Ok(())
+        self.retry_write_op(|client, tree_id| {
+            let smb_path = smb_path.clone();
+            async move {
+                client
+                    .create_close(
+                        tree_id,
+                        &smb_path,
+                        DesiredAccess::Delete as u32,
+                        ShareAccess::Delete as u32,
+                        CreateDisposition::Open as u32,
+                        CreateOptions::NonDirectoryFile as u32
+                            | CreateOptions::DeleteOnClose as u32,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await
     }
 
     /// Head object (metadata only). Compound Create+Close in 1 round trip.
+    ///
+    /// Retries transient failures like `head_object_smb` / `open_read` — a
+    /// single dropped connection on an sccache existence probe would otherwise
+    /// become a 503 that aborts the client's compile unit.
     pub async fn head_object(&self, key: &str) -> io::Result<ObjectMeta> {
-        let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
-        let (cr, _) = client
-            .create_close(
-                tree_id,
-                &smb_path,
-                DesiredAccess::ReadAttributes as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
+        let (cr, _) = self
+            .retry_read_open(|client, tree_id| {
+                let smb_path = smb_path.clone();
+                async move {
+                    client
+                        .create_close(
+                            tree_id,
+                            &smb_path,
+                            DesiredAccess::ReadAttributes as u32,
+                            ShareAccess::All as u32,
+                            CreateDisposition::Open as u32,
+                            CreateOptions::NonDirectoryFile as u32,
+                        )
+                        .await
+                }
+            })
             .await?;
 
         Ok(ObjectMeta {
@@ -725,11 +801,46 @@ impl ShareSession {
                 Err(e) => {
                     if is_reset(&e) {
                         self.pool.note_read_reset();
+                    } else if is_busy(&e) {
+                        self.pool.note_busy();
                     }
                     if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
                         return Err(e);
                     }
-                    if is_busy(&e) {
+                    // Under overload, back off harder so retries do not amplify
+                    // the stampede that triggered the busy/reset.
+                    if is_busy(&e) || self.pool.is_overloaded() {
+                        busy_backoff(attempt).await;
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Write-path counterpart of `retry_read_open`: same bounded retry budget,
+    /// backs off the adaptive *write* size on reset. Healing is left to
+    /// `pick_live` (coalesced) so concurrent retries do not each call `heal`.
+    async fn retry_write_op<T, F, Fut>(&self, mut op: F) -> io::Result<T>
+    where
+        F: FnMut(Arc<SmbClient>, u32) -> Fut,
+        Fut: Future<Output = io::Result<T>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            let (client, tree_id) = self.pick_live().await;
+            match op(client, tree_id).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if is_reset(&e) {
+                        self.pool.note_write_reset();
+                    } else if is_busy(&e) {
+                        self.pool.note_busy();
+                    }
+                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                        return Err(e);
+                    }
+                    if is_busy(&e) || self.pool.is_overloaded() {
                         busy_backoff(attempt).await;
                     }
                     attempt += 1;
@@ -1600,6 +1711,13 @@ impl ShareSession {
     }
 
     /// Ensure parent directories exist for a given path on a specific connection.
+    ///
+    /// Paths already present in `ensured_dirs` are skipped — a process that has
+    /// successfully created (or OpenIf'd) a directory will not re-pay the
+    /// Create+Close round trip for every subsequent write under it. The cache
+    /// is best-effort: an external delete of a cached directory can surface as
+    /// a create failure on the child (rare on a dedicated share); restarting
+    /// the proxy clears the cache.
     async fn ensure_parent_dirs_on(
         &self,
         client: &SmbClient,
@@ -1621,7 +1739,26 @@ impl ShareSession {
             dirs.push(current.clone());
         }
 
-        client.ensure_dirs(tree_id, &dirs).await
+        // Drop anything we already know exists so a hot prefix costs zero
+        // SMB round trips after the first file lands under it.
+        let missing: Vec<String> = {
+            let cache = self.ensured_dirs.lock().unwrap_or_else(|e| e.into_inner());
+            dirs.into_iter().filter(|d| !cache.contains(d)).collect()
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        client.ensure_dirs(tree_id, &missing).await?;
+
+        let mut cache = self.ensured_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        for d in missing {
+            if cache.len() >= ENSURED_DIRS_CAP {
+                break;
+            }
+            cache.insert(d);
+        }
+        Ok(())
     }
 }
 
@@ -1853,6 +1990,11 @@ pub(crate) fn is_reset(e: &io::Error) -> bool {
             // layer already maps it to a retryable 503, so the retry/resume
             // paths must agree or they'd abort instead of reconnecting.
             | io::ErrorKind::NotConnected
+            // TCP connect refused while healing / reconnecting a slot — the
+            // NAS is momentarily unreachable; retry on another connection
+            // (or after the healer brings one back) rather than 503 to the
+            // client.
+            | io::ErrorKind::ConnectionRefused
             // An overwhelmed NAS often closes the TCP connection with a FIN
             // (graceful close) mid-response rather than an RST, so `read_exact`
             // returns `UnexpectedEof` ("early eof") instead of a reset. In the
@@ -2309,6 +2451,7 @@ mod tests {
             io::ErrorKind::ConnectionAborted,
             io::ErrorKind::TimedOut,
             io::ErrorKind::NotConnected,
+            io::ErrorKind::ConnectionRefused,
             io::ErrorKind::UnexpectedEof,
         ] {
             assert!(should_retry(&io::Error::new(k, "reset")), "{k:?}");

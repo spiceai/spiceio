@@ -31,6 +31,13 @@ inputs:
     description: SMB connection-pool size (caps concurrent NAS sessions per instance)
     required: false
     default: "8"
+  immutable-objects:
+    description: >
+      When "true" or "1", enable SPICEIO_IMMUTABLE_OBJECTS — key-only body-cache
+      lookup after HEAD revalidation. Safe for content-addressed stores (sccache);
+      leave off for mutable S3 keys.
+    required: false
+    default: "false"
   token:
     description: GitHub token for downloading release assets from private repos
     required: true
@@ -85,6 +92,7 @@ runs:
         SPICEIO_REGION: ${{ inputs.region }}
         SPICEIO_BIND: ${{ inputs.bind }}
         SPICEIO_SMB_CONNECTIONS: ${{ inputs.connections }}
+        IMMUTABLE_OBJECTS: ${{ inputs.immutable-objects }}
       run: |
         set -euo pipefail
 
@@ -123,8 +131,16 @@ runs:
           SPICEIO_SMB_PORT="445"
         fi
 
+        # Normalize immutable-objects: accept true/1/yes (case-insensitive).
+        # Portable (no ${var,,}) for macOS bash 3.2.
+        case "$(printf '%s' "$IMMUTABLE_OBJECTS" | tr '[:upper:]' '[:lower:]')" in
+          1|true|yes) SPICEIO_IMMUTABLE_OBJECTS=1 ;;
+          *)          SPICEIO_IMMUTABLE_OBJECTS=0 ;;
+        esac
+
         export SPICEIO_SMB_SERVER SPICEIO_SMB_PORT SPICEIO_SMB_USER SPICEIO_SMB_PASS SPICEIO_SMB_SHARE
         export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND SPICEIO_SMB_CONNECTIONS
+        export SPICEIO_IMMUTABLE_OBJECTS
 
         SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"
         : > "$SPICEIO_LOG"
@@ -133,8 +149,14 @@ runs:
         spiceio &
         PID=$!
 
-        # Wait for spiceio to report its actual listening address (port may
-        # auto-increment if the requested port was busy).
+        # Wait for spiceio to be fully ready (SMB connected), not merely
+        # accepting TCP. The process binds early and serves 503 until the
+        # NAS is up; sccache's `.sccache_check` must hit a 200, not a refuse
+        # and not a still-connecting 503.
+        #
+        # Prefer the "ready, listening on" log line (written after SMB is
+        # live). Fall back to "accepting connections" + a successful 200
+        # probe so older binaries without the ready line still work.
         echo "Waiting for spiceio on ${SPICEIO_BIND}..."
         ENDPOINT=""
         for i in $(seq 1 150); do
@@ -145,12 +167,40 @@ runs:
             echo "::endgroup::"
             exit 1
           fi
-          ENDPOINT=$(grep 'listening on' "$SPICEIO_LOG" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
-          if [[ -n "$ENDPOINT" ]] && curl -fsS -o /dev/null "$ENDPOINT/" 2>/dev/null; then
-            echo "spiceio ready at $ENDPOINT (PID $PID)"
-            echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
-            echo "pid=$PID" >> "$GITHUB_OUTPUT"
-            exit 0
+          # Prefer the post-SMB ready line; fall back to accepting-connections.
+          ENDPOINT=$(
+            grep -E 'ready, listening on|accepting connections on' "$SPICEIO_LOG" 2>/dev/null \
+              | grep -o 'http://[^ ]*' | tail -1 || true
+          )
+          READY_LINE=$(grep -c 'ready, listening on' "$SPICEIO_LOG" 2>/dev/null || echo 0)
+          if [[ -n "$ENDPOINT" ]]; then
+            # HTTP 200 on the root (list buckets) means SMB is serving.
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "$ENDPOINT/" 2>/dev/null || echo 000)
+            if [[ "$CODE" == "200" ]] || [[ "$READY_LINE" -gt 0 && "$CODE" != "000" && "$CODE" != "503" ]]; then
+              # Verify a write/read round-trip that mirrors sccache's
+              # `.sccache_check` so we never hand a half-ready endpoint to
+              # clients that fail hard on temporary storage errors.
+              CHECK_KEY="${SPICEIO_BUCKET}/.spiceio_ready_check"
+              PUT_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                -X PUT --data-binary 'ok' -H 'Content-Length: 2' \
+                "${ENDPOINT}/${CHECK_KEY}" 2>/dev/null || echo 000)
+              GET_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+                "${ENDPOINT}/${CHECK_KEY}" 2>/dev/null || echo 000)
+              curl -sS -o /dev/null -X DELETE --max-time 5 \
+                "${ENDPOINT}/${CHECK_KEY}" 2>/dev/null || true
+              if [[ "$PUT_CODE" == "200" && "$GET_CODE" == "200" ]]; then
+                echo "spiceio ready at $ENDPOINT (PID $PID)"
+                echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+                echo "pid=$PID" >> "$GITHUB_OUTPUT"
+                # Export for subsequent steps (sccache, aws cli) so they do not
+                # hard-code a port that auto-increment may have moved.
+                {
+                  echo "SCCACHE_ENDPOINT=$ENDPOINT"
+                  echo "AWS_ENDPOINT_URL=$ENDPOINT"
+                } >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
           fi
           sleep 1
         done

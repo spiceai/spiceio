@@ -4,11 +4,32 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::client::{SmbClient, SmbConfig};
+
+/// Process-start clock for overload windows — monotonic, not wall time.
+static POOL_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_ms() -> u64 {
+    POOL_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// How long a reset/busy event keeps the pool in "overloaded" mode. During
+/// that window HTTP admission fails fast with 503 instead of queueing more
+/// work onto a struggling NAS, and heal reconnects at most one slot per tick.
+const OVERLOAD_HOLD_MS: u64 = 5_000;
+
+/// Concurrent SMB-touching S3 ops allowed per healthy pool connection. Sized
+/// so a full pipeline can run without letting an sccache stampede accumulate
+/// thousands of blocked handlers inside the process.
+const WORK_SLOTS_PER_CONN: usize = 8;
 
 /// Backoff schedule for healing a poisoned connection and for the extra startup
 /// connections once the first is up. Fast, so a transient blip recovers quickly;
@@ -195,6 +216,10 @@ pub struct SmbPool {
     /// check inside `heal` lets callers that queue behind a heal skip the slots
     /// it already restored.
     heal_lock: tokio::sync::Mutex<()>,
+    /// Monotonic-ms deadline until which the pool is treated as overloaded
+    /// (recent resets, busy answers, or mostly-poisoned). Gates fail-fast
+    /// admission and single-slot heal rate limiting.
+    overload_until_ms: AtomicU64,
 }
 
 /// How long a connection may sit idle before the healer probes it with an
@@ -340,7 +365,51 @@ impl SmbPool {
             reset_since_grow: AtomicBool::new(false),
             copychunk_ok: AtomicBool::new(true),
             heal_lock: tokio::sync::Mutex::new(()),
+            overload_until_ms: AtomicU64::new(0),
         }))
+    }
+
+    /// Recommended HTTP admission depth for this pool: enough concurrent S3
+    /// ops to keep every connection busy with pipelined work, not enough to
+    /// bury the process under a client stampede when the NAS is slow.
+    pub fn admission_limit(&self) -> usize {
+        self.size().saturating_mul(WORK_SLOTS_PER_CONN).max(16)
+    }
+
+    /// True while the NAS recently reset/busy'd us, or half+ of the pool is
+    /// poisoned. Used by the HTTP layer to fail fast (503) instead of
+    /// queueing more work onto a struggling backend.
+    pub fn is_overloaded(&self) -> bool {
+        mono_ms() < self.overload_until_ms.load(Ordering::Relaxed) || self.mostly_poisoned()
+    }
+
+    /// Mark the pool overloaded for `OVERLOAD_HOLD_MS`. Idempotent: extends
+    /// the window if a later signal arrives while still overloaded.
+    fn mark_overloaded(&self) {
+        let until = mono_ms().saturating_add(OVERLOAD_HOLD_MS);
+        let mut cur = self.overload_until_ms.load(Ordering::Relaxed);
+        while until > cur {
+            match self.overload_until_ms.compare_exchange_weak(
+                cur,
+                until,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Fraction of active slots currently poisoned (≥ ½ ⇒ overloaded).
+    fn mostly_poisoned(&self) -> bool {
+        let guard = self.slots.read().unwrap();
+        let n = self.n.load(Ordering::Relaxed).min(guard.len());
+        if n == 0 {
+            return true;
+        }
+        let poisoned = guard[..n].iter().filter(|s| s.client.is_poisoned()).count();
+        poisoned * 2 >= n
     }
 
     /// Current adaptive streaming-write in-flight bytes (per-flush budget).
@@ -367,9 +436,11 @@ impl SmbPool {
     /// Note that the server reset/dropped a connection on a write — halve the
     /// write in-flight budget (down to `IO_FLOOR`) so the next attempt uses a
     /// smaller burst (and, below the negotiated max, a smaller write). No-op once
-    /// already at the floor.
+    /// already at the floor. Also marks the pool overloaded so HTTP admission
+    /// fails fast rather than piling more writes onto a struggling NAS.
     pub fn note_write_reset(&self) {
         self.reset_since_grow.store(true, Ordering::Relaxed);
+        self.mark_overloaded();
         let cur = self.write_inflight.load(Ordering::Relaxed);
         let next = io_after_reset(cur);
         if next != cur {
@@ -382,9 +453,11 @@ impl SmbPool {
     }
 
     /// Note that the server reset/dropped a connection on a read — halve the read
-    /// in-flight budget (down to `IO_FLOOR`). No-op once at the floor.
+    /// in-flight budget (down to `IO_FLOOR`). No-op once at the floor. Marks
+    /// overloaded the same way as `note_write_reset`.
     pub fn note_read_reset(&self) {
         self.reset_since_grow.store(true, Ordering::Relaxed);
+        self.mark_overloaded();
         let cur = self.read_inflight.load(Ordering::Relaxed);
         let next = io_after_reset(cur);
         if next != cur {
@@ -394,6 +467,13 @@ impl SmbPool {
                 next / 1024
             );
         }
+    }
+
+    /// Note transient NAS back-pressure (`ResourceBusy` / sharing violation /
+    /// capacity). Does not shrink I/O sizes (the op was refused, not reset)
+    /// but does flip overload so new work fails fast with 503.
+    pub fn note_busy(&self) {
+        self.mark_overloaded();
     }
 
     /// Step both adaptive I/O sizes back up toward their maxes (×2) — called each
@@ -473,17 +553,19 @@ impl SmbPool {
     /// Pick a connection, preferring a healthy one. `pick` already skips
     /// poisoned slots, so the common case (one connection dropped, the rest
     /// healthy) costs nothing; only when every connection is down do we pay for
-    /// a heal and a brief pause before re-picking. If the whole pool is still
-    /// poisoned after that (the heal could not reconnect), this falls back to a
-    /// poisoned connection — the caller's op then fails fast and retries.
+    /// a coalesced heal. If the whole pool is still poisoned after that, this
+    /// returns a poisoned connection — the caller's op fails fast with a
+    /// reset/busy error and the retry budget (or HTTP admission) surfaces 503
+    /// rather than hanging the request for the full heal sleep.
     pub async fn pick_live(&self) -> (Arc<SmbClient>, u32) {
         let (client, tree_id) = self.pick();
-        if client.is_poisoned() {
-            self.heal().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            return self.pick();
+        if !client.is_poisoned() {
+            return (client, tree_id);
         }
-        (client, tree_id)
+        // Coalesced reconnect; under overload heal only repairs one slot per
+        // call so we do not reconnect-storm a saturated NAS.
+        self.heal().await;
+        self.pick()
     }
 
     /// Back the active pool off by one connection (truncating the last slot).
@@ -502,6 +584,7 @@ impl SmbPool {
         let new_size = (old - 1).min(slots.len());
         slots.truncate(new_size);
         self.n.store(new_size, Ordering::Relaxed);
+        self.mark_overloaded();
         crate::slog!(
             "[spiceio] smb pool reduced from {} to {} connections due to server capacity limit",
             old,
@@ -523,10 +606,19 @@ impl SmbPool {
         // retrying requests doesn't fan out into competing reconnect storms.
         // Callers that queue behind a heal find the slots it restored already
         // healthy (the `is_poisoned` check) and skip them.
+        //
+        // Under overload, repair at most one slot per call: a full-pool
+        // reconnect against a capacity-limited NAS is the opposite of recovery.
+        let overloaded = self.is_overloaded();
+        let mut healed = 0usize;
+        let max_heals = if overloaded { 1 } else { usize::MAX };
         {
             let _guard = self.heal_lock.lock().await;
             let current_n = self.n.load(Ordering::Relaxed);
             for idx in 0..current_n {
+                if healed >= max_heals {
+                    break;
+                }
                 // Re-check current size in case a prior capacity shrink happened.
                 let cur = self.n.load(Ordering::Relaxed);
                 if idx >= cur {
@@ -549,11 +641,13 @@ impl SmbPool {
                             if idx < guard.len() {
                                 guard[idx] = Slot { client, tree_id };
                             }
+                            healed += 1;
                             crate::slog!("[spiceio] healed poisoned smb connection (slot {idx})");
                         }
                         Err(e) => {
                             if super::client::is_capacity_error(&e) {
                                 self.shrink_by_one();
+                                self.mark_overloaded();
                                 crate::slog!(
                                     "[spiceio] heal tree-connect hit server capacity, reduced pool (slot {idx})"
                                 );
@@ -566,6 +660,7 @@ impl SmbPool {
                     Err(e) => {
                         if super::client::is_capacity_error(&e) {
                             self.shrink_by_one();
+                            self.mark_overloaded();
                             crate::slog!(
                                 "[spiceio] heal reconnect hit server capacity, reduced pool (slot {idx})"
                             );
@@ -577,9 +672,12 @@ impl SmbPool {
                 }
             }
         }
-        // Re-probe larger I/O sizes now the server has had a moment to recover
-        // (AIMD: multiplicative decrease on reset, gradual increase here).
-        self.grow_io();
+        // Re-probe larger I/O sizes only when we are *not* in an overload
+        // window — otherwise a heal tick would inflate the burst right back
+        // into the overload that just triggered it.
+        if !self.is_overloaded() {
+            self.grow_io();
+        }
     }
 
     /// Probe connections that have gone idle with an SMB2 ECHO, so a session
@@ -651,6 +749,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
     use tokio::time::Instant;
+
+    #[test]
+    fn admission_limit_scales_with_pool_size_floor() {
+        // Pure arithmetic of the sizing rule — pool_n is injected via the
+        // formula so we don't need a live SMB connection.
+        assert_eq!(1usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 16); // floor
+        assert_eq!(4usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 32);
+        assert_eq!(12usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 96);
+    }
+
+    #[test]
+    fn mono_ms_advances() {
+        let a = mono_ms();
+        let b = mono_ms();
+        assert!(b >= a);
+    }
 
     #[test]
     fn adaptive_io_aimd() {

@@ -203,8 +203,8 @@ fn bench_pipelined_read_decode_zerocopy(c: &mut Criterion) {
     let cases = [(8usize, 65536usize), (64, 65536), (64, 8192)];
     for (depth, chunk_size) in cases {
         let base_msg_id = 1_000u64;
-        let messages: Vec<Vec<u8>> = (0..depth)
-            .map(|i| build_read_response_msg(base_msg_id + i as u64, chunk_size))
+        let messages: Vec<Bytes> = (0..depth)
+            .map(|i| Bytes::from(build_read_response_msg(base_msg_id + i as u64, chunk_size)))
             .collect();
         group.throughput(criterion::Throughput::Bytes((depth * chunk_size) as u64));
         group.bench_with_input(
@@ -218,8 +218,8 @@ fn bench_pipelined_read_decode_zerocopy(c: &mut Criterion) {
                         let header = Header::decode(black_box(msg)).unwrap();
                         let slot = header.message_id.wrapping_sub(base_msg_id) as usize;
                         // Clone to simulate ownership transfer from the read
-                        // path — the production code reads directly into a
-                        // fresh Vec each response.
+                        // path — the production code freezes a fresh BytesMut
+                        // each response.
                         slots[slot] = decode_read_response_from_msg(msg.clone());
                     }
                     slots

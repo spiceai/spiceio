@@ -6,5 +6,6 @@
 pub mod body;
 pub mod headers;
 pub mod multipart;
+pub mod object_cache;
 pub mod router;
 pub mod xml;

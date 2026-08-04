@@ -558,9 +558,9 @@ pub fn decode_read_response_bytes(body: &Bytes) -> Option<Bytes> {
 
 /// Zero-copy decode that takes ownership of the full SMB2 message (header +
 /// body) and returns a `Bytes` slice referencing the response payload — for
-/// the pipelined reader, which owns each frame as a `Vec` and would otherwise
+/// the pipelined reader, which owns each frame as a `Bytes` and would otherwise
 /// have to split the body off first.
-pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
+pub fn decode_read_response_from_msg(msg: Bytes) -> Option<Bytes> {
     if msg.len() < SMB2_HEADER_SIZE {
         return None;
     }
@@ -568,7 +568,7 @@ pub fn decode_read_response_from_msg(msg: Vec<u8>) -> Option<Bytes> {
     // Shift the body-relative range to absolute message offsets.
     let start = range.start + SMB2_HEADER_SIZE;
     let end = range.end + SMB2_HEADER_SIZE;
-    Some(Bytes::from(msg).slice(start..end))
+    Some(msg.slice(start..end))
 }
 
 /// Size of the read response's fixed fields (preceding the Buffer):
@@ -579,10 +579,22 @@ pub const READ_RESPONSE_FIXED_PART: usize = 16;
 // ── Write ───────────────────────────────────────────────────────────────────
 
 pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64, data: &[u8]) {
+    encode_write_request_header(buf, file_id, offset, data.len() as u32);
+    buf.put_slice(data);
+}
+
+/// Fixed 48-byte WRITE request body (no payload). Used with vectored send so
+/// the data slice is signed and written without a second memcpy into the frame.
+pub fn encode_write_request_header(
+    buf: &mut BytesMut,
+    file_id: &[u8; 16],
+    offset: u64,
+    data_len: u32,
+) {
     let data_offset = (SMB2_HEADER_SIZE + 48) as u16;
     buf.put_u16_le(49); // StructureSize
     buf.put_u16_le(data_offset); // DataOffset
-    buf.put_u32_le(data.len() as u32); // Length
+    buf.put_u32_le(data_len); // Length
     buf.put_u64_le(offset); // Offset
     buf.put_slice(file_id); // FileId
     buf.put_u32_le(0); // Channel
@@ -590,7 +602,6 @@ pub fn encode_write_request(buf: &mut BytesMut, file_id: &[u8; 16], offset: u64,
     buf.put_u16_le(0); // WriteChannelInfoOffset
     buf.put_u16_le(0); // WriteChannelInfoLength
     buf.put_u32_le(0); // Flags
-    buf.put_slice(data);
 }
 
 pub fn decode_write_response(body: &[u8]) -> Option<u32> {
@@ -1321,7 +1332,7 @@ mod tests {
 
         let mut msg = vec![0u8; SMB2_HEADER_SIZE];
         msg.extend_from_slice(&body);
-        assert!(decode_read_response_from_msg(msg).is_none());
+        assert!(decode_read_response_from_msg(Bytes::from(msg)).is_none());
     }
 
     #[test]
@@ -1336,14 +1347,16 @@ mod tests {
         body[4..8].copy_from_slice(&5u32.to_le_bytes());
         body[16..21].copy_from_slice(b"hello");
 
-        let data = decode_read_response_from_msg(msg).unwrap();
+        let data = decode_read_response_from_msg(Bytes::from(msg)).unwrap();
         assert_eq!(&data[..], b"hello");
     }
 
     #[test]
     fn decode_read_response_from_msg_too_short() {
-        assert!(decode_read_response_from_msg(vec![0u8; SMB2_HEADER_SIZE + 5]).is_none());
-        assert!(decode_read_response_from_msg(vec![0u8; 10]).is_none());
+        assert!(
+            decode_read_response_from_msg(Bytes::from(vec![0u8; SMB2_HEADER_SIZE + 5])).is_none()
+        );
+        assert!(decode_read_response_from_msg(Bytes::from(vec![0u8; 10])).is_none());
     }
 
     #[test]
@@ -1354,7 +1367,7 @@ mod tests {
         let data_offset = (SMB2_HEADER_SIZE + 16) as u16;
         body[2..4].copy_from_slice(&data_offset.to_le_bytes());
         body[4..8].copy_from_slice(&1_000_000u32.to_le_bytes());
-        assert!(decode_read_response_from_msg(msg).is_none());
+        assert!(decode_read_response_from_msg(Bytes::from(msg)).is_none());
     }
 
     #[test]
@@ -1372,7 +1385,7 @@ mod tests {
         // data_offset = 16 (inside the header, well before SMB2_HEADER_SIZE).
         body[2..4].copy_from_slice(&16u16.to_le_bytes());
         body[4..8].copy_from_slice(&8u32.to_le_bytes());
-        assert!(decode_read_response_from_msg(msg).is_none());
+        assert!(decode_read_response_from_msg(Bytes::from(msg)).is_none());
     }
 
     #[test]
@@ -1382,7 +1395,7 @@ mod tests {
         let body = &mut msg[SMB2_HEADER_SIZE..];
         body[2..4].copy_from_slice(&0u16.to_le_bytes());
         body[4..8].copy_from_slice(&4u32.to_le_bytes());
-        assert!(decode_read_response_from_msg(msg).is_none());
+        assert!(decode_read_response_from_msg(Bytes::from(msg)).is_none());
     }
 
     #[test]
@@ -1397,7 +1410,7 @@ mod tests {
         let bad_offset = (SMB2_HEADER_SIZE + 4) as u16;
         body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
         body[4..8].copy_from_slice(&4u32.to_le_bytes());
-        assert!(decode_read_response_from_msg(msg).is_none());
+        assert!(decode_read_response_from_msg(Bytes::from(msg)).is_none());
 
         // Offset = SMB2_HEADER_SIZE + 15 — one byte short of the buffer.
         let mut msg = vec![0u8; SMB2_HEADER_SIZE + 32];
@@ -1405,7 +1418,7 @@ mod tests {
         let bad_offset = (SMB2_HEADER_SIZE + 15) as u16;
         body[2..4].copy_from_slice(&bad_offset.to_le_bytes());
         body[4..8].copy_from_slice(&4u32.to_le_bytes());
-        assert!(decode_read_response_from_msg(msg).is_none());
+        assert!(decode_read_response_from_msg(Bytes::from(msg)).is_none());
     }
 
     #[test]
@@ -1422,7 +1435,7 @@ mod tests {
         let buf_start = SMB2_HEADER_SIZE + READ_RESPONSE_FIXED_PART;
         msg[buf_start..buf_start + payload.len()].copy_from_slice(payload);
 
-        let data = decode_read_response_from_msg(msg).unwrap();
+        let data = decode_read_response_from_msg(Bytes::from(msg)).unwrap();
         assert_eq!(&data[..], payload);
     }
 
