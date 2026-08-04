@@ -7,6 +7,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use super::client::{SmbClient, SmbConfig};
 
@@ -220,6 +221,10 @@ pub struct SmbPool {
     /// (recent resets, busy answers, or mostly-poisoned). Gates fail-fast
     /// admission and single-slot heal rate limiting.
     overload_until_ms: AtomicU64,
+    /// HTTP admission semaphore: `size × WORK_SLOTS_PER_CONN` permits, reduced
+    /// when `shrink_by_one` drops a connection so a capacity-shrunk pool does
+    /// not keep admitting more work than it can sustain.
+    admission: Arc<Semaphore>,
 }
 
 /// How long a connection may sit idle before the healer probes it with an
@@ -349,6 +354,7 @@ impl SmbPool {
             .map(|client| Slot { client, tree_id: 0 })
             .collect();
         let pool_n = slots.len();
+        let admission_n = pool_n.saturating_mul(WORK_SLOTS_PER_CONN).max(16);
 
         Ok(Arc::new(Self {
             slots: RwLock::new(slots),
@@ -366,6 +372,7 @@ impl SmbPool {
             copychunk_ok: AtomicBool::new(true),
             heal_lock: tokio::sync::Mutex::new(()),
             overload_until_ms: AtomicU64::new(0),
+            admission: Arc::new(Semaphore::new(admission_n)),
         }))
     }
 
@@ -374,6 +381,12 @@ impl SmbPool {
     /// bury the process under a client stampede when the NAS is slow.
     pub fn admission_limit(&self) -> usize {
         self.size().saturating_mul(WORK_SLOTS_PER_CONN).max(16)
+    }
+
+    /// Shared admission semaphore for the HTTP layer. Permit count tracks
+    /// live pool size (see `shrink_by_one`).
+    pub fn admission(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.admission)
     }
 
     /// True while the NAS recently reset/busy'd us, or half+ of the pool is
@@ -585,6 +598,18 @@ impl SmbPool {
         slots.truncate(new_size);
         self.n.store(new_size, Ordering::Relaxed);
         self.mark_overloaded();
+        // Drop the work slots that belonged to the removed connection so HTTP
+        // admission tracks the live pool. Best-effort: if those permits are
+        // currently held, try_acquire fails and they re-enter the free pool on
+        // release — the next shrink (or natural drain under overload 503s)
+        // rebalances. Prefer try_acquire over blocking a Tokio worker here.
+        for _ in 0..WORK_SLOTS_PER_CONN {
+            if let Ok(permit) = self.admission.try_acquire() {
+                permit.forget();
+            } else {
+                break;
+            }
+        }
         crate::slog!(
             "[spiceio] smb pool reduced from {} to {} connections due to server capacity limit",
             old,

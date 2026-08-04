@@ -100,6 +100,11 @@ impl ShareSession {
         self.pool.admission_limit()
     }
 
+    /// Shared HTTP admission semaphore (tracks live pool size).
+    pub fn admission(&self) -> Arc<tokio::sync::Semaphore> {
+        self.pool.admission()
+    }
+
     /// Pick the next connection + tree_id via round-robin (owned `Arc`).
     fn pick(&self) -> (Arc<SmbClient>, u32) {
         self.pool.pick()

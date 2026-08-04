@@ -4,11 +4,10 @@ use hyper::Request;
 use hyper::body::Incoming;
 use std::env;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::Semaphore;
 
 use spiceio::crash;
 use spiceio::http;
@@ -151,6 +150,8 @@ async fn connect_share(
 ) -> Result<Arc<AppState>, std::io::Error> {
     let pool = SmbPool::connect(smb_config, smb_connections).await?;
     let admission = pool.admission_limit();
+    // Shared with the pool so capacity shrinks reduce available permits.
+    let smb_slots = pool.admission();
     let share = ShareSession::connect(pool, smb_share, cleanup_grace_secs).await?;
     let share = Arc::new(share);
     // Clean up orphaned WAL temps / stale multipart dirs from prior crashes
@@ -174,7 +175,7 @@ async fn connect_share(
         bucket: bucket_name,
         region,
         multipart: MultipartStore::new(),
-        smb_slots: Arc::new(Semaphore::new(admission)),
+        smb_slots,
         object_cache,
     }))
 }
@@ -239,12 +240,13 @@ async fn main() {
         }
     };
 
-    // Gate for the HTTP handler: None while the SMB pool is still connecting,
-    // Some(state) once the share is live. Serving TCP *before* SMB is ready is
+    // Gate for the HTTP handler: empty while the SMB pool is still connecting,
+    // published once the share is live. `OnceLock` is a one-shot publish — no
+    // per-request lock after readiness. Serving TCP *before* SMB is ready is
     // what keeps sccache (and other S3 clients) from seeing "Connection
     // refused" during a slow NAS connect — they get a 503 SlowDown they can
     // retry instead of a hard TCP error that aborts server startup.
-    let ready: Arc<RwLock<Option<Arc<AppState>>>> = Arc::new(RwLock::new(None));
+    let ready: Arc<OnceLock<Arc<AppState>>> = Arc::new(OnceLock::new());
 
     slog!("[spiceio] accepting connections on http://{bind_addr} (connecting to SMB…)");
     slog!(
@@ -377,7 +379,8 @@ async fn main() {
 
             // Publish readiness. The setup action greps for "ready, listening"
             // (not merely "accepting connections") before pointing sccache at us.
-            *ready.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
+            // OnceLock::set is one-shot; ignore a racing second set.
+            let _ = ready.set(state);
             slog!("[spiceio] ready, listening on http://{bind_addr_log}");
             slog!("[spiceio] bucket: {bucket_name} region: {region}");
             log::flush(Duration::from_millis(200));
@@ -414,9 +417,8 @@ async fn main() {
         move |req: Request<Incoming>| {
             let ready = Arc::clone(&ready);
             async move {
-                let state = ready.read().unwrap_or_else(|e| e.into_inner()).clone();
-                match state {
-                    Some(state) => s3::router::handle_request(req, &state).await,
+                match ready.get() {
+                    Some(state) => s3::router::handle_request(req, state).await,
                     None => s3::router::service_unavailable(
                         "spiceio is still connecting to the SMB backend; please retry.",
                     ),

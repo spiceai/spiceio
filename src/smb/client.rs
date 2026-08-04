@@ -592,7 +592,7 @@ impl SmbClient {
     }
 
     /// Vectored write of all slices with the same timeout/poison policy as
-    /// [`write_all_timeout`]. Used by pipelined WRITE so payload bytes stay in
+    /// `write_all_timeout`. Used by pipelined WRITE so payload bytes stay in
     /// their original buffers (header || data per packet) instead of being
     /// memcpy'd into one contiguous frame.
     async fn write_vectored_all_timeout(

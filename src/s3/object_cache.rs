@@ -50,6 +50,11 @@ struct Inner {
 
 impl ObjectCache {
     pub fn new(immutable: bool, max_bytes: u64, max_object_bytes: u64, max_entries: usize) -> Self {
+        let max_bytes = max_bytes.max(1);
+        // Per-object cap cannot exceed the total budget — keeps may_fill_cache
+        // / insert() invariants aligned and avoids buffering a body that
+        // insert() would immediately reject.
+        let max_object_bytes = max_object_bytes.max(1).min(max_bytes);
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
@@ -57,8 +62,8 @@ impl ObjectCache {
                 clock: 0,
             }),
             immutable,
-            max_bytes: max_bytes.max(1),
-            max_object_bytes: max_object_bytes.max(1),
+            max_bytes,
+            max_object_bytes,
             max_entries: max_entries.max(1),
         }
     }
@@ -136,8 +141,7 @@ impl ObjectCache {
             g.total_bytes = g.total_bytes.saturating_sub(old.body.len() as u64);
         }
         // Evict until we fit.
-        while g.map.len() >= self.max_entries
-            || g.total_bytes.saturating_add(len) > self.max_bytes
+        while g.map.len() >= self.max_entries || g.total_bytes.saturating_add(len) > self.max_bytes
         {
             if g.map.is_empty() {
                 break;
@@ -182,7 +186,11 @@ impl ObjectCache {
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).map.len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .len()
     }
 
     #[cfg(test)]
@@ -235,6 +243,14 @@ mod tests {
         let c = ObjectCache::new(false, 1024, 4, 16);
         c.insert("k", "e1", Bytes::from_static(b"hello")); // 5 > 4
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn clamps_per_object_cap_to_total_budget() {
+        let c = ObjectCache::new(false, 8, 64, 16);
+        assert_eq!(c.max_object_bytes(), 8);
+        c.insert("k", "e1", Bytes::from_static(b"123456789")); // 9 > 8
+        assert!(c.is_empty());
     }
 
     #[test]
