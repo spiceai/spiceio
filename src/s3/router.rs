@@ -954,6 +954,9 @@ async fn stream_get_object(
     let resume_share = share.clone();
     let resume_key = key.to_string();
     let expected_size = file_size;
+    // Etag (size+mtime) must match on resume so a same-size overwrite cannot
+    // splice bytes from a different version into the already-committed body.
+    let expected_etag = cache_etag.clone();
 
     // Spawn background task to stream pipelined SMB reads into the channel.
     //
@@ -982,10 +985,12 @@ async fn stream_get_object(
         let mut cache_ok = may_fill_cache;
 
         // Helper: reopen after a reset, updating handle/chunk_size.
+        // Requires both size *and* etag so a same-size rewrite is rejected.
         async fn reopen_for_resume(
             resume_share: &ShareSession,
             resume_key: &str,
             expected_size: u64,
+            expected_etag: &str,
             resumes: u32,
             offset: u64,
             stream_end: u64,
@@ -1002,7 +1007,7 @@ async fn stream_get_object(
                 reopened = resume_share.open_read(resume_key).await;
             }
             match reopened {
-                Ok(h) if h.file_size == expected_size => {
+                Ok(h) if h.file_size == expected_size && h.meta.etag == expected_etag => {
                     let chunk = h.max_chunk;
                     crate::slog!(
                         "[spiceio] getobject resumed at {offset}/{stream_end} (attempt {resumes})"
@@ -1010,10 +1015,12 @@ async fn stream_get_object(
                     Ok((h, chunk))
                 }
                 Ok(h) => {
-                    let got = h.file_size;
+                    let got_size = h.file_size;
+                    let got_etag = h.meta.etag.clone();
                     let _ = h.close().await;
                     crate::serr!(
-                        "[spiceio] getobject resume aborted: size changed {expected_size} -> {got}"
+                        "[spiceio] getobject resume aborted: size/etag changed \
+                         {expected_size}/{expected_etag} -> {got_size}/{got_etag}"
                     );
                     Err(io::Error::other("object changed during streaming read"))
                 }
@@ -1041,6 +1048,7 @@ async fn stream_get_object(
                             &resume_share,
                             &resume_key,
                             expected_size,
+                            &expected_etag,
                             resumes,
                             offset,
                             stream_end,
@@ -1150,6 +1158,7 @@ async fn stream_get_object(
                         &resume_share,
                         &resume_key,
                         expected_size,
+                        &expected_etag,
                         resumes,
                         offset,
                         stream_end,
