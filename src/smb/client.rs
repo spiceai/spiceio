@@ -1097,7 +1097,15 @@ impl SmbClient {
         }
 
         decode_create_response(&resp_body).ok_or_else(|| {
-            crate::serr!("[spiceio] smb invalid create response: {path}");
+            // Status was "success" but the body is unusable — almost always a
+            // desynced stream after a prior mid-response disconnect (or a
+            // server that returned an empty success). Log enough to tell those
+            // apart from a real codec bug.
+            crate::serr!(
+                "[spiceio] smb invalid create response: {path} status=0x{:08X} body_len={}",
+                resp_hdr.status,
+                resp_body.len()
+            );
             io::Error::new(io::ErrorKind::InvalidData, "invalid create response")
         })
     }
@@ -1878,10 +1886,7 @@ impl SmbClient {
 
         let resp = self.send_compound(vec![(h1, b1), (h2, b2)]).await?;
         if resp.len() < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "compound response too short",
-            ));
+            return Err(compound_too_short(path, &resp, 2));
         }
 
         if NtStatus::from_u32(resp[0].0.status).is_error() {
@@ -1945,10 +1950,7 @@ impl SmbClient {
             .send_compound(vec![(h1, b1), (h2, b2), (h3, b3)])
             .await?;
         if resp.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "compound response too short",
-            ));
+            return Err(compound_too_short(path, &resp, 3));
         }
 
         if NtStatus::from_u32(resp[0].0.status).is_error() {
@@ -2016,10 +2018,7 @@ impl SmbClient {
             .send_compound(vec![(h1, b1), (h2, b2), (h3, b3)])
             .await?;
         if resp.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "compound response too short",
-            ));
+            return Err(compound_too_short(path, &resp, 3));
         }
 
         if NtStatus::from_u32(resp[0].0.status).is_error() {
@@ -2155,6 +2154,38 @@ pub(crate) fn effective_io_sizes(
         compound_max_read: max_read.min(65536),
         compound_max_write: max_write.min(65536),
     }
+}
+
+/// Map a short compound chain to a useful error.
+///
+/// Servers that abort a related chain on the first error often return only
+/// that first response (`NextCommand = 0`). Treating that as a generic
+/// "too short" loses the NTSTATUS (sharing violation, path not found, …) and
+/// makes overload look like a framing bug. Prefer the first error status when
+/// present; only then fall back to InvalidData.
+fn compound_too_short(path: &str, resp: &[(Header, Bytes)], expected: usize) -> io::Error {
+    if let Some((hdr, _)) = resp.first() {
+        if NtStatus::from_u32(hdr.status).is_error() {
+            return smb_status_to_io_error(hdr.status, path);
+        }
+        crate::serr!(
+            "[spiceio] compound response too short for {path}: got {} of {expected} \
+             (first status=0x{:08X})",
+            resp.len(),
+            hdr.status
+        );
+    } else {
+        crate::serr!(
+            "[spiceio] compound response too short for {path}: empty (expected {expected})"
+        );
+    }
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "compound response too short: got {} of {expected}",
+            resp.len()
+        ),
+    )
 }
 
 // ── SMB2 credit-window arithmetic (pure, unit-tested) ───────────────────────

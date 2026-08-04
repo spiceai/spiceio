@@ -159,15 +159,21 @@ HTTP request
 ## Development
 
 ```bash
-make                   # fmt + lint + test + build
+make                   # fmt + full CI-local gate
+make ci                # parity with GitHub Actions (lint + unit + live SMB suites)
 make release           # optimized release build
-make lint              # fmt-check + check + strict clippy + rustdoc warnings
-make test              # S3 API tests + sccache integration test
-make test-extended     # above + builds spiceai repo through sccache/spiceio
+make lint              # static only — not sufficient to claim CI will pass
+make test-unit         # cargo test (no SMB)
+make test              # sccache integration (requires SPICEIO_SMB_USER/PASS)
+make test-live         # sccache + extended + concurrent stress (CI live steps)
+make test-extended     # also builds spiceai repo through sccache/spiceio
 make clean             # cargo clean
 ```
 
-Tests require `SPICEIO_SMB_USER` and `SPICEIO_SMB_PASS` environment variables and access to an SMB server.
+Live tests require `SPICEIO_SMB_USER` and `SPICEIO_SMB_PASS` and access to an SMB
+server. **Run `make ci` with those credentials before merging** — custom HTTP
+benches are not a substitute for `scripts/test-sccache.sh` (which asserts
+sccache cache hits and zero write errors the same way CI does).
 
 ## How it compares
 

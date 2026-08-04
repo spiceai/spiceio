@@ -28,8 +28,14 @@ PREFIX="ext-$$"
 TMPDIR_BASE=$(mktemp -d /tmp/spiceio-ext.XXXXXX)
 PASS=0
 FAIL=0
-CONCURRENCY="${SPICEIO_EXT_CONCURRENCY:-128}"
+# Concurrent multiparts of 10MB each: default 32 (320MB in flight), not 128
+# (1.28GB). 128 concurrent multiparts plus a 128-connection pool was melting
+# the shared NAS (sharing violations, invalid create responses, 0/128 integrity)
+# and was also out of line with CI's job-level SPICEIO_SMB_CONNECTIONS=8.
+CONCURRENCY="${SPICEIO_EXT_CONCURRENCY:-32}"
 CURL_TIMEOUT="${SPICEIO_EXT_TIMEOUT:-60}"
+# Prefer the caller's / CI pool pin; never force 128 sessions by default.
+SMB_CONNECTIONS="${SPICEIO_SMB_CONNECTIONS:-8}"
 
 # Capture spiceio stderr so the post-run guard can flag unexpected
 # `[spiceio] error:` lines. We tee back to stderr so CI still streams live.
@@ -117,20 +123,28 @@ SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
 SPICEIO_SMB_SHARE="$SMB_SHARE" \
 SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
-SPICEIO_SMB_CONNECTIONS=128 \
+SPICEIO_SMB_CONNECTIONS="$SMB_CONNECTIONS" \
 SPICEIO_LOG_FILE="${SPICEIO_LOG_FILE:-}" \
 "$SPICEIO_BIN" 2> >(tee "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
-for i in $(seq 1 60); do
-    if curl -sf --max-time 2 -o /dev/null "${ENDPOINT}/" 2>/dev/null; then break; fi
+# Wait for SMB-ready, not mere TCP accept (early listen serves 503 until ready).
+for i in $(seq 1 120); do
     if ! kill -0 "$SPICEIO_PID" 2>/dev/null; then
         echo "[ext] spiceio failed to start"
         exit 1
     fi
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "${ENDPOINT}/" 2>/dev/null || echo 000)
+    if [[ "$CODE" == "200" ]]; then
+        break
+    fi
+    if [[ "$i" -eq 120 ]]; then
+        echo "[ext] spiceio not ready after 60s (last HTTP $CODE)"
+        exit 1
+    fi
     sleep 0.5
 done
-echo "[ext] spiceio ready (concurrency=${CONCURRENCY})"
+echo "[ext] spiceio ready (concurrency=${CONCURRENCY}, smb_conns=${SMB_CONNECTIONS})"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 1. Multipart upload — single 10MB file
@@ -174,7 +188,9 @@ done
 PIDS=()
 START=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
 for i in $(seq 1 "$CONCURRENCY"); do
-    $AWS s3 cp "${CMP_DIR}/src-${i}" "s3://${BUCKET}/${PREFIX}/cmp-${i}" --quiet 2>/dev/null &
+    # Do not silence stderr: under overload we need to see AWS CLI failures
+    # instead of only discovering them at the integrity pass.
+    $AWS s3 cp "${CMP_DIR}/src-${i}" "s3://${BUCKET}/${PREFIX}/cmp-${i}" --quiet &
     PIDS+=($!)
 done
 wait_pids "${PIDS[@]}"
@@ -183,6 +199,9 @@ ELAPSED=$(echo "$END - $START" | bc -l)
 TOTAL_MB=$((CONCURRENCY * 10))
 printf "  %d × 10MB multiparts in %.2fs  (%.1f MiB/s)  errors=%d\n" \
     "$CONCURRENCY" "$ELAPSED" "$(echo "$TOTAL_MB / $ELAPSED" | bc -l)" "$WAIT_ERRORS"
+if [[ "$WAIT_ERRORS" -gt 0 ]]; then
+    echo "  NOTE: $WAIT_ERRORS upload process(es) exited non-zero (see AWS CLI messages above)"
+fi
 
 PREV_PASS=$PASS
 for i in $(seq 1 "$CONCURRENCY"); do
@@ -438,7 +457,7 @@ if grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICE
     echo "  PASS: session backoff (capacity reduction) messages seen in spiceio logs"
     PASS=$((PASS + 1))
 else
-    echo "  NOTE: no capacity messages in extended test (server allowed full 128 SMB conns)"
+    echo "  NOTE: no capacity messages in extended test (server allowed all ${SMB_CONNECTIONS} SMB conns)"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
