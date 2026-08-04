@@ -15,14 +15,21 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::body::SpiceioBody;
 use super::headers::*;
 use super::multipart::MultipartStore;
+use super::object_cache::ObjectCache;
 use super::xml::{self, XmlWriter};
 use crate::smb::ops::ShareSession;
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+/// How long a non-overloaded request may wait for an SMB admission slot before
+/// we answer 503 instead of queueing forever inside the process.
+const ADMISSION_WAIT: Duration = Duration::from_secs(15);
 
 /// Shared application state passed to the router.
 pub struct AppState {
@@ -30,6 +37,29 @@ pub struct AppState {
     pub bucket: String,
     pub region: String,
     pub multipart: MultipartStore,
+    /// Caps concurrent S3 ops that hit the SMB pool. Sized from the pool
+    /// (`admission_limit`) so an sccache stampede cannot bury spiceio under
+    /// unbounded blocked handlers when the NAS is slow or overloaded.
+    pub smb_slots: Arc<Semaphore>,
+    /// GET body cache (etag-validated; optional immutable-key mode).
+    pub object_cache: Arc<ObjectCache>,
+}
+
+/// Acquire an SMB work slot, or fail with 503.
+///
+/// * Healthy: wait up to `ADMISSION_WAIT` so a short burst queues rather than
+///   fails.
+/// * Overloaded (recent reset/busy, or half the pool poisoned): **try** only —
+///   fail immediately with Retry-After so we stop amplifying the overload.
+async fn acquire_smb_slot(state: &AppState) -> Result<OwnedSemaphorePermit, ()> {
+    if state.share.is_overloaded() {
+        return state.smb_slots.clone().try_acquire_owned().map_err(|_| ());
+    }
+    match tokio::time::timeout(ADMISSION_WAIT, state.smb_slots.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        // Closed semaphore (process shutting down) or wait timed out.
+        _ => Err(()),
+    }
 }
 
 /// Handle an incoming S3 API request.
@@ -51,7 +81,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     let declared_len: Option<u64> = get_header(hdrs, "content-length").and_then(|v| v.parse().ok());
     let request_id = generate_request_id();
 
-    // CORS preflight
+    // CORS preflight — no SMB, no admission slot.
     if *method == Method::OPTIONS {
         return cors_preflight(&request_id, &state.region);
     }
@@ -63,7 +93,8 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     let key_decoded = percent_decode(raw_key);
     let key: &str = &key_decoded;
 
-    // Service-level operations (no bucket)
+    // Service-level operations (no bucket) — ListBuckets is in-memory and must
+    // stay available as a liveness probe even when the NAS is overloaded.
     if req_bucket.is_empty() {
         match *method {
             Method::GET | Method::HEAD => {
@@ -87,7 +118,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         }
     }
 
-    // Bucket must match our configured bucket
+    // Bucket must match our configured bucket (no SMB needed).
     if req_bucket != state.bucket {
         return with_common_headers(
             error_response(
@@ -99,8 +130,6 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             &state.region,
         );
     }
-
-    let share = &state.share;
 
     // Reject keys that could escape the share via `..` path traversal.
     if !key.is_empty() && key_has_traversal(key) {
@@ -114,6 +143,23 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             &state.region,
         );
     }
+
+    // Everything below talks to SMB. Hold an admission permit for the whole
+    // request so a saturated NAS cannot grow unbounded work inside the process.
+    let _smb_permit = match acquire_smb_slot(state).await {
+        Ok(p) => p,
+        Err(()) => {
+            return with_common_headers(
+                service_unavailable(
+                    "spiceio is at capacity waiting on the SMB backend; please retry.",
+                ),
+                &request_id,
+                &state.region,
+            );
+        }
+    };
+
+    let share = &state.share;
 
     // ── Bucket-level operations (no key) ────────────────────────────────
     if key.is_empty() {
@@ -138,7 +184,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             }
             Method::POST if has_query_flag(query, "delete") => {
                 match collect_body(body, declared_len).await {
-                    Ok(body) => handle_delete_objects(body, share).await,
+                    Ok(body) => handle_delete_objects(body, state).await,
                     Err(resp) => resp,
                 }
             }
@@ -271,16 +317,16 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     let resp = match *method {
-        Method::GET => handle_get_object(hdrs, share, key).await,
+        Method::GET => handle_get_object(hdrs, state, key).await,
         Method::PUT => {
             // CopyObject: PUT with x-amz-copy-source header
             if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
                 handle_copy_object(hdrs, state, key).await
             } else {
-                handle_put_object(body, declared_len, hdrs, share, key).await
+                handle_put_object(body, declared_len, hdrs, state, key).await
             }
         }
-        Method::DELETE => handle_delete_object(share, key).await,
+        Method::DELETE => handle_delete_object(state, key).await,
         Method::HEAD => handle_head_object(hdrs, share, key).await,
         _ => error_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -499,11 +545,90 @@ fn stream_channel_capacity(chunk_size: u32) -> usize {
     (STREAM_CHANNEL_MAX_BYTES / chunk_size_for_cap).clamp(1, crate::smb::ops::READ_PIPELINE_DEPTH)
 }
 
+/// Evaluate If-Match / If-None-Match / If-Modified-Since / If-Unmodified-Since
+/// for GetObject. Returns `Some(response)` when the request is fully handled
+/// (304 or 412); `None` means the caller should serve the body.
+fn conditional_get_short_circuit(
+    if_match: &Option<String>,
+    if_none_match: &Option<String>,
+    if_modified_since: &Option<String>,
+    if_unmodified_since: &Option<String>,
+    etag: &str,
+    last_modified: u64,
+) -> Option<Response<SpiceioBody>> {
+    if let Some(im) = if_match
+        && !etag_matches(im, etag)
+    {
+        return Some(error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "",
+        ));
+    }
+    if let Some(inm) = if_none_match
+        && etag_matches(inm, etag)
+    {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", etag)
+                .body(SpiceioBody::empty())
+                .unwrap(),
+        );
+    }
+    if if_none_match.is_none()
+        && let Some(ims) = if_modified_since
+        && let Some(since) = parse_http_date(ims)
+        && last_modified <= since
+    {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", etag)
+                .body(SpiceioBody::empty())
+                .unwrap(),
+        );
+    }
+    if if_match.is_none()
+        && let Some(ius) = if_unmodified_since
+        && let Some(since) = parse_http_date(ius)
+        && last_modified > since
+    {
+        return Some(error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "",
+        ));
+    }
+    None
+}
+
+fn cached_get_response(
+    meta_content_type: &str,
+    meta_last_modified: u64,
+    etag: &str,
+    body: Bytes,
+) -> Response<SpiceioBody> {
+    let last_modified = xml::epoch_to_http_date(meta_last_modified);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", meta_content_type)
+        .header("Content-Length", body.len().to_string())
+        .header("ETag", etag)
+        .header("Last-Modified", last_modified)
+        .header("Accept-Ranges", "bytes")
+        .header("x-spiceio-cache", "HIT")
+        .body(SpiceioBody::full(body))
+        .unwrap()
+}
+
 async fn handle_get_object(
     hdrs: &http::HeaderMap,
-    share: &ShareSession,
+    state: &AppState,
     key: &str,
 ) -> Response<SpiceioBody> {
+    let share = &state.share;
+    let cache = &state.object_cache;
     let range_header = get_header(hdrs, "range").map(String::from);
     let if_match = get_header(hdrs, IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
@@ -513,68 +638,152 @@ async fn handle_get_object(
     // ── Fast path: compound Create+Read+Close for small files ───────
     // Tries to read the entire file in one SMB round trip. Falls back to
     // streaming for large files or range requests.
+    //
+    // Body cache: after a successful compound (or open/stat) we may serve a
+    // previously cached body when the fresh etag matches — S3-safe because
+    // open/stat always hits the NAS first.
     let max_read = share.compound_max_read_size();
     let no_range = range_header.is_none();
 
     if no_range {
+        // Immutable-key soft path: if configured and we have a body, still
+        // verify with a cheap HEAD (stat) so multi-instance DELETE/overwrite
+        // is visible.
+        if cache.immutable()
+            && let Some((cached_etag, cached_body)) = cache.get_by_key(key)
+        {
+            match share.head_object(key).await {
+                Ok(meta) if meta.etag == cached_etag && meta.size == cached_body.len() as u64 => {
+                    let etag = format!("\"{}\"", meta.etag);
+                    if let Some(resp) = conditional_get_short_circuit(
+                        &if_match,
+                        &if_none_match,
+                        &if_modified_since,
+                        &if_unmodified_since,
+                        &etag,
+                        meta.last_modified,
+                    ) {
+                        return resp;
+                    }
+                    return cached_get_response(
+                        &meta.content_type,
+                        meta.last_modified,
+                        &etag,
+                        cached_body,
+                    );
+                }
+                Ok(_) => cache.invalidate(key), // etag/size changed
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    cache.invalidate(key);
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchKey",
+                        "The specified key does not exist.",
+                    );
+                }
+                Err(e) if crate::smb::ops::is_reset(&e) => {} // fall through
+                Err(e) => return io_to_s3_error(&e),
+            }
+        }
+
+        // Warm cache: open/stat revalidates etag without re-reading the body
+        // (compound would pay for a full Create+Read+Close even on a hit).
+        if cache.contains_key(key) {
+            match share.open_read(key).await {
+                Ok(handle) => {
+                    let meta = &handle.meta;
+                    let etag = format!("\"{}\"", meta.etag);
+                    if let Some(resp) = conditional_get_short_circuit(
+                        &if_match,
+                        &if_none_match,
+                        &if_modified_since,
+                        &if_unmodified_since,
+                        &etag,
+                        meta.last_modified,
+                    ) {
+                        let _ = handle.close().await;
+                        return resp;
+                    }
+                    if let Some(cached) = cache.get_if_etag(key, &meta.etag)
+                        && cached.len() as u64 == handle.file_size
+                    {
+                        let content_type = meta.content_type.clone();
+                        let last_modified = meta.last_modified;
+                        let _ = handle.close().await;
+                        return cached_get_response(&content_type, last_modified, &etag, cached);
+                    }
+                    // Stale entry — drop it and fall through (handle still open
+                    // for the streaming path below if compound is not usable).
+                    cache.invalidate(key);
+                    if handle.file_size > max_read as u64 {
+                        // Large warm-miss: reuse this open for streaming.
+                        return stream_get_object(
+                            handle,
+                            share,
+                            key,
+                            range_header.as_deref(),
+                            &if_match,
+                            &if_none_match,
+                            &if_modified_since,
+                            &if_unmodified_since,
+                            cache,
+                            true, // already evaluated conditionals
+                        )
+                        .await;
+                    }
+                    let _ = handle.close().await;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    cache.invalidate(key);
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchKey",
+                        "The specified key does not exist.",
+                    );
+                }
+                Err(e) if crate::smb::ops::is_reset(&e) => {}
+                Err(e) => return io_to_s3_error(&e),
+            }
+        }
+
         let result = share.get_object_compound(key, max_read).await;
         match result {
             Ok((meta, data)) if meta.size <= max_read as u64 => {
                 let etag = format!("\"{}\"", meta.etag);
 
-                if let Some(ref im) = if_match
-                    && !etag_matches(im, &etag)
-                {
-                    return error_response(
-                        StatusCode::PRECONDITION_FAILED,
-                        "PreconditionFailed",
-                        "At least one of the preconditions you specified did not hold.",
-                    );
+                if let Some(resp) = conditional_get_short_circuit(
+                    &if_match,
+                    &if_none_match,
+                    &if_modified_since,
+                    &if_unmodified_since,
+                    &etag,
+                    meta.last_modified,
+                ) {
+                    return resp;
                 }
-                if let Some(ref inm) = if_none_match
-                    && etag_matches(inm, &etag)
-                {
-                    return Response::builder()
-                        .status(StatusCode::NOT_MODIFIED)
-                        .header("ETag", &etag)
-                        .body(SpiceioBody::empty())
-                        .unwrap();
-                }
-                if if_none_match.is_none()
-                    && let Some(ref ims) = if_modified_since
-                    && let Some(since) = parse_http_date(ims)
-                    && meta.last_modified <= since
-                {
-                    return Response::builder()
-                        .status(StatusCode::NOT_MODIFIED)
-                        .header("ETag", &etag)
-                        .body(SpiceioBody::empty())
-                        .unwrap();
-                }
-                if if_match.is_none()
-                    && let Some(ref ius) = if_unmodified_since
-                    && let Some(since) = parse_http_date(ius)
-                    && meta.last_modified > since
-                {
-                    return error_response(
-                        StatusCode::PRECONDITION_FAILED,
-                        "PreconditionFailed",
-                        "At least one of the preconditions you specified did not hold.",
-                    );
-                }
+
+                // Insert on miss so subsequent GETs can revalidate without a
+                // body re-fetch. Prefer an existing matching entry when present.
+                let body_data = cache.get_if_etag(key, &meta.etag).unwrap_or_else(|| {
+                    if (data.len() as u64) <= cache.max_object_bytes() {
+                        cache.insert(key, &meta.etag, data.clone());
+                    }
+                    data
+                });
 
                 let last_modified = xml::epoch_to_http_date(meta.last_modified);
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", &meta.content_type)
-                    .header("Content-Length", data.len().to_string())
+                    .header("Content-Length", body_data.len().to_string())
                     .header("ETag", &etag)
                     .header("Last-Modified", last_modified)
                     .header("Accept-Ranges", "bytes")
-                    .body(SpiceioBody::full(data))
+                    .body(SpiceioBody::full(body_data))
                     .unwrap();
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                cache.invalidate(key);
                 return error_response(
                     StatusCode::NOT_FOUND,
                     "NoSuchKey",
@@ -594,6 +803,7 @@ async fn handle_get_object(
     let handle = match share.open_read(key).await {
         Ok(h) => h,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            cache.invalidate(key);
             return error_response(
                 StatusCode::NOT_FOUND,
                 "NoSuchKey",
@@ -603,67 +813,76 @@ async fn handle_get_object(
         Err(e) => return io_to_s3_error(&e),
     };
 
+    stream_get_object(
+        handle,
+        share,
+        key,
+        range_header.as_deref(),
+        &if_match,
+        &if_none_match,
+        &if_modified_since,
+        &if_unmodified_since,
+        cache,
+        false,
+    )
+    .await
+}
+
+/// Shared streaming GetObject path (large files, ranges, and warm-cache misses
+/// that already hold an open handle).
+#[allow(clippy::too_many_arguments)]
+async fn stream_get_object(
+    handle: crate::smb::ops::FileHandle,
+    share: &ShareSession,
+    key: &str,
+    range_header: Option<&str>,
+    if_match: &Option<String>,
+    if_none_match: &Option<String>,
+    if_modified_since: &Option<String>,
+    if_unmodified_since: &Option<String>,
+    cache: &Arc<ObjectCache>,
+    conditionals_done: bool,
+) -> Response<SpiceioBody> {
     let meta = &handle.meta;
     let etag = format!("\"{}\"", meta.etag);
 
-    // Conditional: If-Match
-    if let Some(ref im) = if_match
-        && !etag_matches(im, &etag)
+    if !conditionals_done
+        && let Some(resp) = conditional_get_short_circuit(
+            if_match,
+            if_none_match,
+            if_modified_since,
+            if_unmodified_since,
+            &etag,
+            meta.last_modified,
+        )
     {
         let _ = handle.close().await;
-        return error_response(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
-            "At least one of the preconditions you specified did not hold.",
-        );
+        return resp;
     }
 
-    // Conditional: If-None-Match → 304
-    if let Some(ref inm) = if_none_match
-        && etag_matches(inm, &etag)
+    let no_range = range_header.is_none();
+    // Full-object GET: etag-validated cache hit after open/stat — close the
+    // handle without reading the body from SMB.
+    if no_range
+        && let Some(cached) = cache.get_if_etag(key, &meta.etag)
+        && cached.len() as u64 == handle.file_size
     {
+        let content_type = meta.content_type.clone();
+        let last_modified = meta.last_modified;
         let _ = handle.close().await;
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header("ETag", &etag)
-            .body(SpiceioBody::empty())
-            .unwrap();
-    }
-
-    // Conditional: If-Modified-Since → 304
-    if if_none_match.is_none()
-        && let Some(ref ims) = if_modified_since
-        && let Some(since) = parse_http_date(ims)
-        && meta.last_modified <= since
-    {
-        let _ = handle.close().await;
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header("ETag", &etag)
-            .body(SpiceioBody::empty())
-            .unwrap();
-    }
-
-    // Conditional: If-Unmodified-Since
-    if if_match.is_none()
-        && let Some(ref ius) = if_unmodified_since
-        && let Some(since) = parse_http_date(ius)
-        && meta.last_modified > since
-    {
-        let _ = handle.close().await;
-        return error_response(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
-            "At least one of the preconditions you specified did not hold.",
-        );
+        return cached_get_response(&content_type, last_modified, &etag, cached);
     }
 
     let last_modified = xml::epoch_to_http_date(meta.last_modified);
     let content_type = meta.content_type.clone();
     let file_size = handle.file_size;
+    let cache_etag = meta.etag.clone();
+    let cache_key = key.to_string();
+    let may_fill_cache = no_range && file_size > 0 && file_size <= cache.max_object_bytes();
+    let cache_for_task = Arc::clone(cache);
 
     // Determine read range
-    let (start, end, is_range) = if let Some(ref range_str) = range_header {
+    let (start, end, is_range) = if let Some(range_str) = range_header {
         if let Some(range) = parse_range(range_str) {
             match range.resolve(file_size) {
                 Some((s, e)) => (s, e, true),
@@ -735,145 +954,244 @@ async fn handle_get_object(
     let resume_share = share.clone();
     let resume_key = key.to_string();
     let expected_size = file_size;
+    // Etag (size+mtime) must match on resume so a same-size overwrite cannot
+    // splice bytes from a different version into the already-committed body.
+    let expected_etag = cache_etag.clone();
 
     // Spawn background task to stream pipelined SMB reads into the channel.
-    // Sends batches of read requests to fill the network pipe, then pushes
-    // each chunk to the HTTP response body as it arrives.
+    //
+    // Double-buffer: while draining batch N into the HTTP channel, already
+    // issue batch N+1 on the same handle (stream lock is free between
+    // pipeline rounds). That overlaps channel backpressure with the next SMB
+    // RTT instead of serialising them.
     //
     // Resilience: once the 200/206 + Content-Length headers are committed we
     // can no longer fall back to a retryable 503, so a mid-stream connection
-    // drop on an overwhelmed NAS (reset or "early eof") would otherwise
-    // truncate the transfer. Instead we reconnect on a fresh pool connection —
-    // `read_pipeline` has already backed the adaptive read size off — and
-    // resume from the current offset, so the client sees one continuous
-    // transfer rather than a partial one it must retry. Bounded by
-    // MAX_GET_RESUMES; every delivered chunk refreshes the budget so only
-    // sustained failure aborts. The file size is re-verified on each reconnect
-    // so we never splice bytes from a file that changed underneath us.
+    // drop on an overwhelmed NAS reconnects and resumes from the current
+    // offset (bounded by MAX_GET_RESUMES).
     tokio::spawn(async move {
         const MAX_GET_RESUMES: u32 = 16;
-        // Heavy concurrent load can poison every pool connection at once, so a
-        // single reconnect attempt may find nothing live. Retry the re-open
-        // (each heals + briefly waits) so a GET rides out a transient
-        // all-connections-down window instead of aborting — symmetric with the
-        // write paths, and bounded to stay within the client's request timeout.
         const MAX_GET_REOPEN_TRIES: u32 = 12;
         let mut handle = handle;
         let mut chunk_size = chunk_size;
         let mut offset = start;
         let stream_end = end + 1;
         let mut resumes: u32 = 0;
-        'outer: while offset < stream_end {
-            let remaining = stream_end - offset;
-            match handle.read_pipeline(offset, chunk_size, remaining).await {
-                // An empty read while offset < stream_end means the object ended
-                // before its reported length. With a fixed Content-Length a clean
-                // break would emit a silently short body, so surface it as an
-                // aborted transfer instead.
-                Ok(chunks) if chunks.is_empty() => {
-                    crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
-                    let _ = tx
-                        .send(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "object ended before the expected length",
-                        )))
-                        .await;
+        let mut cache_buf: Option<Vec<u8>> = if may_fill_cache {
+            Some(Vec::with_capacity(file_size as usize))
+        } else {
+            None
+        };
+        let mut cache_ok = may_fill_cache;
+
+        // Helper: reopen after a reset, updating handle/chunk_size.
+        // Requires both size *and* etag so a same-size rewrite is rejected.
+        async fn reopen_for_resume(
+            resume_share: &ShareSession,
+            resume_key: &str,
+            expected_size: u64,
+            expected_etag: &str,
+            resumes: u32,
+            offset: u64,
+            stream_end: u64,
+        ) -> Result<(crate::smb::ops::FileHandle, u32), io::Error> {
+            if resumes > 1 {
+                tokio::time::sleep(Duration::from_millis(((resumes as u64) * 50).min(500))).await;
+            }
+            let mut reopened = resume_share.open_read(resume_key).await;
+            let mut rtry = 0u32;
+            while reopened.is_err() && rtry < MAX_GET_REOPEN_TRIES {
+                rtry += 1;
+                resume_share.heal().await;
+                tokio::time::sleep(Duration::from_millis((rtry as u64 * 150).min(750))).await;
+                reopened = resume_share.open_read(resume_key).await;
+            }
+            match reopened {
+                Ok(h) if h.file_size == expected_size && h.meta.etag == expected_etag => {
+                    let chunk = h.max_chunk;
+                    crate::slog!(
+                        "[spiceio] getobject resumed at {offset}/{stream_end} (attempt {resumes})"
+                    );
+                    Ok((h, chunk))
+                }
+                Ok(h) => {
+                    let got_size = h.file_size;
+                    let got_etag = h.meta.etag.clone();
+                    let _ = h.close().await;
+                    crate::serr!(
+                        "[spiceio] getobject resume aborted: size/etag changed \
+                         {expected_size}/{expected_etag} -> {got_size}/{got_etag}"
+                    );
+                    Err(io::Error::other("object changed during streaming read"))
+                }
+                Err(e) => {
+                    crate::serr!("[spiceio] getobject reconnect failed: {e}");
+                    Err(e)
+                }
+            }
+        }
+
+        // Prime the first batch.
+        let mut pending: Option<Vec<Bytes>> = None;
+        'outer: while offset < stream_end || pending.is_some() {
+            // Ensure we have a batch at `offset` (unless finishing a tail).
+            let chunks = if let Some(c) = pending.take() {
+                c
+            } else {
+                let remaining = stream_end - offset;
+                match handle.read_pipeline(offset, chunk_size, remaining).await {
+                    Ok(c) => c,
+                    Err(e) if crate::smb::ops::is_reset(&e) && resumes < MAX_GET_RESUMES => {
+                        resumes += 1;
+                        let _ = handle.close().await;
+                        match reopen_for_resume(
+                            &resume_share,
+                            &resume_key,
+                            expected_size,
+                            &expected_etag,
+                            resumes,
+                            offset,
+                            stream_end,
+                        )
+                        .await
+                        {
+                            Ok((h, cs)) => {
+                                handle = h;
+                                chunk_size = cs;
+                                continue 'outer;
+                            }
+                            Err(re) => {
+                                let _ = tx.send(Err(re)).await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        crate::serr!("[spiceio] getobject read error: {e}");
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            };
+
+            if chunks.is_empty() {
+                crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
+                cache_ok = false;
+                let _ = tx
+                    .send(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "object ended before the expected length",
+                    )))
+                    .await;
+                break 'outer;
+            }
+
+            // Advance the logical offset for the next prefetch based on this
+            // batch's sizes; drain and prefetch run concurrently below.
+            let batch_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+            if chunks.iter().any(|c| c.is_empty()) {
+                crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
+                cache_ok = false;
+                let _ = tx
+                    .send(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "object ended before the expected length",
+                    )))
+                    .await;
+                break 'outer;
+            }
+            let next_offset = offset + batch_bytes;
+            let need_prefetch = next_offset < stream_end;
+
+            // Double-buffer: drain this batch to HTTP while reading the next.
+            let drain = async {
+                let mut local_offset = offset;
+                for chunk in chunks {
+                    if let Some(ref mut buf) = cache_buf {
+                        buf.extend_from_slice(&chunk);
+                    }
+                    local_offset += chunk.len() as u64;
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        crate::serr!("[spiceio] getobject client disconnected");
+                        return Err(());
+                    }
+                }
+                Ok(local_offset)
+            };
+
+            let prefetch = async {
+                if !need_prefetch {
+                    return Ok(None);
+                }
+                let remaining = stream_end - next_offset;
+                match handle
+                    .read_pipeline(next_offset, chunk_size, remaining)
+                    .await
+                {
+                    Ok(c) => Ok(Some(c)),
+                    Err(e) => Err(e),
+                }
+            };
+
+            let (drain_res, pref_res) = tokio::join!(drain, prefetch);
+            match drain_res {
+                Ok(new_off) => {
+                    offset = new_off;
+                    resumes = 0;
+                }
+                Err(()) => {
+                    cache_ok = false;
                     break 'outer;
                 }
-                Ok(chunks) => {
-                    for chunk in chunks {
-                        if chunk.is_empty() {
-                            crate::serr!("[spiceio] getobject short read at {offset}/{stream_end}");
-                            let _ = tx
-                                .send(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "object ended before the expected length",
-                                )))
-                                .await;
-                            break 'outer;
-                        }
-                        offset += chunk.len() as u64;
-                        resumes = 0; // forward progress refreshes the resume budget
-                        if tx.send(Ok(chunk)).await.is_err() {
-                            crate::serr!("[spiceio] getobject client disconnected");
-                            break 'outer;
-                        }
-                    }
+            }
+
+            match pref_res {
+                Ok(next) => {
+                    pending = next;
                 }
                 Err(e) if crate::smb::ops::is_reset(&e) && resumes < MAX_GET_RESUMES => {
-                    // Transient mid-stream drop: reconnect and resume instead of
-                    // truncating. `read_pipeline` already backed off the read size.
+                    // Prefetch failed; data already drained is fine — resume
+                    // from the new offset on a fresh connection.
                     resumes += 1;
-                    // Pace consecutive resumes that aren't making progress so the
-                    // budget spreads across the client timeout window (catching a
-                    // recovery window) instead of spinning through all attempts in
-                    // well under a second. The first resume is immediate (a lone
-                    // transient drop recovers at once); forward progress resets
-                    // `resumes`, so an advancing transfer is never paced.
-                    if resumes > 1 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            ((resumes as u64) * 50).min(500),
-                        ))
-                        .await;
-                    }
-                    let _ = handle.close().await; // best-effort; may already be dead
-                    // open_read picks a non-poisoned connection, so the common
-                    // case (this connection dropped, the rest healthy) succeeds
-                    // on the first try. Under heavy contention the whole pool can
-                    // be momentarily poisoned, so retry with a heal + brief pause
-                    // until a connection comes back (bounded).
-                    let mut reopened = resume_share.open_read(&resume_key).await;
-                    let mut rtry = 0u32;
-                    while reopened.is_err() && rtry < MAX_GET_REOPEN_TRIES {
-                        rtry += 1;
-                        resume_share.heal().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            (rtry as u64 * 150).min(750),
-                        ))
-                        .await;
-                        reopened = resume_share.open_read(&resume_key).await;
-                    }
-                    match reopened {
-                        Ok(h) if h.file_size == expected_size => {
-                            chunk_size = h.max_chunk; // adopt the backed-off chunk
+                    let _ = handle.close().await;
+                    match reopen_for_resume(
+                        &resume_share,
+                        &resume_key,
+                        expected_size,
+                        &expected_etag,
+                        resumes,
+                        offset,
+                        stream_end,
+                    )
+                    .await
+                    {
+                        Ok((h, cs)) => {
                             handle = h;
-                            crate::slog!(
-                                "[spiceio] getobject resumed at {offset}/{stream_end} (attempt {resumes})"
-                            );
+                            chunk_size = cs;
+                            pending = None;
                             continue 'outer;
                         }
-                        Ok(h) => {
-                            // File changed underneath us — refuse to splice.
-                            // The old handle was already closed above, so end
-                            // the task rather than fall to the final close.
-                            let got = h.file_size;
-                            let _ = h.close().await;
-                            crate::serr!(
-                                "[spiceio] getobject resume aborted: size changed {expected_size} -> {got}"
-                            );
-                            let _ = tx
-                                .send(Err(io::Error::other(
-                                    "object changed during streaming read",
-                                )))
-                                .await;
-                            return;
-                        }
-                        Err(reopen_err) => {
-                            crate::serr!("[spiceio] getobject reconnect failed: {reopen_err}");
-                            let _ = tx.send(Err(reopen_err)).await;
+                        Err(re) => {
+                            let _ = tx.send(Err(re)).await;
                             return;
                         }
                     }
                 }
                 Err(e) => {
                     crate::serr!("[spiceio] getobject read error: {e}");
-                    // Propagate into the body so the client sees an aborted
-                    // transfer, not a silently truncated one.
                     let _ = tx.send(Err(e)).await;
-                    break 'outer;
+                    return;
                 }
             }
         }
+
+        if cache_ok
+            && let Some(buf) = cache_buf
+            && buf.len() as u64 == file_size
+        {
+            cache_for_task.insert(&cache_key, &cache_etag, Bytes::from(buf));
+        }
+
         let _ = handle.close().await;
     });
 
@@ -908,9 +1226,10 @@ async fn handle_put_object(
     mut body: Incoming,
     content_length: Option<u64>,
     hdrs: &http::HeaderMap,
-    share: &ShareSession,
+    state: &AppState,
     key: &str,
 ) -> Response<SpiceioBody> {
+    let share = &state.share;
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
     // Conditional write: If-None-Match: * means "only if not exists"
@@ -941,6 +1260,9 @@ async fn handle_put_object(
         };
         match share.put_object(key, &data).await {
             Ok(meta) => {
+                // Local overwrite must drop any prior body so a subsequent GET
+                // does not serve the old etag's bytes under a revalidation race.
+                state.object_cache.invalidate(key);
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header("ETag", format!("\"{}\"", meta.etag));
@@ -1010,6 +1332,8 @@ async fn handle_put_object(
         Ok(m) => m,
         Err(e) => return io_to_s3_error(&e),
     };
+
+    state.object_cache.invalidate(key);
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -1124,6 +1448,7 @@ async fn handle_copy_object(
 
     match share.copy_object(&src_key, dest_key).await {
         Ok(meta) => {
+            state.object_cache.invalidate(dest_key);
             let mut w = XmlWriter::new();
             w.declaration();
             w.open("CopyObjectResult");
@@ -1138,13 +1463,19 @@ async fn handle_copy_object(
 
 // ── DeleteObject ────────────────────────────────────────────────────────────
 
-async fn handle_delete_object(share: &ShareSession, key: &str) -> Response<SpiceioBody> {
-    match share.delete_object(key).await {
+async fn handle_delete_object(state: &AppState, key: &str) -> Response<SpiceioBody> {
+    match state.share.delete_object(key).await {
         // DeleteObject is idempotent: 204 for a successful delete and for a
         // missing object. Other errors (access denied, I/O) must surface so a
         // client never assumes a still-present object was deleted.
-        Ok(()) => ok_no_content(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => ok_no_content(),
+        Ok(()) => {
+            state.object_cache.invalidate(key);
+            ok_no_content()
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            state.object_cache.invalidate(key);
+            ok_no_content()
+        }
         Err(e) => io_to_s3_error(&e),
     }
 }
@@ -1219,7 +1550,8 @@ async fn handle_head_object(
 
 // ── Multi-object Delete ─────────────────────────────────────────────────────
 
-async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<SpiceioBody> {
+async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<SpiceioBody> {
+    let share = &state.share;
     let body_str = String::from_utf8_lossy(&body);
 
     // XML-entity-decode keys (a client escapes `&`,`<`,… in the request body);
@@ -1249,6 +1581,7 @@ async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<Sp
         }
         match share.delete_object(key).await {
             Ok(()) => {
+                state.object_cache.invalidate(key);
                 if !quiet {
                     w.open("Deleted");
                     w.element("Key", key);
@@ -1256,6 +1589,7 @@ async fn handle_delete_objects(body: Bytes, share: &ShareSession) -> Response<Sp
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                state.object_cache.invalidate(key);
                 if !quiet {
                     w.open("Deleted");
                     w.element("Key", key);
@@ -1741,6 +2075,8 @@ async fn handle_complete_multipart_upload(
         Err(e) => return io_to_s3_error(&e),
     };
 
+    state.object_cache.invalidate(key);
+
     // Only now remove the upload from the store
     let upload = state.multipart.complete(upload_id).await;
 
@@ -2125,6 +2461,11 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
         //   - ConnectionRefused: TCP connect refused (server unreachable or
         //     temporarily out of capacity/backlog); connect retry + healer
         //     handle it.
+        //
+        // Prefer absorbing these *inside* SMB ops (see `retry_read_open` /
+        // `retry_write_op`) so clients like sccache never see a temporary
+        // error on a one-shot HEAD/GET/PUT. This arm is the last resort when
+        // the retry budget is exhausted.
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::ResourceBusy
         | io::ErrorKind::BrokenPipe
@@ -2134,11 +2475,7 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
         | io::ErrorKind::TimedOut
         | io::ErrorKind::UnexpectedEof => {
             crate::slog!("[spiceio] transient (retry): {e}");
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "SlowDown",
-                "The request could not be completed; please retry.",
-            )
+            service_unavailable("The request could not be completed; please retry.")
         }
         _ => {
             crate::serr!("[spiceio] error: {e}");
@@ -2149,6 +2486,21 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
             )
         }
     }
+}
+
+/// 503 SlowDown with `Retry-After: 1` — used when the SMB backend is not yet
+/// ready at startup, and as the last-resort mapping for exhausted transient
+/// retries. sccache classifies temporary storage errors; returning a clean
+/// retryable status (rather than dropping the TCP connection) lets a client
+/// that retries the check succeed once the NAS is up.
+pub fn service_unavailable(message: &str) -> Response<SpiceioBody> {
+    let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", message);
+    // hyper Response builders don't re-open; insert on the built response.
+    resp.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_static("1"),
+    );
+    resp
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 //! SMB2 client — manages TCP connections and speaks the protocol.
 
 use bytes::Buf;
-use std::io;
+use std::io::{self, IoSlice};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -505,6 +505,67 @@ impl SmbClient {
         }
     }
 
+    /// Read one SMB2 frame (NetBIOS length + payload) without zero-filling the
+    /// payload buffer. `BytesMut::with_capacity` leaves capacity uninit;
+    /// `read_buf` fills it. On a 256 KiB pipelined read that saves a full
+    /// payload memset per response — free bandwidth the NAS can use instead.
+    ///
+    /// Timeout / EOF poison the connection the same way `read_exact_timeout`
+    /// does: the frame is incomplete, so the stream cannot be reused.
+    async fn read_frame(&self, stream: &mut TcpStream) -> io::Result<Bytes> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMB connection poisoned by an earlier transport error",
+            ));
+        }
+        let mut len_buf = [0u8; 4];
+        self.read_exact_timeout(stream, &mut len_buf).await?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
+            crate::serr!("[spiceio] smb invalid message length: {msg_len}");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid SMB2 message length: {msg_len}"),
+            ));
+        }
+        let mut msg = BytesMut::with_capacity(msg_len);
+        while msg.len() < msg_len {
+            if self.poisoned.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "SMB connection poisoned by an earlier transport error",
+                ));
+            }
+            match tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_buf(&mut msg)).await {
+                Ok(Ok(0)) => {
+                    self.poisoned.store(true, Ordering::Relaxed);
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "SMB connection closed mid-frame",
+                    ));
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    self.poisoned.store(true, Ordering::Relaxed);
+                    let _ = stream.shutdown().await;
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.poisoned.store(true, Ordering::Relaxed);
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "SMB server read timed out; connection poisoned",
+                    ));
+                }
+            }
+        }
+        // `read_buf` cannot overshoot `capacity`, which we set to `msg_len`.
+        Ok(msg.freeze())
+    }
+
     /// Write all of `buf` to the stream with a timeout. A server that stops
     /// draining its receive window under heavy concurrent write load would
     /// otherwise block `write_all` indefinitely (there is no OS write timeout),
@@ -528,6 +589,51 @@ impl SmbClient {
                 ))
             }
         }
+    }
+
+    /// Vectored write of all slices with the same timeout/poison policy as
+    /// `write_all_timeout`. Used by pipelined WRITE so payload bytes stay in
+    /// their original buffers (header || data per packet) instead of being
+    /// memcpy'd into one contiguous frame.
+    async fn write_vectored_all_timeout(
+        &self,
+        stream: &mut TcpStream,
+        mut bufs: &mut [IoSlice<'_>],
+    ) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "SMB connection poisoned by an earlier transport error",
+            ));
+        }
+        while !bufs.is_empty() {
+            // Skip leading empty slices so a zero-byte write is never issued.
+            if bufs[0].is_empty() {
+                bufs = &mut bufs[1..];
+                continue;
+            }
+            match tokio::time::timeout(SMB_WRITE_TIMEOUT, stream.write_vectored(bufs)).await {
+                Ok(Ok(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "SMB socket write returned 0 bytes",
+                    ));
+                }
+                Ok(Ok(n)) => {
+                    IoSlice::advance_slices(&mut bufs, n);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    self.poisoned.store(true, Ordering::Relaxed);
+                    let _ = stream.shutdown().await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "SMB server write timed out; connection poisoned",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Mark the connection poisoned and best-effort shut the socket down. A
@@ -582,20 +688,7 @@ impl SmbClient {
 
         // Read responses, looping past STATUS_PENDING interim responses
         loop {
-            let mut len_buf = [0u8; 4];
-            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                crate::serr!("[spiceio] smb invalid message length: {msg_len}");
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid SMB2 message length: {msg_len}"),
-                ));
-            }
-
-            let mut msg = vec![0u8; msg_len];
-            self.read_exact_timeout(&mut stream, &mut msg).await?;
+            let msg = self.read_frame(&mut stream).await?;
 
             let header = Header::decode(&msg).ok_or_else(|| {
                 crate::serr!("[spiceio] smb invalid header");
@@ -608,7 +701,7 @@ impl SmbClient {
                 continue;
             }
 
-            return Ok((header, Bytes::from(msg)));
+            return Ok((header, msg));
         }
     }
 
@@ -1227,19 +1320,9 @@ impl SmbClient {
         let mut eof_after = count; // trim to this length on EOF
 
         while received < count {
-            let mut len_buf = [0u8; 4];
-            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid SMB2 message length: {msg_len}"),
-                ));
-            }
-
-            let mut msg = vec![0u8; msg_len];
-            self.read_exact_timeout(&mut stream, &mut msg).await?;
+            // Non-zeroing frame read: capacity is uninit until the socket fills
+            // it, so a 256 KiB × 16 pipeline no longer pays 4 MiB of memset.
+            let msg = self.read_frame(&mut stream).await?;
 
             let header = Header::decode(&msg)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
@@ -1276,9 +1359,8 @@ impl SmbClient {
                 )));
             }
 
-            // Zero-copy: hand the full `msg` Vec to the decoder, which slices
-            // into it as `Bytes` without an extra body copy. For 64KB chunks
-            // pipelined 64 deep this saves ~4 MiB of memcpy per batch.
+            // Zero-copy: the frame is already `Bytes`; the decoder slices the
+            // payload out without a body memcpy.
             let data = decode_read_response_from_msg(msg).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid read response")
             })?;
@@ -1380,9 +1462,10 @@ impl SmbClient {
     /// all responses. Holds the stream lock for the entire batch, eliminating
     /// per-request round-trip latency. Returns total bytes written.
     ///
-    /// Coalesces all packets into a single contiguous buffer and signs each
-    /// in-place — one allocation, one `write_all` syscall for the whole batch.
-    /// Responses may arrive out of order; each is matched by message_id.
+    /// Headers are packed into one small buffer and signed with multi-slice
+    /// CMAC over `header || payload`; the payload is writev'd from the caller's
+    /// slices (no data memcpy into the frame). Responses may arrive out of
+    /// order; each is matched by message_id.
     pub async fn pipelined_write(
         &self,
         tree_id: u32,
@@ -1427,20 +1510,17 @@ impl SmbClient {
         let n = chunks.len();
         let base_msg_id = self.alloc_msg_ids(total_charge);
 
-        // Each packet: 4 (NetBIOS length) + SMB2_HEADER_SIZE (64) + 48
-        // (write request fixed part) + chunk data.
+        // Header-only framing: 4 (NetBIOS) + SMB2_HEADER_SIZE (64) + 48
+        // (write request fixed part). Payload rides as a separate IoSlice.
         const WRITE_REQUEST_FIXED: usize = 48;
-        let total_bytes: usize = chunks
-            .iter()
-            .map(|c| 4 + SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED + c.len())
-            .sum();
-        let mut buf = BytesMut::with_capacity(total_bytes);
-        let mut packet_starts: Vec<usize> = Vec::with_capacity(n + 1);
+        const HEADER_LEN: usize = 4 + SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED;
+        let mut headers = BytesMut::with_capacity(HEADER_LEN * n);
+        let mut header_starts: Vec<usize> = Vec::with_capacity(n + 1);
 
         let mut offset = start_offset;
         let mut cum_charge = 0u64;
         for chunk in chunks.iter() {
-            packet_starts.push(buf.len());
+            header_starts.push(headers.len());
             let msg_id = base_msg_id + cum_charge;
             cum_charge += credit_charge_for(chunk.len() as u32) as u64;
             let mut hdr =
@@ -1449,44 +1529,41 @@ impl SmbClient {
             hdr.tree_id = tree_id;
 
             let packet_smb_total = SMB2_HEADER_SIZE + WRITE_REQUEST_FIXED + chunk.len();
-            buf.put_u32((packet_smb_total as u32) & 0x00FF_FFFF);
-            hdr.encode(&mut buf);
-            encode_write_request(&mut buf, file_id, offset, chunk);
+            headers.put_u32((packet_smb_total as u32) & 0x00FF_FFFF);
+            hdr.encode(&mut headers);
+            encode_write_request_header(&mut headers, file_id, offset, chunk.len() as u32);
             offset += chunk.len() as u64;
         }
-        packet_starts.push(buf.len());
+        header_starts.push(headers.len());
 
-        // Sign each packet in-place. We pre-allocated exact capacity, so the
-        // earlier slices are still valid (no realloc could have moved them).
+        // Sign each packet as header||payload without copying the payload.
         if let Some(ref key) = self.signing_key {
             for i in 0..n {
-                let start = packet_starts[i];
-                let end = packet_starts[i + 1];
-                sign_packet(&mut buf[start..end], key);
+                let start = header_starts[i];
+                let end = header_starts[i + 1];
+                sign_packet_parts(&mut headers[start..end], chunks[i], key);
             }
         }
 
+        // writev: [hdr0, data0, hdr1, data1, ...]
+        let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let start = header_starts[i];
+            let end = header_starts[i + 1];
+            slices.push(IoSlice::new(&headers[start..end]));
+            slices.push(IoSlice::new(chunks[i]));
+        }
+
         let mut stream = self.lock_stream().await;
-        self.write_all_timeout(&mut stream, &buf).await?;
+        self.write_vectored_all_timeout(&mut stream, &mut slices)
+            .await?;
         stream.flush().await?;
 
         // Receive all responses (handles out-of-order delivery)
         let mut total_written = 0u64;
         let mut received = 0usize;
         while received < n {
-            let mut len_buf = [0u8; 4];
-            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid SMB2 message length: {msg_len}"),
-                ));
-            }
-
-            let mut msg = vec![0u8; msg_len];
-            self.read_exact_timeout(&mut stream, &mut msg).await?;
+            let msg = self.read_frame(&mut stream).await?;
 
             let header = Header::decode(&msg)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header"))?;
@@ -1547,32 +1624,55 @@ impl SmbClient {
     }
 
     /// List directory contents.
+    ///
+    /// Pages the QUERY_DIRECTORY conversation under one stream lock. After each
+    /// non-final page the next request is written *before* the current page is
+    /// parsed, so parse CPU overlaps with the server's next-page RTT on wide
+    /// directories (1 MiB pages).
     pub async fn query_directory(
         &self,
         tree_id: u32,
         file_id: &[u8; 16],
         pattern: &str,
     ) -> io::Result<Vec<DirectoryEntry>> {
+        // Transport/framing errors poison; NTSTATUS protocol errors do not
+        // (the stream is still synchronized — we consumed the response).
+        match self.query_directory_io(tree_id, file_id, pattern).await {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::InvalidData
+                ) =>
+            {
+                self.poison().await;
+                Err(e)
+            }
+            other => other,
+        }
+    }
+
+    async fn query_directory_io(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        pattern: &str,
+    ) -> io::Result<Vec<DirectoryEntry>> {
         let mut all_entries = Vec::new();
-        let mut first = true;
+        let mut stream = self.lock_stream().await;
 
-        loop {
-            // The credit charge is computed from the *expected response* size,
-            // so asking for a large directory buffer must consume the matching
-            // credits — otherwise the batch exceeds the server's sequence
-            // window and it disconnects. Reserve first, then take the matching
-            // MessageId range.
-            let out_len = self.reserve_io_len(self.query_dir_buffer);
+        // Helper: allocate credits + build a signed packet.
+        let build_packet = |this: &Self, restart: bool| -> BytesMut {
+            let out_len = this.reserve_io_len(this.query_dir_buffer);
             let charge = credit_charge_for(out_len);
-            let msg_id = self.alloc_msg_ids(charge as u64);
+            let msg_id = this.alloc_msg_ids(charge as u64);
             let mut hdr = Header::new(Command::QueryDirectory, msg_id).with_credit_charge(out_len);
-            hdr.session_id = self.session_id;
+            hdr.session_id = this.session_id;
             hdr.tree_id = tree_id;
-
-            let restart = first;
-            first = false;
-
-            let packet = build_request(&hdr, |buf| {
+            let mut packet = build_request(&hdr, |buf| {
                 encode_query_directory_request(
                     buf,
                     file_id,
@@ -1582,8 +1682,33 @@ impl SmbClient {
                     out_len,
                 );
             });
+            if let Some(ref key) = this.signing_key {
+                sign_packet(&mut packet, key);
+            }
+            packet
+        };
 
-            let (resp_hdr, resp_body) = self.send_recv(&packet).await?;
+        // Send the first page (restart = true).
+        {
+            let packet = build_packet(self, true);
+            self.write_all_timeout(&mut stream, &packet).await?;
+            stream.flush().await?;
+        }
+
+        loop {
+            // Read response (skip STATUS_PENDING interim replies).
+            let (resp_hdr, msg) = loop {
+                let msg = self.read_frame(&mut stream).await?;
+                let header = Header::decode(&msg).ok_or_else(|| {
+                    crate::serr!("[spiceio] smb invalid header");
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid SMB2 header")
+                })?;
+                self.harvest_credits(&header);
+                if header.status == 0x0000_0103 {
+                    continue;
+                }
+                break (header, msg);
+            };
             let status = NtStatus::from_u32(resp_hdr.status);
 
             if status == NtStatus::NoMoreFiles {
@@ -1600,7 +1725,16 @@ impl SmbClient {
                 )));
             }
 
-            // Parse the output buffer from the response body
+            // Prefetch: write the next page request before parsing this one so
+            // the server is already working while we walk entries. The final
+            // STATUS_NO_MORE_FILES response is expected and cheap.
+            {
+                let packet = build_packet(self, false);
+                self.write_all_timeout(&mut stream, &packet).await?;
+                stream.flush().await?;
+            }
+
+            let resp_body = &msg[SMB2_HEADER_SIZE..];
             if resp_body.len() >= 9 {
                 let buf_offset = (&resp_body[2..4] as &[u8]).get_u16_le() as usize;
                 let buf_length = (&resp_body[4..8] as &[u8]).get_u32_le() as usize;
@@ -1686,20 +1820,7 @@ impl SmbClient {
 
         // Read response frames, skipping STATUS_PENDING interim responses
         loop {
-            let mut len_buf = [0u8; 4];
-            self.read_exact_timeout(&mut stream, &mut len_buf).await?;
-            let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-            if !(SMB2_HEADER_SIZE..=16 * 1024 * 1024).contains(&msg_len) {
-                crate::serr!("[spiceio] smb invalid message length: {msg_len}");
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid SMB2 message length: {msg_len}"),
-                ));
-            }
-
-            let mut msg = vec![0u8; msg_len];
-            self.read_exact_timeout(&mut stream, &mut msg).await?;
+            let msg = self.read_frame(&mut stream).await?;
 
             // Single STATUS_PENDING interim — skip, but bank its credit grant
             if let Some(h) = Header::decode(&msg)
@@ -1711,7 +1832,7 @@ impl SmbClient {
             }
 
             // Each message of the compound chain carries its own grant.
-            let responses = parse_compound_response(&Bytes::from(msg));
+            let responses = parse_compound_response(&msg);
             for (h, _) in &responses {
                 self.harvest_credits(h);
             }
@@ -2081,6 +2202,14 @@ fn credit_affordable_bytes(balance: i64) -> u32 {
 /// Sign an SMB2 packet in-place. `packet` includes the 4-byte NetBIOS header.
 /// Sets the SMB2_FLAGS_SIGNED bit and computes AES-128-CMAC over the SMB2 message.
 fn sign_packet(packet: &mut [u8], key: &[u8; 16]) {
+    sign_packet_parts(packet, &[], key);
+}
+
+/// Sign an SMB2 packet whose payload is a separate slice (WRITE path).
+/// `header` is NetBIOS + SMB2 header + fixed request body; `payload` is the
+/// data that logically follows it on the wire. CMAC is over the concatenated
+/// SMB2 message (header without NetBIOS || payload).
+fn sign_packet_parts(header: &mut [u8], payload: &[u8], key: &[u8; 16]) {
     use crate::crypto;
 
     const NETBIOS_HEADER: usize = 4;
@@ -2088,18 +2217,22 @@ fn sign_packet(packet: &mut [u8], key: &[u8; 16]) {
     const SIGNATURE_OFFSET: usize = NETBIOS_HEADER + 48; // Signature at header offset 48
 
     // Set SMB2_FLAGS_SIGNED (0x00000008)
-    let flags = u32::from_le_bytes(packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].try_into().unwrap());
-    packet[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&(flags | 0x0000_0008).to_le_bytes());
+    let flags = u32::from_le_bytes(header[FLAGS_OFFSET..FLAGS_OFFSET + 4].try_into().unwrap());
+    header[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&(flags | 0x0000_0008).to_le_bytes());
 
     // Zero the signature field
-    packet[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].fill(0);
+    header[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].fill(0);
 
-    // Compute AES-128-CMAC over the SMB2 message (skip NetBIOS header)
-    let smb2_msg = &packet[NETBIOS_HEADER..];
-    let signature = crypto::aes128_cmac(key, smb2_msg);
+    // Compute AES-128-CMAC over the SMB2 message (skip NetBIOS header) + payload.
+    let smb2_hdr = &header[NETBIOS_HEADER..];
+    let signature = if payload.is_empty() {
+        crypto::aes128_cmac(key, smb2_hdr)
+    } else {
+        crypto::aes128_cmac_parts(key, &[smb2_hdr, payload])
+    };
 
     // Write the signature
-    packet[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
+    header[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].copy_from_slice(&signature);
 }
 
 /// Update preauth integrity hash: hash = SHA-512(hash || message_bytes).

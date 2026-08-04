@@ -4,7 +4,7 @@ use hyper::Request;
 use hyper::body::Incoming;
 use std::env;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -18,6 +18,7 @@ use spiceio::slog;
 use spiceio::smb;
 
 use s3::multipart::MultipartStore;
+use s3::object_cache::ObjectCache;
 use s3::router::AppState;
 use smb::client::SmbConfig;
 use smb::ops::ShareSession;
@@ -136,6 +137,49 @@ fn default_pool_size() -> usize {
         .clamp(4, 12)
 }
 
+/// One attempt to stand up the SMB pool + share session + startup cleanup.
+/// Failures are returned to the caller for retry — they must not take the
+/// HTTP listener down.
+async fn connect_share(
+    smb_config: SmbConfig,
+    smb_connections: usize,
+    smb_share: &str,
+    cleanup_grace_secs: u64,
+    bucket_name: String,
+    region: String,
+) -> Result<Arc<AppState>, std::io::Error> {
+    let pool = SmbPool::connect(smb_config, smb_connections).await?;
+    let admission = pool.admission_limit();
+    // Shared with the pool so capacity shrinks reduce available permits.
+    let smb_slots = pool.admission();
+    let share = ShareSession::connect(pool, smb_share, cleanup_grace_secs).await?;
+    let share = Arc::new(share);
+    // Clean up orphaned WAL temps / stale multipart dirs from prior crashes
+    // (the in-memory upload map does not survive a restart).
+    share.cleanup_previous_runs().await;
+    let object_cache = Arc::new(ObjectCache::from_env());
+    slog!("[spiceio] admission limit {admission} concurrent SMB ops (pool×work-depth)");
+    if object_cache.immutable() {
+        slog!(
+            "[spiceio] object cache: immutable-keys mode on, max_object={}B",
+            object_cache.max_object_bytes()
+        );
+    } else {
+        slog!(
+            "[spiceio] object cache: etag-validated, max_object={}B",
+            object_cache.max_object_bytes()
+        );
+    }
+    Ok(Arc::new(AppState {
+        share,
+        bucket: bucket_name,
+        region,
+        multipart: MultipartStore::new(),
+        smb_slots,
+        object_cache,
+    }))
+}
+
 #[tokio::main]
 async fn main() {
     if env::args().any(|a| a == "--version" || a == "-V") {
@@ -196,6 +240,15 @@ async fn main() {
         }
     };
 
+    // Gate for the HTTP handler: empty while the SMB pool is still connecting,
+    // published once the share is live. `OnceLock` is a one-shot publish — no
+    // per-request lock after readiness. Serving TCP *before* SMB is ready is
+    // what keeps sccache (and other S3 clients) from seeing "Connection
+    // refused" during a slow NAS connect — they get a 503 SlowDown they can
+    // retry instead of a hard TCP error that aborts server startup.
+    let ready: Arc<OnceLock<Arc<AppState>>> = Arc::new(OnceLock::new());
+
+    slog!("[spiceio] accepting connections on http://{bind_addr} (connecting to SMB…)");
     slog!(
         "[spiceio] connecting to smb://****@{}:{}/{} ({}x)",
         config.smb_server,
@@ -203,150 +256,134 @@ async fn main() {
         config.smb_share,
         config.smb_connections,
     );
-
-    // Flush the startup lines to disk before the (possibly slow) SMB connect: on
-    // an overloaded NAS the connect can block, and these lines are the
-    // breadcrumb that shows where startup stalled. Without this the async log
-    // buffer holds them and a hung startup leaves an empty log to diagnose from.
+    // Flush so the setup action / CI can see the bind address immediately,
+    // even if the NAS connect stalls for a long time.
     log::flush(Duration::from_millis(200));
 
-    // Connect SMB connection pool
-    let smb_config = SmbConfig {
-        server: config.smb_server.clone(),
-        port: config.smb_port,
-        username: config.smb_username.clone(),
-        password: config.smb_password.clone(),
-        domain: config.smb_domain.clone(),
-        workstation: "SPICEIO".into(),
-        max_io_size: config.smb_max_io,
-    };
-
-    // Startup connection failures are operational errors, not crashes —
-    // report them cleanly (server, share, cause) and exit nonzero.
-    let pool = match SmbPool::connect(smb_config, config.smb_connections).await {
-        Ok(p) => p,
-        Err(e) => {
-            serr!(
-                "[spiceio] failed to connect to SMB server {}:{}: {e}",
-                config.smb_server,
-                config.smb_port
-            );
-            flush_and_exit(1);
-        }
-    };
-
-    let share =
-        match ShareSession::connect(pool, &config.smb_share, config.cleanup_grace_secs).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                serr!(
-                    "[spiceio] failed to connect to SMB share '{}': {e}",
-                    config.smb_share
-                );
-                flush_and_exit(1);
-            }
+    // Connect SMB in the background with unbounded retry. A flaky or rebooting
+    // NAS must not take the HTTP listener down — that is the connection-refused
+    // failure mode sccache hits when spiceio exits (or has not yet bound).
+    {
+        let ready = Arc::clone(&ready);
+        let smb_config = SmbConfig {
+            server: config.smb_server.clone(),
+            port: config.smb_port,
+            username: config.smb_username.clone(),
+            password: config.smb_password.clone(),
+            domain: config.smb_domain.clone(),
+            workstation: "SPICEIO".into(),
+            max_io_size: config.smb_max_io,
         };
+        let smb_server = config.smb_server.clone();
+        let smb_port = config.smb_port;
+        let smb_share = config.smb_share.clone();
+        let smb_connections = config.smb_connections;
+        let cleanup_grace_secs = config.cleanup_grace_secs;
+        let multipart_ttl_secs = config.multipart_ttl_secs;
+        let bucket_name = config.bucket_name.clone();
+        let region = config.region.clone();
+        let bind_addr_log = bind_addr;
 
-    // Clean up orphaned WAL temp files and stale multipart upload dirs from
-    // prior crashes (the in-memory upload map does not survive a restart).
-    share.cleanup_previous_runs().await;
-
-    let state = Arc::new(AppState {
-        share,
-        bucket: config.bucket_name.clone(),
-        region: config.region.clone(),
-        multipart: MultipartStore::new(),
-    });
-
-    slog!("[spiceio] listening on http://{bind_addr}");
-    slog!(
-        "[spiceio] bucket: {} region: {}",
-        config.bucket_name,
-        config.region
-    );
-
-    // Background pool healer — reconnect SMB connections poisoned by a
-    // transient outage so the pool recovers instead of degrading to a wedge,
-    // and probe idle connections so a session dropped during a quiet period is
-    // found (and healed) here rather than by the next client request.
-    {
-        let state = Arc::clone(&state);
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                state.share.heal().await;
-                state.share.keepalive();
-            }
-        });
-    }
-
-    // Background reaper — abort multipart uploads abandoned past the TTL,
-    // freeing their in-memory entry and temp files.
-    {
-        let state = Arc::clone(&state);
-        let ttl = config.multipart_ttl_secs;
-        // The heartbeat below is what keeps a live upload's marker looking
-        // recent, so its cadence must stay comfortably inside the cleanup
-        // grace period — otherwise lowering `SPICEIO_CLEANUP_GRACE_SECS`
-        // would silently reinstate the very bug the grace exists to prevent.
-        // Deriving it from the grace makes the two impossible to drift apart.
-        let reaper_interval = Duration::from_secs((config.cleanup_grace_secs / 3).clamp(30, 300));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(reaper_interval).await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let expired = state.multipart.reap_expired(now, ttl).await;
-                for upload in &expired {
-                    for part in upload.parts.values() {
-                        state.share.delete_temp(&part.temp_path).await;
+            let mut delay = Duration::from_secs(1);
+            let state = loop {
+                match connect_share(
+                    smb_config.clone(),
+                    smb_connections,
+                    &smb_share,
+                    cleanup_grace_secs,
+                    bucket_name.clone(),
+                    region.clone(),
+                )
+                .await
+                {
+                    Ok(state) => break state,
+                    Err(e) => {
+                        slog!(
+                            "[spiceio] SMB not ready ({}:{} / {}): {e}; retrying in {}s",
+                            smb_server,
+                            smb_port,
+                            smb_share,
+                            delay.as_secs()
+                        );
+                        log::flush(Duration::from_millis(100));
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(30));
                     }
-                    // Delete the initiate-time marker file too — without this
-                    // the directory is never empty and remove_dir fails, so
-                    // reaped upload dirs would pile up until the next restart.
-                    state
-                        .share
-                        .delete_temp(&MultipartStore::marker_path(&upload.upload_id))
-                        .await;
-                    state
-                        .share
-                        .remove_dir(&MultipartStore::temp_dir(&upload.upload_id))
-                        .await;
                 }
-                if !expired.is_empty() {
-                    slog!(
-                        "[spiceio] reaped {} abandoned multipart upload(s)",
-                        expired.len()
-                    );
-                }
+            };
 
-                // Heartbeat the uploads that survived: refreshing each marker
-                // keeps its directory looking recent, which is how another
-                // spiceio instance's startup cleanup tells "a live process
-                // owns this upload" from "leftovers of a crashed run" — even
-                // when a client goes quiet between parts. Touches run
-                // concurrently: they are independent, and serializing them
-                // would put N round trips back-to-back on connections the
-                // client requests are also using.
-                // Bounded fan-out: enough to overlap the round trips, not so
-                // much that a share with thousands of live uploads floods the
-                // pool the client requests are also using.
-                const MARKER_TOUCH_CONCURRENCY: usize = 8;
-                let live = state.multipart.upload_ids().await;
-                for batch in live.chunks(MARKER_TOUCH_CONCURRENCY) {
-                    let mut set = tokio::task::JoinSet::new();
-                    for id in batch {
-                        let state = Arc::clone(&state);
-                        let path = MultipartStore::marker_path(id);
-                        set.spawn(async move {
-                            let _ = state.share.write_temp(&path, b"").await;
-                        });
+            // Background pool healer — reconnect poisoned connections and probe
+            // idle ones so a session dropped during a quiet period is found
+            // here rather than by the next client request.
+            {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        state.share.heal().await;
+                        state.share.keepalive();
                     }
-                    while set.join_next().await.is_some() {}
-                }
+                });
             }
+
+            // Background reaper — abort multipart uploads abandoned past the TTL.
+            {
+                let state = Arc::clone(&state);
+                let ttl = multipart_ttl_secs;
+                let reaper_interval = Duration::from_secs((cleanup_grace_secs / 3).clamp(30, 300));
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(reaper_interval).await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let expired = state.multipart.reap_expired(now, ttl).await;
+                        for upload in &expired {
+                            for part in upload.parts.values() {
+                                state.share.delete_temp(&part.temp_path).await;
+                            }
+                            state
+                                .share
+                                .delete_temp(&MultipartStore::marker_path(&upload.upload_id))
+                                .await;
+                            state
+                                .share
+                                .remove_dir(&MultipartStore::temp_dir(&upload.upload_id))
+                                .await;
+                        }
+                        if !expired.is_empty() {
+                            slog!(
+                                "[spiceio] reaped {} abandoned multipart upload(s)",
+                                expired.len()
+                            );
+                        }
+
+                        const MARKER_TOUCH_CONCURRENCY: usize = 8;
+                        let live = state.multipart.upload_ids().await;
+                        for batch in live.chunks(MARKER_TOUCH_CONCURRENCY) {
+                            let mut set = tokio::task::JoinSet::new();
+                            for id in batch {
+                                let state = Arc::clone(&state);
+                                let path = MultipartStore::marker_path(id);
+                                set.spawn(async move {
+                                    let _ = state.share.write_temp(&path, b"").await;
+                                });
+                            }
+                            while set.join_next().await.is_some() {}
+                        }
+                    }
+                });
+            }
+
+            // Publish readiness. The setup action greps for "ready, listening"
+            // (not merely "accepting connections") before pointing sccache at us.
+            // OnceLock::set is one-shot; ignore a racing second set.
+            let _ = ready.set(state);
+            slog!("[spiceio] ready, listening on http://{bind_addr_log}");
+            slog!("[spiceio] bucket: {bucket_name} region: {region}");
+            log::flush(Duration::from_millis(200));
         });
     }
 
@@ -370,13 +407,23 @@ async fn main() {
     };
 
     // Serve until a stop signal arrives, then drain in-flight requests.
+    // Requests that arrive before SMB is ready get 503 SlowDown + Retry-After
+    // rather than a TCP refuse — sccache treats temporary storage errors as
+    // retryable, but a connection refusal fails server startup hard.
     http::serve(
         listener,
         http::ServeConfig::default(),
         shutdown,
         move |req: Request<Incoming>| {
-            let state = Arc::clone(&state);
-            async move { s3::router::handle_request(req, &state).await }
+            let ready = Arc::clone(&ready);
+            async move {
+                match ready.get() {
+                    Some(state) => s3::router::handle_request(req, state).await,
+                    None => s3::router::service_unavailable(
+                        "spiceio is still connecting to the SMB backend; please retry.",
+                    ),
+                }
+            }
         },
     )
     .await;

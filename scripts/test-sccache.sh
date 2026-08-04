@@ -295,7 +295,8 @@ SPICEIO_PID2=$!
 echo "[test] waiting for second spiceio instance..."
 ENDPOINT2=""
 for i in $(seq 1 30); do
-    ENDPOINT2=$(grep 'listening on' "$SPICEIO_LOG2" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
+    # Wait for SMB-ready ("ready, listening on"), not merely TCP-accepting.
+    ENDPOINT2=$(grep 'ready, listening on' "$SPICEIO_LOG2" 2>/dev/null | grep -o 'http://[^ ]*' | tail -1 || true)
     if [[ -n "$ENDPOINT2" ]] && curl -sf -o /dev/null "${ENDPOINT2}/" 2>/dev/null; then
         break
     fi

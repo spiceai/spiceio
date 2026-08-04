@@ -345,6 +345,15 @@ fn cbc_mac(key: &[u8; 16], head: &[u8], last: &[u8; 16]) -> Option<[u8; 16]> {
 
 /// Compute AES-128-CMAC (RFC 4493). Used for SMB 3.x message signing.
 pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+    aes128_cmac_parts(key, &[data])
+}
+
+/// AES-128-CMAC over a concatenation of slices without allocating a contiguous
+/// buffer. Used to sign SMB WRITE packets as `header || payload` so the write
+/// path does not memcpy the data into the signed frame.
+pub fn aes128_cmac_parts(key: &[u8; 16], parts: &[&[u8]]) -> [u8; 16] {
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+
     // Step 1: Generate subkeys
     let zero_block = [0u8; AES_BLOCK_SIZE];
     let l = aes128_ecb_block(key, &zero_block);
@@ -353,32 +362,38 @@ pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
     let k2 = dbl_block(&k1);
 
     // Step 2: Determine number of blocks
-    let n = if data.is_empty() {
+    let n = if total == 0 {
         1
     } else {
-        data.len().div_ceil(AES_BLOCK_SIZE)
+        total.div_ceil(AES_BLOCK_SIZE)
     };
-    let complete = !data.is_empty() && data.len().is_multiple_of(AES_BLOCK_SIZE);
+    let complete = total > 0 && total.is_multiple_of(AES_BLOCK_SIZE);
 
-    // Step 3: Build the last block
+    // Step 3: Build the last block from the logical concatenation of `parts`.
     let mut last = [0u8; AES_BLOCK_SIZE];
+    let last_start = (n - 1) * AES_BLOCK_SIZE;
     if complete {
-        let start = (n - 1) * AES_BLOCK_SIZE;
-        last.copy_from_slice(&data[start..start + AES_BLOCK_SIZE]);
+        copy_parts_range(parts, last_start, &mut last);
         xor_block(&mut last, &k1);
     } else {
-        // Pad with 10*
-        let start = (n - 1) * AES_BLOCK_SIZE;
-        let remaining = data.len() - start;
-        last[..remaining].copy_from_slice(&data[start..]);
+        let remaining = total.saturating_sub(last_start);
+        if remaining > 0 {
+            copy_parts_range(parts, last_start, &mut last[..remaining]);
+        }
         last[remaining] = 0x80;
-        // rest is already zero
         xor_block(&mut last, &k2);
     }
 
     // Step 4: CBC-MAC every block but the last, then the tweaked last block.
-    let head = &data[..(n - 1) * AES_BLOCK_SIZE];
-    if let Some(mac) = cbc_mac(key, head, &last) {
+    // Prefer a contiguous head when the message is a single slice (the common
+    // non-WRITE path) so we keep the fast CommonCrypto CBC pass.
+    let head_len = (n - 1) * AES_BLOCK_SIZE;
+    if parts.len() == 1 {
+        let head = &parts[0][..head_len];
+        if let Some(mac) = cbc_mac(key, head, &last) {
+            return mac;
+        }
+    } else if let Some(mac) = cbc_mac_parts(key, parts, head_len, &last) {
         return mac;
     }
 
@@ -388,15 +403,154 @@ pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
         crate::serr!("[spiceio] AES-CMAC streaming path unavailable; signing will be slow");
     }
     let mut x = [0u8; AES_BLOCK_SIZE];
+    let mut block = [0u8; AES_BLOCK_SIZE];
     for i in 0..n - 1 {
-        let start = i * AES_BLOCK_SIZE;
+        copy_parts_range(parts, i * AES_BLOCK_SIZE, &mut block);
         for j in 0..AES_BLOCK_SIZE {
-            x[j] ^= data[start + j];
+            x[j] ^= block[j];
         }
         x = aes128_ecb_block(key, &x);
     }
     xor_block(&mut last, &x);
     aes128_ecb_block(key, &last)
+}
+
+/// Copy `dst.len()` bytes starting at logical offset `start` across `parts`.
+fn copy_parts_range(parts: &[&[u8]], mut start: usize, dst: &mut [u8]) {
+    let mut out = 0usize;
+    for part in parts {
+        if start >= part.len() {
+            start -= part.len();
+            continue;
+        }
+        let take = (part.len() - start).min(dst.len() - out);
+        dst[out..out + take].copy_from_slice(&part[start..start + take]);
+        out += take;
+        start = 0;
+        if out == dst.len() {
+            return;
+        }
+    }
+    debug_assert_eq!(out, dst.len(), "copy_parts_range: short input");
+}
+
+/// CBC-MAC over a multi-slice head (whole number of AES blocks) + last block.
+fn cbc_mac_parts(
+    key: &[u8; 16],
+    parts: &[&[u8]],
+    head_len: usize,
+    last: &[u8; 16],
+) -> Option<[u8; 16]> {
+    debug_assert!(head_len.is_multiple_of(AES_BLOCK_SIZE));
+    let iv = [0u8; AES_BLOCK_SIZE];
+    let mut cryptor: CcCryptorRef = std::ptr::null_mut();
+    let status = unsafe {
+        CCCryptorCreate(
+            K_CC_ENCRYPT,
+            K_CC_ALGORITHM_AES128,
+            K_CC_OPTION_CBC_NO_PADDING,
+            key.as_ptr() as *const c_void,
+            AES_BLOCK_SIZE,
+            iv.as_ptr() as *const c_void,
+            &mut cryptor,
+        )
+    };
+    if status != K_CC_SUCCESS || cryptor.is_null() {
+        return None;
+    }
+
+    let mut scratch = [0u8; CMAC_CHUNK];
+    let mut moved = 0usize;
+    let mut ok = true;
+    let mut remaining = head_len;
+    let mut part_idx = 0usize;
+    let mut part_off = 0usize;
+    // Feed head bytes in block-aligned chunks from the slice stream. CommonCrypto
+    // accepts any multiple of the block size per Update; we pack into `scratch`
+    // only when a part boundary splits a chunk mid-way.
+    let mut pack = [0u8; CMAC_CHUNK];
+    let mut pack_len = 0usize;
+    while remaining > 0 && ok {
+        while part_idx < parts.len() && part_off >= parts[part_idx].len() {
+            part_idx += 1;
+            part_off = 0;
+        }
+        if part_idx >= parts.len() {
+            ok = false;
+            break;
+        }
+        let part = parts[part_idx];
+        let avail = (part.len() - part_off).min(remaining);
+        // Fast path: emit a full CMAC_CHUNK (or the remaining head) directly
+        // when this part can supply it and the pack buffer is empty.
+        if pack_len == 0 && avail >= AES_BLOCK_SIZE {
+            let take = avail.min(CMAC_CHUNK);
+            let take = take - (take % AES_BLOCK_SIZE); // block-align
+            if take > 0 {
+                let s = unsafe {
+                    CCCryptorUpdate(
+                        cryptor,
+                        part[part_off..].as_ptr() as *const c_void,
+                        take,
+                        scratch.as_mut_ptr() as *mut c_void,
+                        scratch.len(),
+                        &mut moved,
+                    )
+                };
+                if s != K_CC_SUCCESS {
+                    ok = false;
+                    break;
+                }
+                part_off += take;
+                remaining -= take;
+                continue;
+            }
+        }
+        // Pack across a part boundary into `pack` until we have a full chunk
+        // or have finished the head.
+        let room = (CMAC_CHUNK - pack_len).min(remaining);
+        let take = avail.min(room);
+        pack[pack_len..pack_len + take].copy_from_slice(&part[part_off..part_off + take]);
+        pack_len += take;
+        part_off += take;
+        remaining -= take;
+        if pack_len == CMAC_CHUNK || remaining == 0 {
+            debug_assert!(pack_len.is_multiple_of(AES_BLOCK_SIZE));
+            let s = unsafe {
+                CCCryptorUpdate(
+                    cryptor,
+                    pack.as_ptr() as *const c_void,
+                    pack_len,
+                    scratch.as_mut_ptr() as *mut c_void,
+                    scratch.len(),
+                    &mut moved,
+                )
+            };
+            if s != K_CC_SUCCESS {
+                ok = false;
+                break;
+            }
+            pack_len = 0;
+        }
+    }
+
+    let mut mac = [0u8; AES_BLOCK_SIZE];
+    if ok {
+        let s = unsafe {
+            CCCryptorUpdate(
+                cryptor,
+                last.as_ptr() as *const c_void,
+                AES_BLOCK_SIZE,
+                mac.as_mut_ptr() as *mut c_void,
+                AES_BLOCK_SIZE,
+                &mut moved,
+            )
+        };
+        ok = s == K_CC_SUCCESS && moved == AES_BLOCK_SIZE;
+    }
+
+    unsafe { CCCryptorRelease(cryptor) };
+    ok.then_some(mac)
 }
 
 /// Double a block in GF(2^128) with the AES-CMAC polynomial.
@@ -602,6 +756,22 @@ mod tests {
                 aes128_cmac(&key, &message),
                 decode_hex_array::<16>(expected)
             );
+            // Multi-slice must match the contiguous path for every split.
+            if message.len() >= 2 {
+                let mid = message.len() / 2;
+                assert_eq!(
+                    aes128_cmac_parts(&key, &[&message[..mid], &message[mid..]]),
+                    decode_hex_array::<16>(expected)
+                );
+            }
+            if message.len() >= 3 {
+                let a = message.len() / 3;
+                let b = 2 * message.len() / 3;
+                assert_eq!(
+                    aes128_cmac_parts(&key, &[&message[..a], &message[a..b], &message[b..]]),
+                    decode_hex_array::<16>(expected)
+                );
+            }
         }
     }
 

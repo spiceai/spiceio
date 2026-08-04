@@ -94,6 +94,10 @@ All configuration is via environment variables:
 | `SPICEIO_MULTIPART_TTL_SECS`  | no       | `86400`             | Age at which an abandoned multipart upload is reaped |
 | `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
 | `SPICEIO_LOG_FILE`            | no       | *(none)*            | Append logs to file (non-blocking) |
+| `SPICEIO_OBJECT_CACHE_BYTES`  | no       | `268435456` (256 MiB) | Max total GET body cache size |
+| `SPICEIO_OBJECT_CACHE_MAX_OBJECT` | no   | `4194304` (4 MiB)   | Max size of a single cached object |
+| `SPICEIO_OBJECT_CACHE_ENTRIES`| no       | `4096`              | Max body-cache entries |
+| `SPICEIO_IMMUTABLE_OBJECTS`   | no       | off                 | When `1`/`true`, allow key-only body-cache lookup after HEAD revalidation (content-addressed stores like sccache) |
 
 ## Supported S3 operations
 

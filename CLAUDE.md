@@ -39,6 +39,10 @@ The binary requires these environment variables:
 - `SPICEIO_MULTIPART_TTL_SECS` — age at which an abandoned multipart upload is reaped (default `86400`)
 - `SPICEIO_CLEANUP_GRACE_SECS` — startup cleanup leaves WAL temps / upload dirs newer than this alone (default `900`), so instances sharing one share don't delete each other's in-flight state; `0` restores a blanket sweep
 - `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
+- `SPICEIO_OBJECT_CACHE_BYTES` — max total GET body cache size (default `268435456` = 256 MiB)
+- `SPICEIO_OBJECT_CACHE_MAX_OBJECT` — max size of a single cached object (default `4194304` = 4 MiB)
+- `SPICEIO_OBJECT_CACHE_ENTRIES` — max cache entries (default `4096`)
+- `SPICEIO_IMMUTABLE_OBJECTS` — when `1`/`true`, allow key-only body lookup after a HEAD revalidation (content-addressed stores like sccache); default off (etag-validated only)
 
 ## Architecture
 
