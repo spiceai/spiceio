@@ -16,13 +16,39 @@ spiceio is an S3-compatible API proxy that translates S3 HTTP requests into SMB 
 ## Build & Run
 
 ```bash
-make                           # fmt + lint + test + build (default target)
+make                           # fmt + full CI-local gate (see make ci)
+make ci                        # **required before PR green** — parity with .github/workflows/ci.yml
 make release                   # optimized release build
-make lint                      # fmt-check + check + strict clippy + rustdoc warnings
-make test                      # sccache integration test (requires SPICEIO_SMB_USER/PASS)
+make lint                      # static only: fmt-check + check + clippy + rustdoc (NOT full CI)
+make test-unit                 # cargo test --locked (no SMB)
+make test                      # sccache integration only (requires SPICEIO_SMB_USER/PASS)
+make test-live                 # sccache + extended + stress (CI live steps)
 make fmt                       # auto-format
 make clean                     # cargo clean
 ```
+
+### PR / agent verification gate (do not skip)
+
+**`make lint` alone is not enough** to claim CI will pass. CI also runs unit tests
+and three live SMB suites (`test-sccache.sh`, `test-extended.sh`,
+`stress-concurrent.sh`) against the shared NAS.
+
+Before declaring a PR green when NAS credentials are available:
+
+```bash
+source /tmp/spiceio-bench-env.sh   # or export SPICEIO_SMB_USER/PASS/SERVER/SHARE
+make ci                           # or: ./scripts/ci-local.sh
+```
+
+Rules:
+
+- Custom curl benches / 10× stress **do not replace** `scripts/test-sccache.sh`.
+  That script asserts sccache **cache hits > 0 and write errors == 0** — the
+  exact failure mode unit tests and HTTP-only benches miss.
+- If `SPICEIO_SMB_USER`/`PASS` are set, `make ci` **requires** the live suites
+  (`CI_REQUIRE_LIVE=1` by default). Do not unset credentials to skip them.
+- Without credentials, `make ci` still runs lint + unit tests and prints SKIP
+  for live suites (set `CI_REQUIRE_LIVE=1` to force a hard fail).
 
 The binary requires these environment variables:
 - `SPICEIO_SMB_SERVER` (required) — SMB server hostname or IP
