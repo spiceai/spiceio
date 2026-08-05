@@ -1,0 +1,8 @@
+per-method status counts (pre-fix run):
+  DELETE  204  1162
+  GET     200  1126
+  GET     404  1211
+  PUT     200  1163
+  PUT     404  40
+<=64KiB (compound path): 618 PUTs, 0 non-200 (0.0%)
+>64KiB  (WAL stream path): 585 PUTs, 40 non-200 (6.8%)

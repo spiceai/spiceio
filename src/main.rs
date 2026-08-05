@@ -1,7 +1,7 @@
 //! spiceio — S3-compatible API proxy to SMB 3.1.1 file shares (macOS 26).
 
-use hyper::Request;
 use hyper::body::Incoming;
+use hyper::{Request, Response};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::signal;
 
+use spiceio::access_log;
 use spiceio::crash;
 use spiceio::http;
 use spiceio::log;
@@ -211,6 +212,21 @@ async fn main() {
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
+
+    // Opt-in per-request metrics side channel. Off unless SPICEIO_ACCESS_LOG
+    // names a file; the benchmark scripts turn it on to attribute latency to
+    // spiceio versus the client and the network.
+    let access_log_path = env::var("SPICEIO_ACCESS_LOG")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if access_log::init(access_log_path.as_deref())
+        && let Some(p) = access_log_path.as_deref()
+    {
+        slog!(
+            "[spiceio] access log: {p} \
+             (t_ms method status req_bytes resp_bytes head_us total_us path)"
+        );
+    }
 
     let config = Config::from_env();
 
@@ -417,12 +433,18 @@ async fn main() {
         move |req: Request<Incoming>| {
             let ready = Arc::clone(&ready);
             async move {
-                match ready.get() {
+                // `begin` returns None (and costs one atomic load) unless the
+                // access log is on; `finish` then hands the body straight back.
+                let observed = access_log::begin(&req);
+                let response = match ready.get() {
                     Some(state) => s3::router::handle_request(req, state).await,
                     None => s3::router::service_unavailable(
                         "spiceio is still connecting to the SMB backend; please retry.",
                     ),
-                }
+                };
+                let (parts, body) = response.into_parts();
+                let body = access_log::finish(observed, parts.status, body);
+                Response::from_parts(parts, body)
             }
         },
     )
@@ -430,5 +452,6 @@ async fn main() {
 
     // Push the final log lines (including the shutdown notice) to disk before
     // the process exits and takes the writer thread with it.
+    access_log::flush(Duration::from_millis(500));
     log::flush(Duration::from_millis(500));
 }

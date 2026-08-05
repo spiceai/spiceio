@@ -13,6 +13,17 @@ path = "src/lib.rs"
 name = "spiceio"
 path = "src/main.rs"
 
+# sccache-shaped load generator used by scripts/bench-sccache.sh. Behind a
+# feature so `make release` never builds it into the shipped artifact set,
+# while `--all-features` (what CI lints with) still type-checks it.
+[[bin]]
+name = "spiceio-loadgen"
+path = "src/bin/loadgen.rs"
+required-features = ["loadgen"]
+
+[features]
+loadgen = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 hyper = { version = "1", features = ["http1", "server"] }

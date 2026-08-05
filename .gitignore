@@ -1,1 +1,3 @@
 /target
+# Timestamped benchmark output. Committed baselines live in benches/baselines/.
+/benches/results

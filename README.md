@@ -94,6 +94,7 @@ All configuration is via environment variables:
 | `SPICEIO_MULTIPART_TTL_SECS`  | no       | `86400`             | Age at which an abandoned multipart upload is reaped |
 | `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
 | `SPICEIO_LOG_FILE`            | no       | *(none)*            | Append logs to file (non-blocking) |
+| `SPICEIO_ACCESS_LOG`          | no       | *(none)*            | Per-request TSV metrics log for benchmarking: `t_ms method status req_bytes resp_bytes head_us total_us path` |
 | `SPICEIO_OBJECT_CACHE_BYTES`  | no       | `268435456` (256 MiB) | Max total GET body cache size |
 | `SPICEIO_OBJECT_CACHE_MAX_OBJECT` | no   | `4194304` (4 MiB)   | Max size of a single cached object |
 | `SPICEIO_OBJECT_CACHE_ENTRIES`| no       | `4096`              | Max body-cache entries |
@@ -173,7 +174,23 @@ make clean             # cargo clean
 Live tests require `SPICEIO_SMB_USER` and `SPICEIO_SMB_PASS` and access to an SMB
 server. **Run `make ci` with those credentials before merging** — custom HTTP
 benches are not a substitute for `scripts/test-sccache.sh` (which asserts
-sccache cache hits and zero write errors the same way CI does).
+sccache cache hits and zero read/write errors the same way CI does).
+
+### sccache performance
+
+```bash
+make bench-sccache        # synthetic sccache-shaped load, concurrency sweep
+make bench-sccache-build  # real cargo builds: spiceio vs local disk vs no cache
+```
+
+Measurements, not gates — `make ci` never runs them. `bench-sccache` drives
+`spiceio-loadgen` over persistent keep-alive connections (how sccache actually
+talks to the proxy), sweeps concurrency, and reports p50/p90/p99/p99.9 and TTFB
+per operation class, alongside server-side per-request timings from
+`SPICEIO_ACCESS_LOG`. `bench-sccache-build` runs real `cargo build`s three ways
+and reads sccache's own per-hit and per-write latency, with a local-disk cache
+as the floor to measure the network backend against. Results land in
+`benches/results/`; committed reference runs are in `benches/baselines/`.
 
 ## How it compares
 

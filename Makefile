@@ -1,4 +1,5 @@
-.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended ci clean all
+.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended ci clean all \
+	loadgen bench-sccache bench-sccache-build bench-sccache-all
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
 # Prefer `make ci` explicitly when validating a PR — see CLAUDE.md.
@@ -30,7 +31,10 @@ lint: fmt-check check clippy doc
 
 # Unit tests only (no SMB).
 test-unit:
-	cargo test --locked
+	# --features loadgen so spiceio-loadgen's own tests run: they cover the
+	# per-operation status classifier that decides whether the load burst can
+	# see a failed write, and would silently not compile without it.
+	cargo test --locked --features loadgen
 
 # CI sccache integration (requires SPICEIO_SMB_USER/PASS). This is the gate
 # that custom curl benches do NOT replace.
@@ -49,6 +53,28 @@ test-extended: build test
 # while CI_REQUIRE_LIVE=1 (default when SMB creds are set).
 ci:
 	./scripts/ci-local.sh
+
+# ── sccache performance ─────────────────────────────────────────────────────
+#
+# Benchmarks, not gates: they measure, they do not pass or fail, and they are
+# never run by `make ci`. Both need SPICEIO_SMB_USER/PASS and write timestamped
+# results under benches/results/.
+
+# The load generator lives behind a feature so `make release` stays lean.
+loadgen:
+	cargo build --release --locked --features loadgen --bin spiceio-loadgen
+
+# Synthetic sccache-shaped load: concurrency sweep, latency percentiles, and
+# per-request server-side attribution from the access log.
+bench-sccache: release loadgen
+	./scripts/bench-sccache.sh
+
+# Real cargo builds through sccache, comparing spiceio against a local-disk
+# cache (the floor) and an uncached build (the ceiling).
+bench-sccache-build: release
+	./scripts/bench-sccache-build.sh
+
+bench-sccache-all: bench-sccache bench-sccache-build
 
 clean:
 	cargo clean

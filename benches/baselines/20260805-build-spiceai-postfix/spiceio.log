@@ -1,0 +1,61 @@
+2026-08-05T00:45:34.889Z [spiceio] v0.5.10 starting (pid 80894)
+2026-08-05T00:45:34.890Z [spiceio] access log: benches/results/build-20260805T004520Z/access-build.tsv (t_ms method status req_bytes resp_bytes head_us total_us path)
+2026-08-05T00:45:34.890Z [spiceio] accepting connections on http://127.0.0.1:18392 (connecting to SMB…)
+2026-08-05T00:45:34.890Z [spiceio] connecting to smb://****@192.168.3.148:445/ai_platform_dev (12x)
+2026-08-05T00:45:34.890Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.896Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.902Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.902Z [spiceio] smb tcp connected: 192.168.3.148:445
+2026-08-05T00:45:34.910Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.912Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.917Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.917Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.922Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.923Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.930Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.933Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.935Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.938Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.938Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.939Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.940Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.941Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.942Z [spiceio] negotiated SMB 0x0311, server_max=8192K io_cap=256K
+2026-08-05T00:45:34.944Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.945Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.949Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.949Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.951Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.951Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.956Z [spiceio] authenticated, signing key derived
+2026-08-05T00:45:34.956Z [spiceio] smb pool: 12 connections ready
+2026-08-05T00:45:34.985Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.016Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.048Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.094Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.130Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.164Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.198Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.228Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.258Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.288Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.321Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.350Z [spiceio] smb tree connected: \\192.168.3.148\ai_platform_dev
+2026-08-05T00:45:35.359Z [spiceio] admission limit 96 concurrent SMB ops (pool×work-depth)
+2026-08-05T00:45:35.359Z [spiceio] object cache: etag-validated, max_object=4194304B
+2026-08-05T00:45:35.359Z [spiceio] ready, listening on http://127.0.0.1:18392
+2026-08-05T00:45:35.359Z [spiceio] bucket: sccache-bench region: us-east-1
+2026-08-05T00:48:59.819Z [spiceio] first connection from 127.0.0.1
+2026-08-05T00:51:50.840Z [spiceio] write setup hit a missing path (attempt 1), dropping cached dirs and retrying: not found: .spiceio-wal\01785891110839789000-0532
+2026-08-05T00:53:21.278Z [spiceio] shutting down (SIGTERM)
+2026-08-05T00:53:21.278Z [spiceio] all connections drained
