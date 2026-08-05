@@ -1,4 +1,4 @@
-//! In-process object body cache with S3-safe revalidation.
+//! Object body cache with S3-safe revalidation, over two tiers.
 //!
 //! Entries are keyed by object key and validated by etag (size+mtime). A hit
 //! is only served after a fresh open/stat shows the same etag — so a peer
@@ -8,6 +8,18 @@
 //! Optional `immutable` mode serves a hit by key alone, with **no SMB round
 //! trip at all** — the only path in the proxy that answers a GET without
 //! touching the NAS. See [`ObjectCache::get_by_key`] for when that is sound.
+//!
+//! # Tiers
+//!
+//! L1 is this process's memory, bounded by [`DEFAULT_MAX_BYTES`]. L2 is
+//! [`crate::s3::spill::Spill`] — a directory on local disk shared by every
+//! spiceio instance on the machine, an order of magnitude larger and still an
+//! order of magnitude faster than the NAS. The `lookup_*` methods read through
+//! both and promote an L2 hit into L1; `store` writes to both.
+//!
+//! The sync methods (`get_if_etag`, `insert`, `invalidate`, …) address L1
+//! alone. They are what the tiered methods are built from, and what the unit
+//! tests exercise directly.
 //!
 //! # Why the LRU is indexed
 //!
@@ -22,10 +34,14 @@
 //! use-generation makes eviction a `pop_first` and touch an O(log n) reindex.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
+
+use super::spill::{DirtyEntry, Spill, SweepStats};
 
 /// Default max total cached body bytes (8 GiB).
 ///
@@ -93,12 +109,14 @@ pub struct CachedObject {
     pub body: Bytes,
 }
 
-/// Process-local GET body cache.
+/// GET body cache: process memory over an optional shared disk tier.
 pub struct ObjectCache {
     inner: Mutex<Inner>,
     /// When true, `get_by_key` may return a body without etag match (caller
     /// must still have decided that is safe for the deployment).
     immutable: bool,
+    /// L2 — the machine-wide disk spill, when configured.
+    spill: Option<Arc<Spill>>,
     max_bytes: u64,
     max_object_bytes: u64,
     max_entries: usize,
@@ -173,6 +191,7 @@ impl ObjectCache {
                 clock: 0,
             }),
             immutable,
+            spill: None,
             max_bytes,
             max_object_bytes,
             max_entries: max_entries.max(1),
@@ -215,6 +234,279 @@ impl ObjectCache {
 
     pub fn max_entries(&self) -> usize {
         self.max_entries
+    }
+
+    /// Attach the shared disk tier.
+    pub fn with_spill(mut self, spill: Arc<Spill>) -> Self {
+        self.spill = Some(spill);
+        self
+    }
+
+    pub fn spill(&self) -> Option<&Arc<Spill>> {
+        self.spill.as_ref()
+    }
+
+    // ── Tiered access ───────────────────────────────────────────────────
+    //
+    // Spill work runs on the blocking pool: these are file reads and writes,
+    // and letting one stall a runtime worker would stall unrelated requests.
+    // Each call is a single blocking hop — a miss costs one failed `open`,
+    // which is cheap against the backend read it is trying to avoid.
+
+    /// Etag-validated lookup across both tiers (the S3-safe path, after a stat).
+    pub async fn lookup_etag(&self, key: &str, etag: &str) -> Option<Bytes> {
+        if let Some(body) = self.get_if_etag(key, etag) {
+            return Some(body);
+        }
+        let spill = self.spill.as_ref()?;
+        let entry = read_spill(spill, key).await?;
+        if entry.etag != etag {
+            // On disk but superseded on the backend. Drop it now rather than
+            // re-reading and re-rejecting it on every future request.
+            let spill = Arc::clone(spill);
+            let key_owned = key.to_string();
+            let _ = tokio::task::spawn_blocking(move || spill.remove(&key_owned)).await;
+            return None;
+        }
+        self.promote(key, &entry);
+        self.note_hit(entry.body.len() as u64);
+        Some(entry.body)
+    }
+
+    /// Lookup by key alone across both tiers — immutable mode only.
+    pub async fn lookup_key(&self, key: &str) -> Option<CachedObject> {
+        if !self.immutable {
+            return None;
+        }
+        self.lookup_any(key).await
+    }
+
+    /// Lookup by key alone, without the immutable gate.
+    ///
+    /// Only for a key with an acknowledged write that has not reached the
+    /// backend: the cache *is* the authority for it, and revalidating would
+    /// compare against an object the NAS does not have yet. Everything else
+    /// must go through [`Self::lookup_etag`] or [`Self::lookup_key`].
+    pub async fn lookup_pending(&self, key: &str) -> Option<CachedObject> {
+        self.lookup_any(key).await
+    }
+
+    async fn lookup_any(&self, key: &str) -> Option<CachedObject> {
+        if let Some(hit) = self.get_any(key) {
+            self.note_hit(hit.body.len() as u64);
+            return Some(hit);
+        }
+        let spill = self.spill.as_ref()?;
+        let entry = read_spill(spill, key).await?;
+        self.promote(key, &entry);
+        self.note_hit(entry.body.len() as u64);
+        Some(CachedObject {
+            etag: entry.etag,
+            last_modified: entry.last_modified,
+            body: entry.body,
+        })
+    }
+
+    /// True if either tier may hold `key` — used to prefer a cheap stat
+    /// revalidation over a cold read that would re-fetch the body.
+    pub async fn may_hold(&self, key: &str) -> bool {
+        if self.contains_key(key) {
+            return true;
+        }
+        match self.spill.as_ref() {
+            Some(spill) => {
+                let spill = Arc::clone(spill);
+                let key = key.to_string();
+                tokio::task::spawn_blocking(move || spill.contains_key(&key))
+                    .await
+                    .unwrap_or(false)
+            }
+            None => false,
+        }
+    }
+
+    /// Insert into memory, and publish to the shared tier in the background.
+    ///
+    /// The disk write is not awaited: it is off the critical path of whatever
+    /// response is being built, and a failed spill write is a missing cache
+    /// entry, never a failed request. The same race L1 has always had applies —
+    /// a concurrent invalidate can be overtaken by an insert already in flight
+    /// — and is resolved the same way, by etag revalidation on the next read.
+    pub fn store(&self, key: &str, etag: &str, last_modified: u64, body: Bytes) {
+        self.insert(key, etag, last_modified, body.clone());
+        let Some(spill) = self.spill.as_ref() else {
+            return;
+        };
+        if body.len() as u64 > spill.max_object_bytes() {
+            return;
+        }
+        let spill = Arc::clone(spill);
+        let key = key.to_string();
+        let etag = etag.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = spill.put(&key, &etag, last_modified, &body, false) {
+                crate::serr!("[spiceio] spill write failed for {key}: {e}");
+            }
+        });
+    }
+
+    /// Drop a stale cached copy of `key` from both tiers, keeping any
+    /// journalled write.
+    ///
+    /// This is the invalidation a *revalidation failure* calls for — the
+    /// backend says the object is gone or has changed. A dirty spill entry is
+    /// not a stale copy: it is an acknowledged write the backend has not
+    /// received yet, quite possibly a peer instance's, and dropping it would
+    /// discard a write some client was told had succeeded.
+    pub async fn invalidate_stale(&self, key: &str) {
+        self.invalidate(key);
+        let Some(spill) = self.spill.as_ref() else {
+            return;
+        };
+        let spill = Arc::clone(spill);
+        let key = key.to_string();
+        let _ = tokio::task::spawn_blocking(move || spill.drop_clean(&key)).await;
+    }
+
+    /// Drop `key` from both tiers entirely, journalled write included.
+    ///
+    /// For an explicit DELETE or a wholesale replacement, where the object is
+    /// genuinely going away. Awaited, unlike [`Self::store`]: a DELETE that
+    /// returned 204 must not be followed by a GET that finds the body on disk.
+    pub async fn forget(&self, key: &str) {
+        self.invalidate(key);
+        let Some(spill) = self.spill.as_ref() else {
+            return;
+        };
+        let spill = Arc::clone(spill);
+        let key = key.to_string();
+        let _ = tokio::task::spawn_blocking(move || spill.remove(&key)).await;
+    }
+
+    /// Replace an entry's provisional metadata with the backend's, once an
+    /// asynchronous write has landed. No-op if the entry has since been
+    /// replaced — that body owns the key now, and carries its own metadata.
+    pub fn retag(&self, key: &str, from_etag: &str, to_etag: &str, last_modified: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.map.get_mut(key)
+            && e.etag == from_etag
+        {
+            e.etag = to_etag.to_string();
+            e.last_modified = last_modified;
+        }
+    }
+
+    /// Journal an acknowledged write to the shared tier, marked dirty. Returns
+    /// the body digest, which [`Self::spill_promote`] needs to prove it is
+    /// promoting the same bytes.
+    pub async fn spill_put_dirty(
+        &self,
+        key: &str,
+        etag: &str,
+        last_modified: u64,
+        body: &Bytes,
+    ) -> Option<[u8; 32]> {
+        let spill = self.spill.as_ref()?;
+        if body.len() as u64 > spill.max_object_bytes() {
+            return None;
+        }
+        let spill = Arc::clone(spill);
+        let key_owned = key.to_string();
+        // Journal the provisional metadata, not a placeholder: a peer instance
+        // reading this pending write off the shared tier answers a GET with it.
+        let etag = etag.to_string();
+        let body = body.clone();
+        match tokio::task::spawn_blocking(move || {
+            spill
+                .put(&key_owned, &etag, last_modified, &body, true)
+                .map(Some)
+        })
+        .await
+        {
+            Ok(Ok(sha)) => sha,
+            Ok(Err(e)) => {
+                crate::serr!("[spiceio] write-back journal failed for {key}: {e}");
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Mark a journalled write clean and give it the backend's metadata.
+    pub async fn spill_promote(
+        &self,
+        key: &str,
+        sha: [u8; 32],
+        etag: &str,
+        last_modified: u64,
+        body: &Bytes,
+    ) {
+        let Some(spill) = self.spill.as_ref() else {
+            return;
+        };
+        let spill = Arc::clone(spill);
+        let key_owned = key.to_string();
+        let etag = etag.to_string();
+        let body = body.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            spill.promote(&key_owned, &sha, &etag, last_modified, &body)
+        })
+        .await;
+        if let Ok(Err(e)) = res {
+            crate::serr!("[spiceio] spill promote failed for {key}: {e}");
+        }
+    }
+
+    /// Keys this process journalled dirty that have not reached the backend.
+    /// Unlike [`Self::spill_scan_dirty`], never includes a peer's entries.
+    pub fn spill_owned_dirty(&self) -> Vec<String> {
+        match self.spill.as_ref() {
+            Some(spill) => spill.owned_dirty_keys(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Read one entry off the shared tier by key, whatever its state.
+    pub async fn spill_read(&self, key: &str) -> Option<super::spill::SpillEntry> {
+        let spill = self.spill.as_ref()?;
+        read_spill(spill, key).await
+    }
+
+    /// Acknowledged writes on disk that never reached the backend.
+    /// Returns `(entries ready to replay, entries skipped for being too young)`.
+    pub async fn spill_scan_dirty(&self, min_age: Duration) -> (Vec<DirtyEntry>, usize) {
+        let Some(spill) = self.spill.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let spill = Arc::clone(spill);
+        tokio::task::spawn_blocking(move || spill.scan_dirty(min_age))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Enforce the shared tier's budget.
+    pub async fn spill_sweep(&self) -> Option<SweepStats> {
+        let spill = Arc::clone(self.spill.as_ref()?);
+        tokio::task::spawn_blocking(move || spill.sweep())
+            .await
+            .ok()
+    }
+
+    /// L1 lookup by key, ignoring the immutable gate.
+    fn get_any(&self, key: &str) -> Option<CachedObject> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let found = g.map.get(key).map(|e| CachedObject {
+            etag: e.etag.clone(),
+            last_modified: e.last_modified,
+            body: e.body.clone(),
+        })?;
+        g.touch(key);
+        Some(found)
+    }
+
+    /// Pull an L2 hit into L1 so the next read skips the disk entirely.
+    fn promote(&self, key: &str, entry: &super::spill::SpillEntry) {
+        self.insert(key, &entry.etag, entry.last_modified, entry.body.clone());
     }
 
     /// True if any entry exists for `key` (used to prefer open/stat revalidation
@@ -367,9 +659,139 @@ impl ObjectCache {
     }
 }
 
+/// Read one entry off the shared tier without blocking a runtime worker.
+async fn read_spill(spill: &Arc<Spill>, key: &str) -> Option<super::spill::SpillEntry> {
+    let spill = Arc::clone(spill);
+    let key = key.to_string();
+    tokio::task::spawn_blocking(move || spill.get(&key))
+        .await
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Tiered behaviour (L1 over a real spill directory) ────────────
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "spiceio-cache-test-{}-{tag}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tiered(immutable: bool, dir: &TempDir) -> ObjectCache {
+        let spill = Spill::open(&dir.0, "ns".into(), 1 << 20, 1 << 18).unwrap();
+        ObjectCache::new(immutable, 1 << 20, 1 << 18, 64).with_spill(Arc::new(spill))
+    }
+
+    #[tokio::test]
+    async fn a_spill_hit_is_promoted_into_memory() {
+        // The point of the disk tier: a body evicted from RAM (or written by a
+        // peer instance) is served without touching the NAS, and lands back in
+        // RAM so the next read skips the disk too.
+        let d = TempDir::new("promote");
+        let c = tiered(false, &d);
+        c.store("k", "e1", 7, Bytes::from_static(b"body"));
+        // Let the background spill write land, then evict from L1 only.
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            if c.spill().unwrap().contains_key("k") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c.invalidate("k");
+        assert!(c.get_if_etag("k", "e1").is_none(), "still in memory");
+
+        let hit = c.lookup_etag("k", "e1").await.expect("spill miss");
+        assert_eq!(&hit[..], b"body");
+        assert!(
+            c.get_if_etag("k", "e1").is_some(),
+            "a disk hit was not promoted into memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_spill_entry_is_dropped_not_served() {
+        let d = TempDir::new("stale");
+        let c = tiered(false, &d);
+        c.spill()
+            .unwrap()
+            .put("k", "old-etag", 1, b"old-body", false)
+            .unwrap();
+        assert!(c.lookup_etag("k", "new-etag").await.is_none());
+        // Dropped on the spot, so the next read does not re-fetch and re-reject.
+        assert!(!c.spill().unwrap().contains_key("k"));
+    }
+
+    #[tokio::test]
+    async fn forget_clears_both_tiers() {
+        // A DELETE that returned 204 must not be followed by a GET that finds
+        // the body still on disk.
+        let d = TempDir::new("forget");
+        let c = tiered(true, &d);
+        c.spill().unwrap().put("k", "e", 1, b"body", false).unwrap();
+        c.insert("k", "e", 1, Bytes::from_static(b"body"));
+        c.forget("k").await;
+        assert!(c.lookup_key("k").await.is_none());
+        assert!(!c.spill().unwrap().contains_key("k"));
+    }
+
+    #[tokio::test]
+    async fn may_hold_sees_the_disk_tier() {
+        let d = TempDir::new("may-hold");
+        let c = tiered(false, &d);
+        assert!(!c.may_hold("k").await);
+        c.spill().unwrap().put("k", "e", 1, b"body", false).unwrap();
+        assert!(c.may_hold("k").await);
+    }
+
+    #[tokio::test]
+    async fn lookup_pending_ignores_the_immutable_gate() {
+        // Pending keys are served by key in *both* modes: the cache is their
+        // only authority until the write reaches the backend.
+        let d = TempDir::new("pending");
+        let c = tiered(false, &d);
+        c.insert("k", "provisional", 1, Bytes::from_static(b"body"));
+        assert!(c.lookup_key("k").await.is_none(), "immutable gate leaked");
+        assert_eq!(&c.lookup_pending("k").await.unwrap().body[..], b"body");
+    }
+
+    #[test]
+    fn retag_adopts_backend_metadata_only_for_the_matching_body() {
+        let c = ObjectCache::new(false, 1 << 20, 1 << 18, 64);
+        c.insert("k", "provisional", 1, Bytes::from_static(b"body"));
+        c.retag("k", "provisional", "real", 999);
+        let hit = c.get_if_etag("k", "real").expect("etag not adopted");
+        assert_eq!(&hit[..], b"body");
+
+        // A newer body owns the key now; a late flush must not stamp the old
+        // write's backend metadata onto it.
+        c.insert("k", "newer", 2, Bytes::from_static(b"newer-body"));
+        c.retag("k", "provisional", "real", 999);
+        assert!(
+            c.get_if_etag("k", "real").is_none(),
+            "retagged a newer body"
+        );
+        assert!(c.get_if_etag("k", "newer").is_some());
+    }
 
     #[test]
     fn etag_miss_on_mismatch() {
