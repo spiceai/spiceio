@@ -1271,14 +1271,14 @@ async fn handle_put_object(
                 }
                 return builder.body(SpiceioBody::empty()).unwrap();
             }
-            Err(e) => return io_to_s3_error(&e),
+            Err(e) => return io_to_s3_write_error(&e),
         }
     }
 
     // ── Streaming path: buffered WAL write for large or unknown-size bodies ──
     let mut wal = match share.open_wal_write(key).await {
         Ok(w) => w,
-        Err(e) => return io_to_s3_error(&e),
+        Err(e) => return io_to_s3_write_error(&e),
     };
 
     let mut write_err = None;
@@ -1304,7 +1304,7 @@ async fn handle_put_object(
 
     if let Some(e) = write_err {
         wal.abort().await;
-        return io_to_s3_error(&e);
+        return io_to_s3_write_error(&e);
     }
 
     // A body that ended short of its declared Content-Length must not be
@@ -1330,7 +1330,7 @@ async fn handle_put_object(
     // Commit: flush remaining buffer, rename WAL temp → final path
     let meta = match wal.commit(share).await {
         Ok(m) => m,
-        Err(e) => return io_to_s3_error(&e),
+        Err(e) => return io_to_s3_write_error(&e),
     };
 
     state.object_cache.invalidate(key);
@@ -1457,7 +1457,9 @@ async fn handle_copy_object(
             w.close("CopyObjectResult");
             xml_response(StatusCode::OK, w.finish())
         }
-        Err(e) => io_to_s3_error(&e),
+        // Destination write: the source key was resolved above, so a missing
+        // path here is about where we are writing, not what we are reading.
+        Err(e) => io_to_s3_write_error(&e),
     }
 }
 
@@ -1699,7 +1701,7 @@ async fn handle_upload_part(
     let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
 
     if let Err(e) = state.share.write_temp(&temp_path, &body).await {
-        return io_to_s3_error(&e);
+        return io_to_s3_write_error(&e);
     }
 
     // The upload can be completed/aborted/reaped while the part body was
@@ -1922,7 +1924,9 @@ async fn handle_upload_part_copy(
             .await;
         }
         Ok(None) => {} // Not supported — fall through to streaming.
-        Err(e) => return io_to_s3_error(&e),
+        // Writes the part temp; the source key was validated above, so a
+        // missing path here is the destination and must stay retryable.
+        Err(e) => return io_to_s3_write_error(&e),
     }
 
     // Read exactly the validated range — bounded by the check above, so memory
@@ -1946,7 +1950,7 @@ async fn handle_upload_part_copy(
                     "The x-amz-copy-source-range is not satisfiable",
                 );
             }
-            Err(e) => return io_to_s3_error(&e),
+            Err(e) => return io_to_s3_write_error(&e),
         }
     };
 
@@ -1971,7 +1975,7 @@ async fn handle_upload_part_copy(
     };
 
     if let Err(e) = state.share.write_temp(&temp_path, &data).await {
-        return io_to_s3_error(&e);
+        return io_to_s3_write_error(&e);
     }
     finish_part_copy(
         state,
@@ -2072,7 +2076,7 @@ async fn handle_complete_multipart_upload(
 
     let meta = match state.share.assemble_parts(key, &parts).await {
         Ok(m) => m,
-        Err(e) => return io_to_s3_error(&e),
+        Err(e) => return io_to_s3_write_error(&e),
     };
 
     state.object_cache.invalidate(key);
@@ -2488,6 +2492,30 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
     }
 }
 
+/// Map an SMB error from an object-*write* path to an S3 response.
+///
+/// Identical to [`io_to_s3_error`] except for `NotFound`, which cannot mean
+/// what 404 NoSuchKey says it means: a PUT creates the key, so "the specified
+/// key does not exist" is never a truthful description of why the write failed.
+/// The real cause is a missing *path* — a parent directory that vanished, or a
+/// server that transiently could not resolve one — which is retryable, so it is
+/// reported as such.
+///
+/// This matters beyond tidiness. sccache records a 404 on write as a cache
+/// write error and moves on, so the artifact is silently never cached and the
+/// next build recompiles it, while the build itself still succeeds. A 503 is
+/// retried instead.
+///
+/// Only for the destination of a write. CopyObject's *source* lookup keeps
+/// [`io_to_s3_error`], where a missing key really is 404.
+fn io_to_s3_write_error(e: &io::Error) -> Response<SpiceioBody> {
+    if e.kind() == io::ErrorKind::NotFound {
+        crate::slog!("[spiceio] write path not found (reporting retryable): {e}");
+        return service_unavailable("The write could not be completed; please retry.");
+    }
+    io_to_s3_error(e)
+}
+
 /// 503 SlowDown with `Retry-After: 1` — used when the SMB backend is not yet
 /// ready at startup, and as the last-resort mapping for exhausted transient
 /// retries. sccache classifies temporary storage errors; returning a clean
@@ -2733,6 +2761,37 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "{kind:?} should map to 503"
             );
+        }
+    }
+
+    #[test]
+    fn io_to_s3_write_error_never_answers_404_for_a_missing_path() {
+        // A PUT creates the key, so NoSuchKey cannot describe why it failed.
+        // Answering 404 makes sccache record a cache write error and drop the
+        // artifact silently; 503 gets retried instead.
+        let resp =
+            io_to_s3_write_error(&io::Error::new(io::ErrorKind::NotFound, "not found: a\\b"));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn io_to_s3_write_error_leaves_every_other_kind_alone() {
+        // Only NotFound is reinterpreted; the write path must not soften real
+        // failures into retryable ones.
+        for (kind, expected) in [
+            (io::ErrorKind::PermissionDenied, StatusCode::FORBIDDEN),
+            (io::ErrorKind::ResourceBusy, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                io::ErrorKind::ConnectionReset,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                io::ErrorKind::InvalidData,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let resp = io_to_s3_write_error(&io::Error::new(kind, "x"));
+            assert_eq!(resp.status(), expected, "{kind:?}");
         }
     }
 

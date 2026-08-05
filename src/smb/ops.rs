@@ -459,7 +459,7 @@ impl ShareSession {
             let data = data.to_vec(); // ≤64 KiB compound cap
             let session = self.clone();
             let cl = self
-                .retry_write_op(|client, tree_id| {
+                .retry_write_op(&[&smb_path], |client, tree_id| {
                     let smb_path = smb_path.clone();
                     let data = data.clone();
                     let session = session.clone();
@@ -485,7 +485,7 @@ impl ShareSession {
         let chunk_size = self.pool.write_chunk_size() as usize;
         let session = self.clone();
         let write_ok = self
-            .retry_write_op(|client, tree_id| {
+            .retry_write_op(&[&smb_path], |client, tree_id| {
                 let smb_path = smb_path.clone();
                 let data = data_owned.clone();
                 let session = session.clone();
@@ -540,7 +540,7 @@ impl ShareSession {
     /// surface as a hard failure to the client.
     pub async fn delete_object(&self, key: &str) -> io::Result<()> {
         let smb_path = to_smb_path(key);
-        self.retry_write_op(|client, tree_id| {
+        self.retry_write_op(&[], |client, tree_id| {
             let smb_path = smb_path.clone();
             async move {
                 client
@@ -679,7 +679,7 @@ impl ShareSession {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
-                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !self.retry_write_setup(&e, &[smb_path], attempt) {
                         return Err(e);
                     }
                     if is_busy(&e) {
@@ -826,7 +826,13 @@ impl ShareSession {
     /// Write-path counterpart of `retry_read_open`: same bounded retry budget,
     /// backs off the adaptive *write* size on reset. Healing is left to
     /// `pick_live` (coalesced) so concurrent retries do not each call `heal`.
-    async fn retry_write_op<T, F, Fut>(&self, mut op: F) -> io::Result<T>
+    ///
+    /// `dests` names the paths whose parent directories `op` ensures, so a
+    /// `NotFound` can be recovered by dropping the stale cache entry and
+    /// retrying (see [`Self::retry_write_setup`]). Pass an empty slice for an
+    /// operation that ensures nothing — DeleteObject — where `NotFound` is a
+    /// truthful answer that must not be retried into a timeout.
+    async fn retry_write_op<T, F, Fut>(&self, dests: &[&str], mut op: F) -> io::Result<T>
     where
         F: FnMut(Arc<SmbClient>, u32) -> Fut,
         Fut: Future<Output = io::Result<T>>,
@@ -842,7 +848,7 @@ impl ShareSession {
                     } else if is_busy(&e) {
                         self.pool.note_busy();
                     }
-                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !self.retry_write_setup(&e, dests, attempt) {
                         return Err(e);
                     }
                     if is_busy(&e) || self.pool.is_overloaded() {
@@ -1100,7 +1106,7 @@ impl ShareSession {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
-                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !self.retry_write_setup(&e, &[temp_path], attempt) {
                         self.delete_temp(temp_path).await;
                         return Err(e);
                     }
@@ -1372,7 +1378,7 @@ impl ShareSession {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
-                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                    if !self.retry_write_setup(&e, &[&final_path, &wal_path], attempt) {
                         return Err(e);
                     }
                     if is_busy(&e) {
@@ -1720,28 +1726,18 @@ impl ShareSession {
     /// Paths already present in `ensured_dirs` are skipped — a process that has
     /// successfully created (or OpenIf'd) a directory will not re-pay the
     /// Create+Close round trip for every subsequent write under it. The cache
-    /// is best-effort: an external delete of a cached directory can surface as
-    /// a create failure on the child (rare on a dedicated share); restarting
-    /// the proxy clears the cache.
+    /// is best-effort: a cached directory that is no longer there surfaces as a
+    /// create failure on the child, which the write paths recover from by
+    /// calling [`Self::forget_ensured_dirs`] and retrying.
     async fn ensure_parent_dirs_on(
         &self,
         client: &SmbClient,
         tree_id: u32,
         smb_path: &str,
     ) -> io::Result<()> {
-        let parts: Vec<&str> = smb_path.split('\\').collect();
-        if parts.len() <= 1 {
+        let dirs = ancestor_dirs(smb_path);
+        if dirs.is_empty() {
             return Ok(());
-        }
-
-        let mut dirs = Vec::with_capacity(parts.len() - 1);
-        let mut current = String::new();
-        for part in &parts[..parts.len() - 1] {
-            if !current.is_empty() {
-                current.push('\\');
-            }
-            current.push_str(part);
-            dirs.push(current.clone());
         }
 
         // Drop anything we already know exists so a hot prefix costs zero
@@ -1764,6 +1760,86 @@ impl ShareSession {
             cache.insert(d);
         }
         Ok(())
+    }
+
+    /// Ensure the parent directories of `smb_path` exist, choosing a live
+    /// connection. For callers that hold no connection of their own — the WAL
+    /// rename, which must re-create a destination parent that disappeared.
+    async fn ensure_parent_dirs(&self, smb_path: &str) -> io::Result<()> {
+        let (client, tree_id) = self.pick_live().await;
+        self.ensure_parent_dirs_on(&client, tree_id, smb_path).await
+    }
+
+    /// Whether a failed write *setup* attempt is worth another try — performing
+    /// the recovery that makes the retry meaningful before answering.
+    ///
+    /// `NotFound` is the case that needs the extra step. It is never a truthful
+    /// answer to a write: the request is what brings the key into existence, so
+    /// there is no key to be missing. It means a *path* we believed existed does
+    /// not — overwhelmingly a parent directory this process cached in
+    /// `ensured_dirs` and therefore skipped creating. Retrying without dropping
+    /// that cache entry re-runs the identical skip and fails identically, so the
+    /// two steps only work together.
+    ///
+    /// Measured cost of not doing this: 3.3% of PutObjects during a 1163-unit
+    /// sccache build failed here and became `404 NoSuchKey`. sccache counts that
+    /// as a cache write error and drops the artifact, so the *next* build
+    /// recompiles it — while the build still succeeds, which is why nothing
+    /// caught it.
+    ///
+    /// `dests` is what makes this safe to apply to every write path: it names
+    /// the paths whose directories this attempt assumed. An operation that
+    /// ensured nothing (DeleteObject) passes none, and its `NotFound` stays
+    /// authoritative rather than being retried into a timeout.
+    fn retry_write_setup(&self, e: &io::Error, dests: &[&str], attempt: u32) -> bool {
+        let action = classify_write_setup(e, !dests.is_empty(), attempt);
+        if action.forgets_dirs() {
+            for dest in dests {
+                self.forget_ensured_dirs(dest);
+            }
+        }
+        match action {
+            WriteSetupAction::ForgetDirsAndRetry => {
+                // Logged on every occurrence, not only on the final failure. The
+                // condition is intermittent and load-dependent, so silence after
+                // a fix is ambiguous — it reads the same whether the recovery
+                // worked or the condition never arose. A line per recovery makes
+                // "happened N times, absorbed N times" visible.
+                crate::slog!(
+                    "[spiceio] write setup hit a missing path (attempt {}), \
+                     dropping cached dirs and retrying: {e}",
+                    attempt + 1
+                );
+                true
+            }
+            WriteSetupAction::ForgetDirsAndGiveUp => {
+                // The NTSTATUS→`NotFound` mapping is silent by design, so
+                // without this the path that could not be found is unrecoverable
+                // after the fact.
+                crate::serr!(
+                    "[spiceio] write setup could not find a path after {} attempt(s): {e}",
+                    attempt + 1
+                );
+                false
+            }
+            WriteSetupAction::Retry => true,
+            WriteSetupAction::GiveUp => false,
+        }
+    }
+
+    /// Forget every cached "this directory exists" assertion along `smb_path`.
+    ///
+    /// The cache is an optimisation that trades a round trip for the assumption
+    /// that a directory this process created is still there. When an operation
+    /// reports the path missing, that assumption is what was wrong, so the
+    /// entries must go — otherwise every retry skips the create for exactly the
+    /// directory that needs creating and fails identically forever.
+    ///
+    /// Drops the ancestors too, not just the immediate parent: a sweep that
+    /// removed the leaf almost certainly removed the (now empty) chain above it.
+    fn forget_ensured_dirs(&self, smb_path: &str) {
+        let mut cache = self.ensured_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        forget_dirs_in(&mut cache, smb_path);
     }
 }
 
@@ -2040,6 +2116,90 @@ async fn busy_backoff(attempt: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
+/// Every ancestor directory of `smb_path`, outermost first.
+///
+/// `a\b\c\file` yields `[a, a\b, a\b\c]`. A path with no separator has no
+/// ancestors and yields nothing. Outermost-first order is what the create side
+/// needs (a parent must exist before its child), and the forget side is
+/// order-independent, so one function serves both — and the two can no longer
+/// disagree about which directories a path implies.
+fn ancestor_dirs(smb_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = smb_path.split('\\').collect();
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    let mut dirs = Vec::with_capacity(parts.len() - 1);
+    let mut current = String::new();
+    for part in &parts[..parts.len() - 1] {
+        if !current.is_empty() {
+            current.push('\\');
+        }
+        current.push_str(part);
+        dirs.push(current.clone());
+    }
+    dirs
+}
+
+/// What to do about a failed write-*setup* attempt.
+///
+/// Separated from the side effects it implies so the decision — which is where
+/// the subtlety lives — is unit-testable without a live SMB pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteSetupAction {
+    /// Not retryable; surface the error to the client.
+    GiveUp,
+    /// Transient (reset, contention); retry as-is.
+    Retry,
+    /// A path the attempt assumed existed does not. Drop the cached directory
+    /// assertions, then retry — the next attempt re-creates them for real.
+    ForgetDirsAndRetry,
+    /// Same diagnosis, but the retry budget is spent.
+    ForgetDirsAndGiveUp,
+}
+
+impl WriteSetupAction {
+    fn forgets_dirs(self) -> bool {
+        matches!(self, Self::ForgetDirsAndRetry | Self::ForgetDirsAndGiveUp)
+    }
+}
+
+/// Classify a failed write-setup attempt.
+///
+/// `NotFound` is the case that carries the subtlety. It is never a truthful
+/// answer to a write — the request is what brings the key into existence, so
+/// there is no key to be missing. It means a *path* the attempt assumed existed
+/// does not: overwhelmingly a parent directory this process cached in
+/// `ensured_dirs` and therefore skipped creating.
+///
+/// `has_dests` is what keeps this safe to apply to every write path. It says
+/// the attempt ensured directories for something, so a stale cache entry is a
+/// live hypothesis. An operation that ensured nothing — DeleteObject — passes
+/// `false`, and its `NotFound` stays authoritative instead of being retried
+/// into a timeout against a key that really is absent.
+fn classify_write_setup(e: &io::Error, has_dests: bool, attempt: u32) -> WriteSetupAction {
+    let stale_dir_cache = e.kind() == io::ErrorKind::NotFound && has_dests;
+    let budget_left = attempt < MAX_RESET_RETRIES;
+    match (stale_dir_cache, budget_left) {
+        (true, true) => WriteSetupAction::ForgetDirsAndRetry,
+        (true, false) => WriteSetupAction::ForgetDirsAndGiveUp,
+        (false, true) if should_retry(e) => WriteSetupAction::Retry,
+        // Not transient, or the budget is spent.
+        (false, _) => WriteSetupAction::GiveUp,
+    }
+}
+
+/// Remove every cached "this directory exists" assertion along `smb_path`.
+///
+/// Drops the ancestors too, not just the immediate parent: whatever removed the
+/// leaf almost certainly removed the (now empty) chain above it, and
+/// `ensure_parent_dirs_on` re-creates the whole chain anyway — so evicting less
+/// would leave it skipping the very parents it needs to rebuild.
+fn forget_dirs_in(cache: &mut HashSet<String>, smb_path: &str) {
+    for dir in ancestor_dirs(smb_path) {
+        cache.remove(&dir);
+    }
+}
+
 /// Monotonic counter for unique WAL file names within this process.
 static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2268,8 +2428,23 @@ impl WalWriter {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
-                    if !should_retry(&e) || attempt >= MAX_RESET_RETRIES {
+                    // The destination's parent directories are ensured during
+                    // *setup*, which succeeded — the WAL temp lives under its
+                    // own directory, so a destination parent that disappeared
+                    // in between is not discovered until this rename. That is
+                    // the second place a stale `ensured_dirs` entry surfaces.
+                    let missing_path = e.kind() == io::ErrorKind::NotFound;
+                    if !share.retry_write_setup(&e, &[&self.final_path], attempt) {
                         break Err(e);
+                    }
+                    if missing_path {
+                        // Dropping the cache entry is only half the repair here:
+                        // rename creates nothing, so without re-creating the
+                        // destination's parents the retry renames into the same
+                        // directory that is not there.
+                        if let Err(re) = share.ensure_parent_dirs(&self.final_path).await {
+                            break Err(re);
+                        }
                     }
                     if is_busy(&e) {
                         busy_backoff(attempt).await;
@@ -2445,6 +2620,114 @@ mod tests {
             "x"
         )));
         assert!(!is_busy(&io::Error::new(io::ErrorKind::NotFound, "x")));
+    }
+
+    #[test]
+    fn classify_write_setup_recovers_a_missing_path_then_gives_up() {
+        // The defect this exists for: a write answered NotFound because a
+        // parent directory this process cached as created is not there. It must
+        // evict and retry — evicting without retrying fixes nothing, and
+        // retrying without evicting re-runs the identical skip.
+        let missing = io::Error::new(io::ErrorKind::NotFound, "not found: a\\b");
+        assert_eq!(
+            classify_write_setup(&missing, true, 0),
+            WriteSetupAction::ForgetDirsAndRetry
+        );
+        // Budget spent: still evict (the next request should not inherit the
+        // bad entry), but stop retrying this one.
+        assert_eq!(
+            classify_write_setup(&missing, true, MAX_RESET_RETRIES),
+            WriteSetupAction::ForgetDirsAndGiveUp
+        );
+    }
+
+    #[test]
+    fn classify_write_setup_leaves_a_genuine_not_found_alone() {
+        // DeleteObject ensures no directories, so it passes no dests. Its
+        // NotFound is the truth about a key that is absent — retrying it would
+        // spend the whole budget re-asking a question already answered.
+        let missing = io::Error::new(io::ErrorKind::NotFound, "not found: k");
+        assert_eq!(
+            classify_write_setup(&missing, false, 0),
+            WriteSetupAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn classify_write_setup_keeps_ordinary_transient_handling() {
+        // Resets and contention retry as before, without touching the cache —
+        // evicting on every blip would throw away the round-trip savings the
+        // cache exists for.
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ResourceBusy,
+            io::ErrorKind::TimedOut,
+        ] {
+            let e = io::Error::new(kind, "transient");
+            assert_eq!(
+                classify_write_setup(&e, true, 0),
+                WriteSetupAction::Retry,
+                "{kind:?}"
+            );
+            assert_eq!(
+                classify_write_setup(&e, true, MAX_RESET_RETRIES),
+                WriteSetupAction::GiveUp,
+                "{kind:?} with no budget"
+            );
+        }
+        // Real failures are surfaced immediately, dests or not.
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "nope");
+        assert_eq!(
+            classify_write_setup(&denied, true, 0),
+            WriteSetupAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn only_the_missing_path_cases_touch_the_directory_cache() {
+        assert!(WriteSetupAction::ForgetDirsAndRetry.forgets_dirs());
+        assert!(WriteSetupAction::ForgetDirsAndGiveUp.forgets_dirs());
+        assert!(!WriteSetupAction::Retry.forgets_dirs());
+        assert!(!WriteSetupAction::GiveUp.forgets_dirs());
+    }
+
+    #[test]
+    fn forget_dirs_in_evicts_the_whole_ancestor_chain() {
+        // Evicting only the immediate parent would leave `ensure_parent_dirs_on`
+        // skipping the grandparents it also needs to rebuild, so the retry would
+        // fail the same way.
+        let mut cache: HashSet<String> = ["a", "a\\b", "a\\b\\c", "other"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        forget_dirs_in(&mut cache, "a\\b\\c\\file");
+        assert!(!cache.contains("a"));
+        assert!(!cache.contains("a\\b"));
+        assert!(!cache.contains("a\\b\\c"));
+        // Unrelated prefixes keep their savings.
+        assert!(cache.contains("other"));
+    }
+
+    #[test]
+    fn forget_dirs_in_is_a_noop_for_a_path_with_no_parents() {
+        let mut cache: HashSet<String> = ["a"].iter().map(|s| (*s).to_string()).collect();
+        forget_dirs_in(&mut cache, "bare");
+        assert!(cache.contains("a"));
+    }
+
+    #[test]
+    fn ancestor_dirs_enumerates_the_chain_outermost_first() {
+        // Order matters on the create side: a parent must exist before its
+        // child, and `ensure_dirs` issues them in the order given.
+        assert_eq!(ancestor_dirs("a\\b\\c\\file"), vec!["a", "a\\b", "a\\b\\c"]);
+        assert_eq!(
+            ancestor_dirs(".spiceio-wal\\0001-0002"),
+            vec![".spiceio-wal"]
+        );
+        // A bare name has no parent to create — and must not yield itself, or
+        // the write path would try to mkdir the file it is about to write.
+        assert!(ancestor_dirs("file").is_empty());
+        assert!(ancestor_dirs("").is_empty());
     }
 
     #[test]

@@ -147,8 +147,11 @@ echo "======================================="
 
 rm -rf "$TEST_TARGET_DIR"
 COLD_START=$(date +%s)
-CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
-    cargo build -p spice --manifest-path "$SPICEAI_DIR/Cargo.toml" 2>&1
+# Build from inside the spiceai repo, not via --manifest-path: cargo resolves
+# rust-toolchain.toml and .cargo/config.toml from the working directory, so
+# --manifest-path builds a toolchain-pinned repo with whatever toolchain this
+# repo happens to use — which fails outright once the pins diverge.
+(cd "$SPICEAI_DIR" && CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build -p spice) 2>&1
 COLD_END=$(date +%s)
 COLD_SECS=$((COLD_END - COLD_START))
 
@@ -173,8 +176,7 @@ rm -rf "$TEST_TARGET_DIR"
 sccache --zero-stats 2>/dev/null || true
 
 WARM_START=$(date +%s)
-CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
-    cargo build -p spice --manifest-path "$SPICEAI_DIR/Cargo.toml" 2>&1
+(cd "$SPICEAI_DIR" && CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build -p spice) 2>&1
 WARM_END=$(date +%s)
 WARM_SECS=$((WARM_END - WARM_START))
 

@@ -20,6 +20,7 @@ macro_rules! serr {
     };
 }
 
+pub mod access_log;
 pub mod crash;
 pub mod crypto;
 pub mod http;

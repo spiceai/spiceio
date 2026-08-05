@@ -52,11 +52,16 @@ jobs:
       - name: Check rustdoc
         run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
 
-      - name: Build debug binary
-        run: cargo build --locked
+      - name: Build debug binaries
+        # --features loadgen also builds spiceio-loadgen, which the sccache
+        # test uses for its concurrent load burst. Without it that check
+        # silently downgrades to a skip.
+        run: cargo build --locked --features loadgen --bins
 
       - name: Run unit tests
-        run: cargo test --locked
+        # --features loadgen also runs spiceio-loadgen's own tests, which
+        # cover the per-operation status classifier the load burst relies on.
+        run: cargo test --locked --features loadgen
 
       - name: Prepare crash-log directory
         # spiceio writes a crash report (panic or fatal signal) to its

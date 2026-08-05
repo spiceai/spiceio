@@ -389,17 +389,68 @@ export CARGO_INCREMENTAL=0  # sccache cannot cache incremental builds
 sccache --start-server
 sccache --zero-stats 2>/dev/null || true
 
+# ── Client-side metrics ─────────────────────────────────────────────────────
+#
+# sccache's own JSON stats are the client's view of how fast this backend is:
+# `cache_read_hit_duration` and `cache_write_duration` are cumulative, so the
+# per-op averages below are what stay comparable between a cold and a warm
+# build (and between runs with different unit counts). Printed as `[metrics]`
+# lines so CI logs carry a time series even when the run passes.
+sccache_metrics() {
+    # Averages are computed in named locals rather than inline in the f-strings:
+    # a backslash-escaped quote inside an f-string expression is a Python syntax
+    # error, and the failure is invisible here — it just prints zeros, which
+    # read as "the cache did nothing" instead of "the metrics broke".
+    sccache --show-stats --stats-format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)["stats"]
+except Exception:
+    print("0 0 0 0 0 0 0.00 0.00"); raise SystemExit
+def total(field):
+    v = doc.get(field) or {}
+    counts = v.get("counts") if isinstance(v, dict) else None
+    return sum(counts.values()) if counts else 0
+def dur_ms(field):
+    d = doc.get(field) or {}
+    return d.get("secs", 0) * 1000.0 + d.get("nanos", 0) / 1e6
+hits, misses = total("cache_hits"), total("cache_misses")
+writes = doc.get("cache_writes", 0)
+hit_avg = dur_ms("cache_read_hit_duration") / hits if hits else 0.0
+write_avg = dur_ms("cache_write_duration") / writes if writes else 0.0
+print(hits, misses, writes,
+      doc.get("cache_read_errors", 0), doc.get("cache_write_errors", 0),
+      doc.get("cache_timeouts", 0),
+      f"{hit_avg:.2f}", f"{write_avg:.2f}")
+' || echo "0 0 0 0 0 0 0.00 0.00"
+}
+
+report_metrics() {
+    local phase="$1" secs="$2"
+    local hits misses writes rerr werr touts hitavg wravg
+    read -r hits misses writes rerr werr touts hitavg wravg < <(sccache_metrics)
+    echo "[metrics] ${phase} wall=${secs}s hits=${hits} misses=${misses} writes=${writes} \
+read_err=${rerr} write_err=${werr} timeouts=${touts} \
+hit_avg=${hitavg}ms write_avg=${wravg}ms"
+}
+
 echo ""
 echo "[test] === cold build (populating cache) ==="
 rm -rf "$TEST_TARGET_DIR"
+COLD_START=$(date +%s)
 CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
+COLD_SECS=$(( $(date +%s) - COLD_START ))
+report_metrics cold "$COLD_SECS"
 
 sccache --zero-stats 2>/dev/null || true
 
 echo ""
 echo "[test] === warm build (should hit cache) ==="
 rm -rf "$TEST_TARGET_DIR"
+WARM_START=$(date +%s)
 CARGO_TARGET_DIR="$TEST_TARGET_DIR" cargo build 2>&1
+WARM_SECS=$(( $(date +%s) - WARM_START ))
+report_metrics warm "$WARM_SECS"
 
 echo ""
 echo "======================================="
@@ -415,13 +466,22 @@ echo "======================================="
 # blip (common under concurrent CI runners) without loosening the final bar.
 
 check_warm_stats() {
-    local stats hits write_err
+    local stats hits write_err read_err timeouts
     stats=$(sccache --show-stats 2>&1)
     hits=$(echo "$stats" | grep -m1 "^Cache hits" | awk '{print $NF}' || echo "0")
     write_err=$(echo "$stats" | grep -m1 "Cache write errors" | awk '{print $NF}' || echo "0")
+    # A read error or timeout on a warm build is a cache the client could not
+    # use — the same class of failure as a failed write, and equally invisible
+    # to a build that still succeeds by recompiling. Checked here so the
+    # existing retry absorbs a single shared-NAS blip.
+    read_err=$(echo "$stats" | grep -m1 "Cache read errors" | awk '{print $NF}' || echo "0")
+    timeouts=$(echo "$stats" | grep -m1 "Cache timeouts" | awk '{print $NF}' || echo "0")
     CACHE_HITS=${hits:-0}
     WRITE_ERRORS=${write_err:-0}
-    [[ "$CACHE_HITS" -gt 0 && "$WRITE_ERRORS" -eq 0 ]]
+    READ_ERRORS=${read_err:-0}
+    CACHE_TIMEOUTS=${timeouts:-0}
+    [[ "$CACHE_HITS" -gt 0 && "$WRITE_ERRORS" -eq 0 \
+        && "$READ_ERRORS" -eq 0 && "$CACHE_TIMEOUTS" -eq 0 ]]
 }
 
 verify_warm_or_retry() {
@@ -429,10 +489,10 @@ verify_warm_or_retry() {
     local max_attempts=2
     while true; do
         if check_warm_stats; then
-            echo "[test] PASS: warm build got $CACHE_HITS cache hits, 0 write errors"
+            echo "[test] PASS: warm build got $CACHE_HITS cache hits, 0 read/write errors, 0 timeouts"
             return 0
         fi
-        echo "[test] warm-build stats attempt ${attempt}/${max_attempts}: hits=${CACHE_HITS} write_errors=${WRITE_ERRORS}"
+        echo "[test] warm-build stats attempt ${attempt}/${max_attempts}: hits=${CACHE_HITS} write_errors=${WRITE_ERRORS} read_errors=${READ_ERRORS} timeouts=${CACHE_TIMEOUTS}"
         if [[ "$attempt" -ge "$max_attempts" ]]; then
             break
         fi
@@ -443,7 +503,7 @@ verify_warm_or_retry() {
         attempt=$((attempt + 1))
     done
 
-    # Split the two conditions so a hits-ok / writes-bad failure is obvious.
+    # Split the conditions so a hits-ok / writes-bad failure is obvious.
     echo ""
     if [[ "${CACHE_HITS:-0}" -le 0 ]]; then
         echo "[test] FAIL: expected cache hits > 0 (got ${CACHE_HITS:-0})"
@@ -452,6 +512,14 @@ verify_warm_or_retry() {
         echo "[test] FAIL: expected cache write errors == 0 (got ${WRITE_ERRORS:-0})"
         echo "[test]       (hits were ${CACHE_HITS:-0} — cache is partially working;"
         echo "[test]        write errors usually mean transient NAS/SMB overload during PUT)"
+    fi
+    if [[ "${READ_ERRORS:-0}" -ne 0 ]]; then
+        echo "[test] FAIL: expected cache read errors == 0 (got ${READ_ERRORS:-0})"
+        echo "[test]       (a GET that sccache could not use — the build still"
+        echo "[test]        succeeds by recompiling, so only this check catches it)"
+    fi
+    if [[ "${CACHE_TIMEOUTS:-0}" -ne 0 ]]; then
+        echo "[test] FAIL: expected cache timeouts == 0 (got ${CACHE_TIMEOUTS:-0})"
     fi
     if [[ -s "${SPICEIO_LOG_FILE:-}" ]]; then
         echo "[test] last 40 lines of SPICEIO_LOG_FILE (${SPICEIO_LOG_FILE}):"
@@ -465,6 +533,124 @@ verify_warm_or_retry() {
 
 echo ""
 verify_warm_or_retry
+
+# ════════════════════════════════════════════════════════════════════════════
+# Concurrent load burst
+# ════════════════════════════════════════════════════════════════════════════
+#
+# A cargo build of this crate is ~30 compile units — nowhere near the request
+# concurrency a real sccache fleet produces, so the build test above can pass
+# while the proxy falls over under a stampede. This drives the same request
+# shape at high concurrency over persistent connections and requires that every
+# request succeed. Metrics are printed either way so CI logs carry a throughput
+# series alongside the pass/fail.
+#
+# Uses the debug loadgen that `make build` (--all-features) already produces;
+# skipped if it is absent so the suite still runs from a bare `cargo build`.
+
+LOADGEN="./target/debug/spiceio-loadgen"
+BURST_CONCURRENCY="${SCCACHE_TEST_BURST_CONCURRENCY:-64}"
+BURST_OBJECTS="${SCCACHE_TEST_BURST_OBJECTS:-128}"
+# Failure budget, as a percentage of attempted requests. Zero, deliberately.
+#
+# An earlier revision carried a 2% budget because spiceio intermittently dropped
+# large writes under burst load (3.3% of PUTs during a 1163-unit sccache build).
+# That is fixed, so the budget is gone: every failure here is now a regression.
+#
+# `errors` counts what it needs to for that to mean anything. The load generator
+# classifies each response against the status its *operation* expects — a PUT or
+# a cache-hit read answered 404 is a failure, 404 is a success only for a miss
+# probe, and 5xx never passes — so a proxy that silently stores nothing can no
+# longer post a clean run. It is left overridable only for bisecting against an
+# older build.
+BURST_MAX_ERROR_PCT="${SCCACHE_TEST_BURST_MAX_ERROR_PCT:-0}"
+
+if [[ -x "$LOADGEN" ]]; then
+    echo ""
+    echo "======================================="
+    echo "[test] concurrent load burst (c=${BURST_CONCURRENCY}, ${BURST_OBJECTS} objects)"
+    echo "======================================="
+    BURST_JSON="${SPICEIO_STDERR}.burst.json"
+    # Exit status is ignored here: the loadgen exits nonzero on any error at
+    # all, and the budget below is the actual gate.
+    "$LOADGEN" \
+        --endpoint "$ENDPOINT" \
+        --bucket "$BUCKET" \
+        --prefix "${TEST_PREFIX}/burst" \
+        --concurrency "$BURST_CONCURRENCY" \
+        --objects "$BURST_OBJECTS" \
+        --ops $((BURST_OBJECTS * 4)) \
+        --phase put,get,head-hit,head-miss,mixed \
+        --json "$BURST_JSON" || true
+
+    if [[ -s "$BURST_JSON" ]]; then
+        BURST_TOTALS=$(python3 - "$BURST_JSON" <<'PY'
+import json, sys
+with open(sys.argv[1]) as fh:
+    doc = json.load(fh)
+ops = errs = 0
+for p in doc["phases"]:
+    lat = p["latency_us"]
+    e = sum(p["errors"].values()) if p["errors"] else 0
+    ops += p["ops"] + e   # p["ops"] counts completions only
+    errs += e
+    # No status allowlist here: which statuses are acceptable depends on the
+    # operation, and that judgement already happened in the load generator
+    # (Op::accepts), which turned every mismatch into a named entry in
+    # `errors` — e.g. "PUT status 404". Re-deciding it here with a flat
+    # allowlist is exactly how a failed write got counted as a success before.
+    detail = " ".join(f"{k}={v}" for k, v in sorted(p["errors"].items())) if p["errors"] else ""
+    statuses = " ".join(f"{k}x{v}" for k, v in sorted(p["statuses"].items()))
+    print(f"[metrics] burst phase={p['phase']} c={p['concurrency']} "
+          f"ops={p['ops']} ops_s={p['ops_per_sec']:.1f} mib_s={p['mib_per_sec']:.1f} "
+          f"p50={lat['p50']/1000:.2f}ms p99={lat['p99']/1000:.2f}ms "
+          f"max={lat['max']/1000:.2f}ms errors={e} status=[{statuses}]"
+          + (f" failed=[{detail}]" if detail else ""), file=sys.stderr)
+print(ops, errs)
+PY
+)
+        BURST_OPS=$(echo "$BURST_TOTALS" | awk '{print $1}')
+        BURST_ERRS=$(echo "$BURST_TOTALS" | awk '{print $2}')
+        BURST_PCT=$(awk -v e="${BURST_ERRS:-0}" -v o="${BURST_OPS:-1}" \
+            'BEGIN{printf "%.2f", (o>0? 100*e/o : 0)}')
+        echo "[metrics] burst total ops=${BURST_OPS} errors=${BURST_ERRS} (${BURST_PCT}%)"
+        if awk -v p="$BURST_PCT" -v m="$BURST_MAX_ERROR_PCT" 'BEGIN{exit !(p<=m)}'; then
+            if [[ "${BURST_ERRS:-0}" -gt 0 ]]; then
+                echo "  PASS: load burst error rate ${BURST_PCT}% within ${BURST_MAX_ERROR_PCT}% budget"
+                echo "  NOTE: ${BURST_ERRS} request(s) failed — the budget is only non-zero"
+                echo "        when overridden; see the [metrics] failed=[...] breakdown above"
+            else
+                echo "  PASS: load burst completed with no failed requests"
+            fi
+            PASS=$((PASS + 1))
+        else
+            echo "  FAIL: ${BURST_ERRS} of ${BURST_OPS} burst requests failed (${BURST_PCT}%)"
+            echo "        A wrong status counts here: a PUT or a cache-hit read"
+            echo "        answered 404 means the object was never stored."
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "  FAIL: load burst produced no results"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Remove the burst objects; the AWS-CLI section's cleanup only covers the
+    # keys it wrote itself.
+    "$LOADGEN" --endpoint "$ENDPOINT" --bucket "$BUCKET" \
+        --prefix "${TEST_PREFIX}/burst" --concurrency 16 \
+        --objects "$BURST_OBJECTS" --ops "$BURST_OBJECTS" \
+        --phase delete >/dev/null 2>&1 || true
+    rm -f "$BURST_JSON"
+else
+    echo ""
+    echo "[test] NOTE: ${LOADGEN} not built — skipping concurrent load burst"
+    echo "[test]       (build it with: cargo build --all-targets --all-features)"
+fi
+
+if [[ "$FAIL" -gt 0 ]]; then
+    echo "[test] ABORTING — concurrent load burst failed"
+    exit 1
+fi
 
 # ── Session backoff exercise verification ───────────────────────────────────
 # (with SPICEIO_SMB_CONNECTIONS=128 on startup)

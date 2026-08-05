@@ -25,7 +25,38 @@ make test                      # sccache integration only (requires SPICEIO_SMB_
 make test-live                 # sccache + extended + stress (CI live steps)
 make fmt                       # auto-format
 make clean                     # cargo clean
+
+make bench-sccache             # synthetic sccache-shaped load, concurrency sweep
+make bench-sccache-build       # real cargo builds: spiceio vs local-disk vs no cache
+make bench-sccache-all         # both
 ```
+
+### Measuring sccache performance
+
+The two bench targets answer different questions and are **measurements, not
+gates** — `make ci` never runs them.
+
+- `make bench-sccache` drives `spiceio-loadgen` (a dependency-free HTTP/1.1
+  client built behind the `loadgen` feature) over **persistent keep-alive
+  connections**, which is how sccache actually talks to the proxy. It sweeps
+  concurrency, reports p50/p90/p99/p99.9 and TTFB per operation class, and runs
+  a second pass with the GET body cache disabled so proxy-cache hits and real
+  NAS reads are not conflated. Do not go back to per-request `curl` fan-out: it
+  pays a TCP handshake per request and cannot offer enough load to find the knee.
+- `make bench-sccache-build` runs real `cargo build`s three ways — no cache,
+  sccache on local disk, sccache through spiceio — and reads sccache's own JSON
+  stats (`--stats-format json`) for per-hit and per-write latency. The local-disk
+  arm is the floor; a warm-build number without it is not interpretable.
+
+Both write timestamped output to `benches/results/` (gitignored). Committed
+reference runs live in `benches/baselines/`.
+
+`SPICEIO_ACCESS_LOG=<path>` turns on a per-request TSV log
+(`t_ms method status req_bytes resp_bytes head_us total_us path`). `head_us` is
+time to the response head (for GetObject: SMB open + first read); `total_us`
+also covers streaming the body, so the gap between them is streaming cost.
+Comparing it against client-side latency attributes time to spiceio versus the
+client and the network. Off by default and free when off.
 
 ### PR / agent verification gate (do not skip)
 
@@ -65,6 +96,7 @@ The binary requires these environment variables:
 - `SPICEIO_MULTIPART_TTL_SECS` — age at which an abandoned multipart upload is reaped (default `86400`)
 - `SPICEIO_CLEANUP_GRACE_SECS` — startup cleanup leaves WAL temps / upload dirs newer than this alone (default `900`), so instances sharing one share don't delete each other's in-flight state; `0` restores a blanket sweep
 - `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
+- `SPICEIO_ACCESS_LOG` — per-request TSV metrics log for benchmarking (optional; off by default, one atomic load per request when off)
 - `SPICEIO_OBJECT_CACHE_BYTES` — max total GET body cache size (default `268435456` = 256 MiB)
 - `SPICEIO_OBJECT_CACHE_MAX_OBJECT` — max size of a single cached object (default `4194304` = 4 MiB)
 - `SPICEIO_OBJECT_CACHE_ENTRIES` — max cache entries (default `4096`)

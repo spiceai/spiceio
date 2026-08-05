@@ -1,0 +1,153 @@
+########## POOL=4 ##########
+[bench] building release binary...
+[bench] building load generator...
+═══════════════════════════════════════════════════════════════════
+ spiceio sccache bench — pool-4
+ target : smb://192.168.3.148/ai_platform_dev  bucket=sccache-bench
+ pool   : 4 SMB connections
+ sweep  : concurrency [32]  objects=192  ops/worker=12
+ phases : put,get
+ results: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230657Z
+═══════════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════
+ pass: nocache
+═══════════════════════════════════════════════════════════════════
+
+── nocache @ concurrency 32 (384 ops/phase) ─────────────
+[loadgen] pool-4 nocache c32 → http://127.0.0.1:18390/sccache-bench  concurrency=32 objects=192 ops/phase=384 prefix=bench/20260804T230657Z/nocache
+
+phase             ops     ops/s     MiB/s      mean       p50       p90       p99     p99.9     err
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+put               384     134.8      79.0   222.9ms   154.5ms   488.4ms   850.7ms  1265.9ms       0
+  └ ttfb                                    222.8ms   154.5ms   488.4ms   850.7ms  1265.9ms        
+get               384     153.3      89.8   173.6ms   123.4ms   353.6ms   725.7ms  1020.7ms       0
+  └ ttfb                                    119.5ms    98.9ms   241.7ms   426.0ms   558.2ms        
+
+[loadgen] done — 2 phase(s), 0 error(s)
+[loadgen] wrote /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230657Z/nocache-c32.json
+
+  server-side (time spiceio held the request):
+  method     count       MiB        p50        p90        p99        max   head_p50   head_p99   5xx
+  GET          768     450.0   133.30ms   394.38ms   718.27ms  1020.68ms    99.27ms   452.37ms     0
+  PUT          384     225.0   154.39ms   488.30ms   850.57ms  1265.84ms   154.39ms   850.57ms     0
+
+═══════════════════════════════════════════════════════════════════
+ report: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230657Z/report.md
+═══════════════════════════════════════════════════════════════════
+[bench] removing benchmark objects from the share...
+########## POOL=12 ##########
+[bench] building release binary...
+[bench] building load generator...
+═══════════════════════════════════════════════════════════════════
+ spiceio sccache bench — pool-12
+ target : smb://192.168.3.148/ai_platform_dev  bucket=sccache-bench
+ pool   : 12 SMB connections
+ sweep  : concurrency [32]  objects=192  ops/worker=12
+ phases : put,get
+ results: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230706Z
+═══════════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════
+ pass: nocache
+═══════════════════════════════════════════════════════════════════
+
+── nocache @ concurrency 32 (384 ops/phase) ─────────────
+[loadgen] pool-12 nocache c32 → http://127.0.0.1:18390/sccache-bench  concurrency=32 objects=192 ops/phase=384 prefix=bench/20260804T230706Z/nocache
+
+phase             ops     ops/s     MiB/s      mean       p50       p90       p99     p99.9     err
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+put               384     165.6      97.0   179.8ms    97.4ms   388.8ms   934.0ms  2020.3ms       0
+  └ ttfb                                    179.8ms    97.4ms   388.8ms   934.0ms  2020.3ms        
+get               384     171.7     100.6   160.4ms    82.6ms   420.9ms  1253.4ms  1501.9ms       0
+  └ ttfb                                     91.8ms    38.8ms   258.6ms   587.2ms  1125.9ms        
+
+[loadgen] done — 2 phase(s), 0 error(s)
+[loadgen] wrote /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230706Z/nocache-c32.json
+
+  server-side (time spiceio held the request):
+  method     count       MiB        p50        p90        p99        max   head_p50   head_p99   5xx
+  GET          768     450.0    83.33ms   428.14ms  1057.91ms  1504.19ms    43.06ms   587.20ms     0
+  PUT          384     225.0    97.40ms   388.71ms   933.98ms  2020.22ms    97.40ms   933.98ms     0
+
+═══════════════════════════════════════════════════════════════════
+ report: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230706Z/report.md
+═══════════════════════════════════════════════════════════════════
+[bench] removing benchmark objects from the share...
+########## POOL=24 ##########
+[bench] building release binary...
+[bench] building load generator...
+═══════════════════════════════════════════════════════════════════
+ spiceio sccache bench — pool-24
+ target : smb://192.168.3.148/ai_platform_dev  bucket=sccache-bench
+ pool   : 24 SMB connections
+ sweep  : concurrency [32]  objects=192  ops/worker=12
+ phases : put,get
+ results: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230715Z
+═══════════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════
+ pass: nocache
+═══════════════════════════════════════════════════════════════════
+
+── nocache @ concurrency 32 (384 ops/phase) ─────────────
+[loadgen] pool-24 nocache c32 → http://127.0.0.1:18390/sccache-bench  concurrency=32 objects=192 ops/phase=384 prefix=bench/20260804T230715Z/nocache
+
+phase             ops     ops/s     MiB/s      mean       p50       p90       p99     p99.9     err
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+put               384     159.8      93.6   155.3ms    64.0ms   373.7ms  1354.5ms  1953.1ms       0
+  └ ttfb                                    155.2ms    64.0ms   373.7ms  1354.5ms  1953.1ms        
+get               384     161.7      94.8   162.0ms    47.9ms   448.3ms  1378.6ms  2201.9ms       0
+  └ ttfb                                     60.9ms    21.3ms   137.4ms   764.9ms  1175.9ms        
+
+[loadgen] done — 2 phase(s), 0 error(s)
+[loadgen] wrote /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230715Z/nocache-c32.json
+
+  server-side (time spiceio held the request):
+  method     count       MiB        p50        p90        p99        max   head_p50   head_p99   5xx
+  GET          768     450.0    47.48ms   425.40ms  1378.61ms  2201.91ms    21.09ms   764.82ms     0
+  PUT          384     225.0    63.95ms   373.60ms  1354.41ms  1953.03ms    63.95ms  1354.41ms     0
+
+═══════════════════════════════════════════════════════════════════
+ report: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230715Z/report.md
+═══════════════════════════════════════════════════════════════════
+[bench] removing benchmark objects from the share...
+########## POOL=48 ##########
+[bench] building release binary...
+[bench] building load generator...
+═══════════════════════════════════════════════════════════════════
+ spiceio sccache bench — pool-48
+ target : smb://192.168.3.148/ai_platform_dev  bucket=sccache-bench
+ pool   : 48 SMB connections
+ sweep  : concurrency [32]  objects=192  ops/worker=12
+ phases : put,get
+ results: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230725Z
+═══════════════════════════════════════════════════════════════════
+
+═══════════════════════════════════════════════════════════════════
+ pass: nocache
+═══════════════════════════════════════════════════════════════════
+
+── nocache @ concurrency 32 (384 ops/phase) ─────────────
+[loadgen] pool-48 nocache c32 → http://127.0.0.1:18390/sccache-bench  concurrency=32 objects=192 ops/phase=384 prefix=bench/20260804T230725Z/nocache
+
+phase             ops     ops/s     MiB/s      mean       p50       p90       p99     p99.9     err
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+put               384     179.6     105.2   148.4ms    67.0ms   331.6ms  1045.2ms  1874.9ms       0
+  └ ttfb                                    148.4ms    67.0ms   331.6ms  1045.2ms  1874.9ms        
+get               384     166.7      97.7   147.0ms    28.1ms   371.9ms  1565.9ms  2189.9ms       0
+  └ ttfb                                     25.5ms    19.8ms    44.8ms   247.1ms   266.4ms        
+
+[loadgen] done — 2 phase(s), 0 error(s)
+[loadgen] wrote /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230725Z/nocache-c32.json
+
+  server-side (time spiceio held the request):
+  method     count       MiB        p50        p90        p99        max   head_p50   head_p99   5xx
+  GET          768     450.0    29.40ms   374.66ms  1565.83ms  2235.83ms    20.95ms   241.25ms     0
+  PUT          384     225.0    66.92ms   331.57ms  1045.16ms  1874.82ms    66.92ms  1045.16ms     0
+
+═══════════════════════════════════════════════════════════════════
+ report: /private/tmp/claude-502/-Users-lukim-dev-spiceio/d94f5969-8127-4c29-bbcd-96df19acfeea/scratchpad/pool-sweep/20260804T230725Z/report.md
+═══════════════════════════════════════════════════════════════════
+[bench] removing benchmark objects from the share...
+########## POOL SWEEP DONE ##########

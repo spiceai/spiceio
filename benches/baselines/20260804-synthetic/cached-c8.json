@@ -1,0 +1,75 @@
+{
+  "label": "baseline-v0.5.10 cached c8",
+  "endpoint": "http://127.0.0.1:18390",
+  "bucket": "sccache-bench",
+  "concurrency": 8,
+  "objects": 512,
+  "ops_per_phase": 512,
+  "phases": [
+    {
+      "phase": "put",
+      "concurrency": 8,
+      "ops": 512,
+      "bytes": 321806336,
+      "wall_ms": 3274,
+      "ops_per_sec": 156.37,
+      "mib_per_sec": 93.73,
+      "latency_us": {"mean": 50517, "p50": 22963, "p90": 118375, "p99": 384391, "p999": 589450, "max": 589450},
+      "ttfb_us": {"mean": 50510, "p50": 22961, "p90": 118373, "p99": 384388, "p999": 589449, "max": 589449},
+      "statuses": {"200": 512},
+      "errors": {}
+    },
+    {
+      "phase": "get",
+      "concurrency": 8,
+      "ops": 512,
+      "bytes": 321806336,
+      "wall_ms": 981,
+      "ops_per_sec": 521.39,
+      "mib_per_sec": 312.53,
+      "latency_us": {"mean": 12055, "p50": 4399, "p90": 12944, "p99": 328585, "p999": 624796, "max": 624796},
+      "ttfb_us": {"mean": 5910, "p50": 4172, "p90": 12685, "p99": 17283, "p999": 23641, "max": 23641},
+      "statuses": {"200": 512},
+      "errors": {}
+    },
+    {
+      "phase": "head-hit",
+      "concurrency": 8,
+      "ops": 512,
+      "bytes": 0,
+      "wall_ms": 114,
+      "ops_per_sec": 4488.36,
+      "mib_per_sec": 0.00,
+      "latency_us": {"mean": 1773, "p50": 933, "p90": 3433, "p99": 14083, "p999": 20406, "max": 20406},
+      "ttfb_us": {"mean": 1770, "p50": 932, "p90": 3433, "p99": 14082, "p999": 20404, "max": 20404},
+      "statuses": {"200": 512},
+      "errors": {}
+    },
+    {
+      "phase": "head-miss",
+      "concurrency": 8,
+      "ops": 512,
+      "bytes": 0,
+      "wall_ms": 46,
+      "ops_per_sec": 11116.41,
+      "mib_per_sec": 0.00,
+      "latency_us": {"mean": 712, "p50": 472, "p90": 1004, "p99": 6206, "p999": 6712, "max": 6712},
+      "ttfb_us": {"mean": 708, "p50": 472, "p90": 941, "p99": 6205, "p999": 6701, "max": 6701},
+      "statuses": {"404": 512},
+      "errors": {}
+    },
+    {
+      "phase": "mixed",
+      "concurrency": 8,
+      "ops": 512,
+      "bytes": 258587588,
+      "wall_ms": 904,
+      "ops_per_sec": 566.12,
+      "mib_per_sec": 272.68,
+      "latency_us": {"mean": 12433, "p50": 3978, "p90": 17514, "p99": 141619, "p999": 630365, "max": 630365},
+      "ttfb_us": {"mean": 8148, "p50": 3932, "p90": 15914, "p99": 88343, "p999": 165884, "max": 165884},
+      "statuses": {"200": 410, "404": 102},
+      "errors": {}
+    }
+  ]
+}

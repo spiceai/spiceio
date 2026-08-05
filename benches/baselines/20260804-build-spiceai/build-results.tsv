@@ -1,0 +1,5 @@
+arm	jobs	phase	secs	hits	misses	writes	read_err	write_err	timeouts	hit_avg_ms	write_avg_ms
+local	16	cold	167.9	0	1163	1163	0	0	0	0.00	1.22
+local	16	warm	24.4	1162	1	1	0	0	0	0.62	2.32
+spiceio	16	cold	194.3	2	1161	1121	0	40	0	2.64	20.30
+spiceio	16	warm	34.2	1122	41	41	0	0	0	22.90	58.50

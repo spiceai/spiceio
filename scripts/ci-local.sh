@@ -97,12 +97,14 @@ if [[ "$LIVE_ONLY" -eq 0 ]]; then
     make lint
 
     # ── 2. Unit tests ─────────────────────────────────────────────────────
-    step "unit tests (cargo test --locked)"
-    cargo test --locked
+    step "unit tests (cargo test --locked --features loadgen)"
+    # --features loadgen also runs spiceio-loadgen's status-classifier tests.
+    cargo test --locked --features loadgen
 
-    # ── 3. Debug binary (live scripts expect ./target/debug/spiceio) ──────
-    step "build debug binary"
-    cargo build --locked
+    # ── 3. Debug binaries (live scripts expect ./target/debug/spiceio, and
+    #      test-sccache.sh's load burst expects ./target/debug/spiceio-loadgen)
+    step "build debug binaries"
+    cargo build --locked --features loadgen --bins
 fi
 
 # ── Live SMB suites (exactly what CI runs when HAS_SMB_PASS) ──────────────

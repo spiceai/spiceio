@@ -2086,16 +2086,7 @@ impl SmbClient {
         }
 
         let responses = self.send_compound(requests).await?;
-
-        // Check Create responses (every other response)
-        for i in (0..responses.len()).step_by(2) {
-            let status = NtStatus::from_u32(responses[i].0.status);
-            if status.is_error() {
-                return Err(smb_status_to_io_error(responses[i].0.status, &dirs[i / 2]));
-            }
-        }
-
-        Ok(())
+        ensure_dirs_outcome(dirs, &responses, count)
     }
 }
 
@@ -2154,6 +2145,51 @@ pub(crate) fn effective_io_sizes(
         compound_max_read: max_read.min(65536),
         compound_max_write: max_write.min(65536),
     }
+}
+
+/// Decide the outcome of an `ensure_dirs` compound chain.
+///
+/// Two failure modes, and the order they are checked in is the whole point.
+///
+/// A server that aborts a related chain on its first failure returns only that
+/// one response. Judging the chain by its *length* first would turn a precise
+/// `OBJECT_PATH_NOT_FOUND` or `ACCESS_DENIED` into a generic framing error —
+/// the exact loss [`compound_too_short`] exists to prevent — and the write-path
+/// recovery that keys on `NotFound` would never fire, while a permission
+/// failure would stop being a 403. So inspect the statuses that arrived first
+/// and report the real one, against the directory it belongs to.
+///
+/// Only once every response that arrived is a success does a short chain mean
+/// what its length says: the server stopped early for some other reason. That
+/// still cannot be `Ok`. The caller records every directory in `dirs` as
+/// existing and skips creating them for the rest of the process, so returning
+/// success here would cache directories that were never created, and every
+/// later write beneath one of them would fail having skipped the single
+/// operation that would have fixed it.
+///
+/// Extracted as a free function so both orderings are unit-testable without a
+/// live SMB connection.
+fn ensure_dirs_outcome(
+    dirs: &[String],
+    responses: &[(Header, Bytes)],
+    expected: usize,
+) -> io::Result<()> {
+    // Create responses are the even indices; the odd ones are their Closes.
+    for i in (0..responses.len()).step_by(2) {
+        if NtStatus::from_u32(responses[i].0.status).is_error() {
+            let path = dirs.get(i / 2).map_or("", String::as_str);
+            return Err(smb_status_to_io_error(responses[i].0.status, path));
+        }
+    }
+
+    if responses.len() != expected {
+        // Name the first directory we could not confirm — that is the one the
+        // caller must not cache.
+        let unverified = dirs.get(responses.len() / 2).map_or("", String::as_str);
+        return Err(compound_too_short(unverified, responses, expected));
+    }
+
+    Ok(())
 }
 
 /// Map a short compound chain to a useful error.
@@ -2446,6 +2482,84 @@ fn sign_message(msg: &mut [u8], key: &[u8; 16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ensure_dirs_outcome ─────────────────────────────────────────────────
+
+    /// Build a Create/Close response pair chain with the given Create statuses.
+    fn dir_chain(create_statuses: &[u32]) -> Vec<(Header, Bytes)> {
+        let mut out = Vec::new();
+        for (i, st) in create_statuses.iter().enumerate() {
+            let mut create = Header::new(Command::Create, i as u64 * 2);
+            create.status = *st;
+            out.push((create, Bytes::new()));
+            let close = Header::new(Command::Close, i as u64 * 2 + 1);
+            out.push((close, Bytes::new()));
+        }
+        out
+    }
+
+    fn dirs(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("d{i}")).collect()
+    }
+
+    #[test]
+    fn ensure_dirs_outcome_accepts_a_complete_successful_chain() {
+        let d = dirs(3);
+        let resp = dir_chain(&[0, 0, 0]);
+        assert!(ensure_dirs_outcome(&d, &resp, 6).is_ok());
+    }
+
+    #[test]
+    fn ensure_dirs_outcome_keeps_the_status_when_the_chain_is_cut_short_by_it() {
+        // The failure mode that matters: the server aborted the chain on the
+        // first failed Create, so only that response came back. The precise
+        // NTSTATUS must survive — the write-path recovery keys on NotFound, and
+        // judging by length first would erase it into a framing error.
+        let d = dirs(4);
+        let resp = dir_chain(&[0xC000_003A]); // STATUS_OBJECT_PATH_NOT_FOUND
+        let err = ensure_dirs_outcome(&d, &resp, 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("d0"), "names the dir: {err}");
+    }
+
+    #[test]
+    fn ensure_dirs_outcome_keeps_access_denied_on_a_short_chain() {
+        // Same ordering requirement, different consequence: this one has to
+        // stay a 403 rather than becoming a retryable framing error.
+        let d = dirs(4);
+        let resp = dir_chain(&[0xC000_0022]); // STATUS_ACCESS_DENIED
+        let err = ensure_dirs_outcome(&d, &resp, 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn ensure_dirs_outcome_reports_the_failing_dir_not_the_first_one() {
+        // A mid-chain failure must be attributed to its own directory, or the
+        // caller evicts the wrong cache entry.
+        let d = dirs(3);
+        let resp = dir_chain(&[0, 0xC000_003A, 0]);
+        let err = ensure_dirs_outcome(&d, &resp, 6).unwrap_err();
+        assert!(err.to_string().contains("d1"), "names the dir: {err}");
+    }
+
+    #[test]
+    fn ensure_dirs_outcome_rejects_a_short_all_success_chain() {
+        // Every response that arrived succeeded, but not all arrived. Returning
+        // Ok would let the caller cache `d2`/`d3` as created when the server
+        // never created them, and every later write beneath them would fail
+        // having skipped the create that would have fixed it.
+        let d = dirs(4);
+        let resp = dir_chain(&[0, 0]);
+        let err = ensure_dirs_outcome(&d, &resp, 8).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn ensure_dirs_outcome_rejects_an_empty_chain() {
+        let d = dirs(2);
+        let err = ensure_dirs_outcome(&d, &[], 4).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 
     fn assert_kind_and_path(err: &io::Error, kind: io::ErrorKind, needle: &str) {
         assert_eq!(err.kind(), kind, "wrong kind for {err}");
