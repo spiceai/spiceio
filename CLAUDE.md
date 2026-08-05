@@ -22,7 +22,8 @@ make release                   # optimized release build
 make lint                      # static only: fmt-check + check + clippy + rustdoc (NOT full CI)
 make test-unit                 # cargo test --locked (no SMB)
 make test                      # sccache integration only (requires SPICEIO_SMB_USER/PASS)
-make test-live                 # sccache + extended + stress (CI live steps)
+make test-live                 # sccache + extended + write-back + stress (CI live steps)
+make test-writeback            # write-back ack + machine-wide spill, on their own
 make fmt                       # auto-format
 make clean                     # cargo clean
 
@@ -61,8 +62,8 @@ client and the network. Off by default and free when off.
 ### PR / agent verification gate (do not skip)
 
 **`make lint` alone is not enough** to claim CI will pass. CI also runs unit tests
-and three live SMB suites (`test-sccache.sh`, `test-extended.sh`,
-`stress-concurrent.sh`) against the shared NAS.
+and four live SMB suites (`test-sccache.sh`, `test-extended.sh`,
+`test-writeback.sh`, `stress-concurrent.sh`) against the shared NAS.
 
 Before declaring a PR green when NAS credentials are available:
 
@@ -76,6 +77,11 @@ Rules:
 - Custom curl benches / 10× stress **do not replace** `scripts/test-sccache.sh`.
   That script asserts sccache **cache hits > 0 and write errors == 0** — the
   exact failure mode unit tests and HTTP-only benches miss.
+- `scripts/test-writeback.sh` is the only check that an *asynchronously
+  acknowledged* write reaches the NAS. It cannot be replaced by asserting
+  against the instance that took the write — that instance's own cache answers
+  either way — so it restarts and reads back through a second instance with
+  write-back and the spill both off.
 - If `SPICEIO_SMB_USER`/`PASS` are set, `make ci` **requires** the live suites
   (`CI_REQUIRE_LIVE=1` by default). Do not unset credentials to skip them.
 - Without credentials, `make ci` still runs lint + unit tests and prints SKIP
@@ -91,7 +97,7 @@ The binary requires these environment variables:
 - `SPICEIO_SMB_DOMAIN` — SMB domain (default empty)
 - `SPICEIO_BUCKET` — virtual S3 bucket name (defaults to `SPICEIO_SMB_SHARE`)
 - `SPICEIO_REGION` — AWS region to advertise (default `us-east-1`)
-- `SPICEIO_SMB_CONNECTIONS` — number of SMB TCP connections in the pool (default: CPU count, clamped to 4–12)
+- `SPICEIO_SMB_CONNECTIONS` — number of SMB TCP connections in the pool (default: CPU count, clamped to 4–16)
 - `SPICEIO_SMB_MAX_IO` — max standalone read/write I/O size in bytes (default `262144`; raise for servers that handle larger I/O)
 - `SPICEIO_MULTIPART_TTL_SECS` — age at which an abandoned multipart upload is reaped (default `86400`)
 - `SPICEIO_CLEANUP_GRACE_SECS` — startup cleanup leaves WAL temps / upload dirs newer than this alone (default `900`), so instances sharing one share don't delete each other's in-flight state; `0` restores a blanket sweep
@@ -100,6 +106,10 @@ The binary requires these environment variables:
 - `SPICEIO_OBJECT_CACHE_BYTES` — max total GET body cache size (default `8589934592` = **8 GiB**, i.e. up to 8 GiB resident). **The most effective tuning knob**: the body cache is the only path that answers a GET without backend I/O, and eviction is O(log n) so a large cache costs no CPU. Budget is logged at startup, hit rate at shutdown; lower it on hosts that cannot spare the memory
 - `SPICEIO_OBJECT_CACHE_MAX_OBJECT` — max size of a single cached object (default: 1/64 of the budget, so it scales with it — 128 MiB at the 8 GiB default). The cap is about how many *other* objects one admission evicts: a fixed 32 MiB cap against a 256 MiB budget measured a hit-rate drop from 93% to 60%
 - `SPICEIO_OBJECT_CACHE_ENTRIES` — max cache entries (default `131072`, sized so *bytes* stay the binding constraint rather than the entry count)
+- `SPICEIO_SPILL_DIR` — machine-wide disk tier behind the memory cache (default `/var/tmp/spiceio-cache`; `off` or empty disables). Shared by every spiceio instance on the host, so a second instance benefits from the first one's reads and the cache is not bounded by one process's memory. Created 0700 — sharing is between processes of the same user, because a world-writable cache lets any local user plant an entry that a correct digest makes indistinguishable from a real one; an existing directory keeps its permissions, so a group-shared one is opt-in. Budget is clamped so at least 10 GiB stays free and to half the space above that, recomputed every sweep
+- `SPICEIO_SPILL_BYTES` — disk budget for the whole spill directory, across all instances (default `68719476736` = **64 GiB**)
+- `SPICEIO_WRITE_BACK` — acknowledge PutObject from memory and write to the NAS in the background (**on by default**; `0`/`false`/`off` disables). **Trades durability for latency**: a crash between the 200 and the background write loses that object (recoverable once it reaches the spill, which is where the flusher puts it first). Measured 2.6–6.7× end to end on a put-then-read sweep. Right for a cache backend, wrong for a system of record
+- `SPICEIO_WRITE_BACK_BYTES` — ceiling on un-flushed bytes before PutObject writes through synchronously (default `1073741824` = 1 GiB). This is the backpressure a backlogged NAS applies to clients
 - `SPICEIO_IMMUTABLE_OBJECTS` — when `1`/`true`, serve a cached body by key with **no backend round trip at all** (content-addressed stores like sccache, where the key is a hash of the bytes). Default off (etag-revalidated, which still costs one SMB open per hit). Trades noticing a backend-side delete for the round trip — harmless for a cache, wrong for a mutable namespace
 
 ## Architecture
@@ -107,6 +117,8 @@ The binary requires these environment variables:
 The codebase has five modules:
 
 - **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads (including UploadPartCopy, the form `aws s3 cp`/`sync` use for objects above the ~8 MiB multipart threshold), and stub endpoints for ACL/tagging/versioning. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spiceio-uploads/` on the SMB share. `body.rs` implements `SpiceioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
+
+  Caching lives here too. `object_cache.rs` is the in-memory tier (L1) and the entry point to both; `spill.rs` is the second tier (L2) — a directory on local disk shared by every instance on the machine, addressed by `sha256(backend-identity \0 key)`, published by atomic rename, carrying a body digest so a torn or power-loss-damaged entry reads as a miss rather than a wrong answer. Its eviction is LRU against a machine-wide budget, serialized between processes by a non-blocking `flock`, and it doubles as the write-back journal: a not-yet-flushed body is named `.d` (dirty) rather than `.o`, which keeps the sweeper from evicting it and lets a restart — or a peer instance — find and replay writes stranded by a crash. `writeback.rs` is the queue behind `SPICEIO_WRITE_BACK`: bodies acknowledged to the client but not yet on the NAS, flushed by a small pool of workers (journal → NAS → adopt the backend's etag in both tiers). Every operation that could observe the gap consults it — GET/HEAD serve from the cache without revalidating, DELETE cancels or waits out a flush, LIST overlays pending keys, copy paths flush the source first — and per-key ordering is total: a key is queued at most once, and a write arriving mid-flush re-queues on completion.
 
 - **`smb`** — Wire protocol client. `protocol.rs` defines SMB 3.1.x packet structures (little-endian). `client.rs` manages a TCP connection, negotiate/session-setup handshake, and exposes operations (tree connect, create, read, write, close, query directory, pipelined read). `pool.rs` manages N authenticated connections for concurrent request fan-out. `auth.rs` implements NTLMv2 challenge-response. `ops.rs` provides the high-level `ShareSession` abstraction the S3 layer consumes (list, read, write, delete, stat, copy).
 
@@ -122,8 +134,10 @@ The codebase has five modules:
 
 - Zero external crypto dependencies — all crypto goes through `crypto::ffi` to CommonCrypto.
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.
-- Connection pool — N TCP connections (default: CPU count, clamped 4–12) to the same SMB server. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
+- Connection pool — N TCP connections (default: CPU count, clamped 4–16) to the same SMB server. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
 - Least-loaded dispatch — each connection tracks its queue depth via `StreamGuard`, the only way to reach the stream (so the accounting cannot be skipped) and `SmbPool::pick` sends new work to the shallowest healthy connection, rotating on ties. A connection owns its stream for a whole round trip, so blind round-robin could put a one-round-trip HEAD behind a multi-megabyte pipelined batch.
+- Two-tier object cache — L1 in process memory, L2 on local disk shared machine-wide. L2 exists because the backend saturates at a fixed rate while local NVMe does not, and because a second instance should not re-fetch what the first already pulled down. A disk hit is promoted into memory; both tiers are written on the way out.
+- Write-back is bounded and yields to readers — acknowledging a PUT before the NAS write is a durability trade, so it is capped by un-flushed bytes (past which PutObject writes through synchronously), drained at shutdown, and journalled to the spill so a crash is recoverable rather than silent. Flushers take the same admission slot live requests do and leave a quarter of the budget free: fair queueing measured a *read* latency spike during a write drain worse than the write latency the feature removes. Both that reserve and the overload backoff are lifted once the drain begins — there is no client left to defer to, and deferring would spend the drain's whole budget sleeping.
 - Object body cache is the throughput lever — the backend saturates at a fixed rate (measured ~100 MiB/s; see `benches/baselines/`), and the cache is the only mechanism that beats it. Eviction is a `pop_first` on a use-generation index, not a scan, so the cache can be sized to a real working set. Writes populate it (write-through): a cache client reads back what it just wrote, and the bytes are already in hand. `SPICEIO_IMMUTABLE_OBJECTS` serves hits with no round trip at all.
 - Zero-copy response bodies — each SMB response is read into one allocation and handed to decoders as `Bytes` views (`send_recv`, `parse_compound_response`, `decode_read_response_bytes`), so no read payload is memcpy'd out of its buffer.
 - Proactive keepalive — the healer probes connections idle for 45s with SMB2 ECHO, and SMB sockets enable TCP keepalive, so a session dropped while idle is poisoned and reconnected before a client request lands on it.

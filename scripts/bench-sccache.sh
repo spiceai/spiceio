@@ -30,6 +30,10 @@ set -euo pipefail
 #   BENCH_SMB_CONNECTIONS  spiceio pool size (default 12)
 #   BENCH_PHASES           loadgen phases (default put,get,head-hit,head-miss,mixed)
 #   BENCH_PASSES           which passes to run (default "cached nocache")
+#                          `cached`/`nocache` pin SPICEIO_WRITE_BACK=0 so they
+#                          are baselines; also available: `writeback` (the
+#                          shipped default) and `nospill` (SPICEIO_SPILL_DIR=off),
+#                          for isolating the write-ack and disk-tier changes
 #   BENCH_OUT              results directory (default benches/results)
 #   BENCH_LABEL            label recorded in the report (default: git describe)
 #   BENCH_KEEP             1 to leave written objects on the share (default 0)
@@ -337,13 +341,28 @@ for pass in $SELECTED_PASSES; do
     fi
     case "$pass" in
         cached)
-            start_spiceio cached
+            # Write-back pinned off: it is on by default, and a baseline that
+            # inherited it would make the `writeback` pass a comparison against
+            # itself. Same reason the `nocache` pass pins the cache off.
+            start_spiceio cached SPICEIO_WRITE_BACK=0
             ;;
         nocache)
-            start_spiceio nocache SPICEIO_OBJECT_CACHE_BYTES=0 SPICEIO_OBJECT_CACHE_ENTRIES=0
+            start_spiceio nocache SPICEIO_WRITE_BACK=0 \
+                SPICEIO_OBJECT_CACHE_BYTES=0 SPICEIO_OBJECT_CACHE_ENTRIES=0
+            ;;
+        writeback)
+            # PUT acknowledged from memory; the NAS write happens behind it (the
+            # shipped default). The number to read is the `put` phase against the
+            # `cached` pass, which pins it off.
+            start_spiceio writeback SPICEIO_WRITE_BACK=1
+            ;;
+        nospill)
+            # Memory tier only, for attributing a change to the disk tier rather
+            # than to the cache as a whole.
+            start_spiceio nospill SPICEIO_SPILL_DIR=off
             ;;
         *)
-            echo "[bench] unknown pass ${pass}; expected 'cached' or 'nocache'" >&2
+            echo "[bench] unknown pass ${pass}; expected one of: cached nocache writeback nospill" >&2
             exit 1
             ;;
     esac
