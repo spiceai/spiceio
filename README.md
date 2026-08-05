@@ -95,10 +95,10 @@ All configuration is via environment variables:
 | `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
 | `SPICEIO_LOG_FILE`            | no       | *(none)*            | Append logs to file (non-blocking) |
 | `SPICEIO_ACCESS_LOG`          | no       | *(none)*            | Per-request TSV metrics log for benchmarking: `t_ms method status req_bytes resp_bytes head_us total_us path` |
-| `SPICEIO_OBJECT_CACHE_BYTES`  | no       | `268435456` (256 MiB) | Max total GET body cache size |
-| `SPICEIO_OBJECT_CACHE_MAX_OBJECT` | no   | `4194304` (4 MiB)   | Max size of a single cached object |
-| `SPICEIO_OBJECT_CACHE_ENTRIES`| no       | `4096`              | Max body-cache entries |
-| `SPICEIO_IMMUTABLE_OBJECTS`   | no       | off                 | When `1`/`true`, allow key-only body-cache lookup after HEAD revalidation (content-addressed stores like sccache) |
+| `SPICEIO_OBJECT_CACHE_BYTES`  | no       | `8589934592` (8 GiB) | Max total GET body cache size — up to this much resident memory. The most effective tuning knob |
+| `SPICEIO_OBJECT_CACHE_MAX_OBJECT` | no   | budget / 64 (128 MiB) | Max size of a single cached object; scales with the budget so one object cannot evict a large share of the cache |
+| `SPICEIO_OBJECT_CACHE_ENTRIES`| no       | `131072`            | Max body-cache entries (sized so bytes bind first) |
+| `SPICEIO_IMMUTABLE_OBJECTS`   | no       | off                 | When `1`/`true`, serve cached bodies by key with **no backend round trip**. For content-addressed stores (sccache) where the key is a hash of the content. Gives up noticing a backend-side delete |
 
 ## Supported S3 operations
 

@@ -1,0 +1,53 @@
+[bench] building release binary...
+═══════════════════════════════════════════════════════════════════
+ spiceio real-build sccache bench — perf-cache
+ build  : /Users/lukim/dev/spiceai (-p spice)
+ arms   : local spiceio
+ jobs   : 16
+ target : smb://192.168.3.148/ai_platform_dev  bucket=sccache-bench
+ results: benches/results/build-20260805T012047Z
+═══════════════════════════════════════════════════════════════════
+[bench] starting spiceio (pool=12)...
+
+── arm=local jobs=16 ─────────────────────────────────────
+  cold: 148.8s  misses=1163 writes=1163 write_avg=1.10ms write_err=0
+  warm: 21.7s  hits=1162 misses=1 hit_avg=0.50ms read_err=0 timeouts=0
+
+── arm=spiceio jobs=16 ─────────────────────────────────────
+  cold: 154.5s  misses=1163 writes=1163 write_avg=24.85ms write_err=0
+  warm: 21.3s  hits=1163 misses=0 hit_avg=1.52ms read_err=0 timeouts=0
+
+═══════════════════════════════════════════════════════════════════
+# spiceio real-build sccache bench — build-20260805T012047Z
+
+| field | value |
+| --- | --- |
+| label | `perf-cache` |
+| build | `/Users/lukim/dev/spiceai` (-p spice) |
+
+`local` is sccache on local disk — the floor a network backend is measured
+against. `nocache` is the compile-everything ceiling.
+
+| arm | jobs | phase | wall | hits | misses | hit avg | write avg | errors |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| local | 16 | cold | 148.8s | 0 | 1163 | 0.00ms | 1.10ms | 0 |
+| local | 16 | warm | 21.7s | 1162 | 1 | 0.50ms | 6.98ms | 0 |
+| spiceio | 16 | cold | 154.5s | 0 | 1163 | 0.00ms | 24.85ms | 0 |
+| spiceio | 16 | warm | 21.3s | 1163 | 0 | 1.52ms | 0.00ms | 0 |
+
+## spiceio versus local disk
+
+| jobs | phase | local | spiceio | overhead | per-op gap |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 16 | cold | 148.8s | 154.5s | 1.04x | +23.75ms per cache write |
+| 16 | warm | 21.7s | 21.3s | 0.98x | +1.02ms per cache hit |
+
+## Raw
+
+- `build-results.tsv` — every measurement, tab separated
+- `stats-<arm>-j<jobs>-warm.txt` — full `sccache --show-stats` per arm
+- `access-build.tsv` — spiceio server-side per-request log for the spiceio arm
+═══════════════════════════════════════════════════════════════════
+ report: benches/results/build-20260805T012047Z/report.md
+[bench] removing build-cache objects from the share...
+########## PERF BUILD DONE ##########

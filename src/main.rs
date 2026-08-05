@@ -160,17 +160,17 @@ async fn connect_share(
     share.cleanup_previous_runs().await;
     let object_cache = Arc::new(ObjectCache::from_env());
     slog!("[spiceio] admission limit {admission} concurrent SMB ops (pool×work-depth)");
-    if object_cache.immutable() {
-        slog!(
-            "[spiceio] object cache: immutable-keys mode on, max_object={}B",
-            object_cache.max_object_bytes()
-        );
-    } else {
-        slog!(
-            "[spiceio] object cache: etag-validated, max_object={}B",
-            object_cache.max_object_bytes()
-        );
-    }
+    slog!(
+        "[spiceio] object cache: {} MiB budget, max_object={} MiB, {} entries, {}",
+        object_cache.max_bytes() / (1024 * 1024),
+        object_cache.max_object_bytes() / (1024 * 1024),
+        object_cache.max_entries(),
+        if object_cache.immutable() {
+            "immutable keys (hits served with no backend round trip)"
+        } else {
+            "etag-revalidated (one stat per hit)"
+        }
+    );
     Ok(Arc::new(AppState {
         share,
         bucket: bucket_name,
@@ -426,6 +426,10 @@ async fn main() {
     // Requests that arrive before SMB is ready get 503 SlowDown + Retry-After
     // rather than a TCP refuse — sccache treats temporary storage errors as
     // retryable, but a connection refusal fails server startup hard.
+    // Kept out of the handler closure, which takes ownership of `ready`, so the
+    // shutdown summary below can still read the cache counters.
+    let ready_for_stats = Arc::clone(&ready);
+
     http::serve(
         listener,
         http::ServeConfig::default(),
@@ -449,6 +453,23 @@ async fn main() {
         },
     )
     .await;
+
+    // The body cache is the only mechanism that serves a GET without touching
+    // the NAS, so its hit rate is the single most useful number for explaining
+    // a deployment's throughput. A cache whose working set does not fit looks
+    // exactly like one that is working, from the outside.
+    if let Some(state) = ready_for_stats.get() {
+        let (hits, misses, hit_bytes) = state.object_cache.stats();
+        let total = hits + misses;
+        if total > 0 {
+            slog!(
+                "[spiceio] object cache: {hits} hit / {misses} miss ({:.1}% hit rate), \
+                 {:.1} MiB served from memory",
+                100.0 * hits as f64 / total as f64,
+                hit_bytes as f64 / 1_048_576.0,
+            );
+        }
+    }
 
     // Push the final log lines (including the shutdown notice) to disk before
     // the process exits and takes the writer thread with it.

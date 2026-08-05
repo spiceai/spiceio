@@ -23,7 +23,7 @@ use super::headers::*;
 use super::multipart::MultipartStore;
 use super::object_cache::ObjectCache;
 use super::xml::{self, XmlWriter};
-use crate::smb::ops::ShareSession;
+use crate::smb::ops::{ShareSession, guess_content_type};
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -646,14 +646,57 @@ async fn handle_get_object(
     let no_range = range_header.is_none();
 
     if no_range {
-        // Immutable-key soft path: if configured and we have a body, still
-        // verify with a cheap HEAD (stat) so multi-instance DELETE/overwrite
-        // is visible.
+        // Immutable-key fast path: answer entirely from memory, with no SMB
+        // round trip.
+        //
+        // This previously revalidated with a HEAD, which made a cache hit cost
+        // the same round trip as a miss — measured at 0.56ms and a pool slot,
+        // against ~0.05ms to serve the bytes we already hold. Under a backend
+        // that saturates at a fixed throughput (see benches/baselines), the
+        // round trip is the expensive part, not the bytes.
+        //
+        // Sound only because `immutable` asserts the key determines the
+        // content: in a content-addressed store like sccache the key *is* a
+        // hash of these bytes, so nothing can put different content under it
+        // and a revalidation has nothing to discover. What it gives up is
+        // noticing a backend-side delete — harmless for a cache, since the
+        // client asked for a content hash and receives exactly those bytes.
         if cache.immutable()
-            && let Some((cached_etag, cached_body)) = cache.get_by_key(key)
+            && let Some(hit) = cache.get_by_key(key)
         {
+            let etag = format!("\"{}\"", hit.etag);
+            if let Some(resp) = conditional_get_short_circuit(
+                &if_match,
+                &if_none_match,
+                &if_modified_since,
+                &if_unmodified_since,
+                &etag,
+                hit.last_modified,
+            ) {
+                return resp;
+            }
+            return cached_get_response(
+                &guess_content_type(key),
+                hit.last_modified,
+                &etag,
+                hit.body,
+            );
+        }
+
+        // Warm cache, etag mode: revalidate with a compound stat (one round
+        // trip) rather than an open.
+        //
+        // Opening leaves a handle that has to be closed, so a *hit* — the case
+        // `contains_key` has already made likely — cost two round trips where
+        // one will do. The open only pays off when revalidation fails and the
+        // handle can be reused to stream, which is the rarer path; that path
+        // now opens for itself below.
+        //
+        // Not needed at all in immutable mode, which returned above without
+        // touching the backend.
+        if cache.contains_key(key) {
             match share.head_object(key).await {
-                Ok(meta) if meta.etag == cached_etag && meta.size == cached_body.len() as u64 => {
+                Ok(meta) => {
                     let etag = format!("\"{}\"", meta.etag);
                     if let Some(resp) = conditional_get_short_circuit(
                         &if_match,
@@ -665,14 +708,19 @@ async fn handle_get_object(
                     ) {
                         return resp;
                     }
-                    return cached_get_response(
-                        &meta.content_type,
-                        meta.last_modified,
-                        &etag,
-                        cached_body,
-                    );
+                    if let Some(cached) = cache.get_if_etag(key, &meta.etag)
+                        && cached.len() as u64 == meta.size
+                    {
+                        return cached_get_response(
+                            &meta.content_type,
+                            meta.last_modified,
+                            &etag,
+                            cached,
+                        );
+                    }
+                    // Stale entry — drop it and fall through to a cold read.
+                    cache.invalidate(key);
                 }
-                Ok(_) => cache.invalidate(key), // etag/size changed
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     cache.invalidate(key);
                     return error_response(
@@ -686,66 +734,7 @@ async fn handle_get_object(
             }
         }
 
-        // Warm cache: open/stat revalidates etag without re-reading the body
-        // (compound would pay for a full Create+Read+Close even on a hit).
-        if cache.contains_key(key) {
-            match share.open_read(key).await {
-                Ok(handle) => {
-                    let meta = &handle.meta;
-                    let etag = format!("\"{}\"", meta.etag);
-                    if let Some(resp) = conditional_get_short_circuit(
-                        &if_match,
-                        &if_none_match,
-                        &if_modified_since,
-                        &if_unmodified_since,
-                        &etag,
-                        meta.last_modified,
-                    ) {
-                        let _ = handle.close().await;
-                        return resp;
-                    }
-                    if let Some(cached) = cache.get_if_etag(key, &meta.etag)
-                        && cached.len() as u64 == handle.file_size
-                    {
-                        let content_type = meta.content_type.clone();
-                        let last_modified = meta.last_modified;
-                        let _ = handle.close().await;
-                        return cached_get_response(&content_type, last_modified, &etag, cached);
-                    }
-                    // Stale entry — drop it and fall through (handle still open
-                    // for the streaming path below if compound is not usable).
-                    cache.invalidate(key);
-                    if handle.file_size > max_read as u64 {
-                        // Large warm-miss: reuse this open for streaming.
-                        return stream_get_object(
-                            handle,
-                            share,
-                            key,
-                            range_header.as_deref(),
-                            &if_match,
-                            &if_none_match,
-                            &if_modified_since,
-                            &if_unmodified_since,
-                            cache,
-                            true, // already evaluated conditionals
-                        )
-                        .await;
-                    }
-                    let _ = handle.close().await;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    cache.invalidate(key);
-                    return error_response(
-                        StatusCode::NOT_FOUND,
-                        "NoSuchKey",
-                        "The specified key does not exist.",
-                    );
-                }
-                Err(e) if crate::smb::ops::is_reset(&e) => {}
-                Err(e) => return io_to_s3_error(&e),
-            }
-        }
-
+        cache.note_miss();
         let result = share.get_object_compound(key, max_read).await;
         match result {
             Ok((meta, data)) if meta.size <= max_read as u64 => {
@@ -766,7 +755,7 @@ async fn handle_get_object(
                 // body re-fetch. Prefer an existing matching entry when present.
                 let body_data = cache.get_if_etag(key, &meta.etag).unwrap_or_else(|| {
                     if (data.len() as u64) <= cache.max_object_bytes() {
-                        cache.insert(key, &meta.etag, data.clone());
+                        cache.insert(key, &meta.etag, meta.last_modified, data.clone());
                     }
                     data
                 });
@@ -877,6 +866,7 @@ async fn stream_get_object(
     let content_type = meta.content_type.clone();
     let file_size = handle.file_size;
     let cache_etag = meta.etag.clone();
+    let cache_last_modified = meta.last_modified;
     let cache_key = key.to_string();
     let may_fill_cache = no_range && file_size > 0 && file_size <= cache.max_object_bytes();
     let cache_for_task = Arc::clone(cache);
@@ -1189,7 +1179,12 @@ async fn stream_get_object(
             && let Some(buf) = cache_buf
             && buf.len() as u64 == file_size
         {
-            cache_for_task.insert(&cache_key, &cache_etag, Bytes::from(buf));
+            cache_for_task.insert(
+                &cache_key,
+                &cache_etag,
+                cache_last_modified,
+                Bytes::from(buf),
+            );
         }
 
         let _ = handle.close().await;
@@ -1260,9 +1255,16 @@ async fn handle_put_object(
         };
         match share.put_object(key, &data).await {
             Ok(meta) => {
-                // Local overwrite must drop any prior body so a subsequent GET
-                // does not serve the old etag's bytes under a revalidation race.
-                state.object_cache.invalidate(key);
+                // Write through rather than invalidate. The one thing about a
+                // cache client's future that is not a guess is that it will
+                // read back what it just wrote — sccache PUTs an object and
+                // GETs it on the next build — and the bytes are already in
+                // hand, so populating costs a refcount bump and saves a full
+                // backend read later. `insert` replaces any prior entry, so
+                // this is also the invalidation the overwrite needs.
+                state
+                    .object_cache
+                    .insert(key, &meta.etag, meta.last_modified, data.clone());
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header("ETag", format!("\"{}\"", meta.etag));
@@ -1283,15 +1285,30 @@ async fn handle_put_object(
 
     let mut write_err = None;
 
+    // Accumulate the body as it streams so the write can populate the cache
+    // (see the compound path above for why). Dropped the moment it outgrows
+    // what the cache would accept, so a multi-gigabyte upload buffers nothing.
+    let cache_cap = state.object_cache.max_object_bytes();
+    let mut cache_buf: Option<Vec<u8>> = Some(Vec::new());
+
     while let Some(frame) = body.frame().await {
         match frame {
             Ok(frame) => {
                 if let Ok(data) = frame.into_data()
                     && !data.is_empty()
-                    && let Err(e) = wal.write(&data).await
                 {
-                    write_err = Some(e);
-                    break;
+                    match cache_buf.as_mut() {
+                        Some(buf) if buf.len() as u64 + data.len() as u64 <= cache_cap => {
+                            buf.extend_from_slice(&data);
+                        }
+                        // Too large to cache — stop accumulating and give the
+                        // memory back rather than carrying it to the end.
+                        _ => cache_buf = None,
+                    }
+                    if let Err(e) = wal.write(&data).await {
+                        write_err = Some(e);
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -1333,7 +1350,17 @@ async fn handle_put_object(
         Err(e) => return io_to_s3_write_error(&e),
     };
 
-    state.object_cache.invalidate(key);
+    // Same write-through as the compound path. The size check is what makes it
+    // safe to trust the buffer: a short read or a mid-stream abort would leave
+    // it disagreeing with what was actually published.
+    match cache_buf {
+        Some(buf) if buf.len() as u64 == meta.size => {
+            state
+                .object_cache
+                .insert(key, &meta.etag, meta.last_modified, Bytes::from(buf));
+        }
+        _ => state.object_cache.invalidate(key),
+    }
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
