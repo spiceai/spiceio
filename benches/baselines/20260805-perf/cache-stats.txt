@@ -1,0 +1,6 @@
+2026-08-05T01:41:38.676Z [spiceio] object cache: 8192 MiB budget, max_object=128 MiB, 131072 entries, etag-revalidated (one stat per hit)
+2026-08-05T01:43:29.717Z [spiceio] object cache: 21926 hit / 3351 miss (86.7% hit rate), 11717.6 MiB served from memory
+2026-08-05T01:43:30.524Z [spiceio] object cache: 0 MiB budget, max_object=0 MiB, 1 entries, etag-revalidated (one stat per hit)
+2026-08-05T01:47:13.927Z [spiceio] object cache: 0 hit / 25244 miss (0.0% hit rate), 0.0 MiB served from memory
+2026-08-05T01:47:14.815Z [spiceio] object cache: 8192 MiB budget, max_object=128 MiB, 131072 entries, immutable keys (hits served with no backend round trip)
+2026-08-05T01:48:35.420Z [spiceio] object cache: 23507 hit / 1737 miss (93.1% hit rate), 14122.1 MiB served from memory

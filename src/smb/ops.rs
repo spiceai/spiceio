@@ -2578,7 +2578,7 @@ fn filetime_to_epoch_secs(ft: u64) -> u64 {
 }
 
 /// Very simple content type guessing based on extension.
-fn guess_content_type(key: &str) -> String {
+pub(crate) fn guess_content_type(key: &str) -> String {
     let ext = key.rsplit('.').next().unwrap_or("");
     match ext.to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html",

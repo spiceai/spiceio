@@ -97,10 +97,10 @@ The binary requires these environment variables:
 - `SPICEIO_CLEANUP_GRACE_SECS` — startup cleanup leaves WAL temps / upload dirs newer than this alone (default `900`), so instances sharing one share don't delete each other's in-flight state; `0` restores a blanket sweep
 - `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
 - `SPICEIO_ACCESS_LOG` — per-request TSV metrics log for benchmarking (optional; off by default, one atomic load per request when off)
-- `SPICEIO_OBJECT_CACHE_BYTES` — max total GET body cache size (default `268435456` = 256 MiB)
-- `SPICEIO_OBJECT_CACHE_MAX_OBJECT` — max size of a single cached object (default `4194304` = 4 MiB)
-- `SPICEIO_OBJECT_CACHE_ENTRIES` — max cache entries (default `4096`)
-- `SPICEIO_IMMUTABLE_OBJECTS` — when `1`/`true`, allow key-only body lookup after a HEAD revalidation (content-addressed stores like sccache); default off (etag-validated only)
+- `SPICEIO_OBJECT_CACHE_BYTES` — max total GET body cache size (default `8589934592` = **8 GiB**, i.e. up to 8 GiB resident). **The most effective tuning knob**: the body cache is the only path that answers a GET without backend I/O, and eviction is O(log n) so a large cache costs no CPU. Budget is logged at startup, hit rate at shutdown; lower it on hosts that cannot spare the memory
+- `SPICEIO_OBJECT_CACHE_MAX_OBJECT` — max size of a single cached object (default: 1/64 of the budget, so it scales with it — 128 MiB at the 8 GiB default). The cap is about how many *other* objects one admission evicts: a fixed 32 MiB cap against a 256 MiB budget measured a hit-rate drop from 93% to 60%
+- `SPICEIO_OBJECT_CACHE_ENTRIES` — max cache entries (default `131072`, sized so *bytes* stay the binding constraint rather than the entry count)
+- `SPICEIO_IMMUTABLE_OBJECTS` — when `1`/`true`, serve a cached body by key with **no backend round trip at all** (content-addressed stores like sccache, where the key is a hash of the bytes). Default off (etag-revalidated, which still costs one SMB open per hit). Trades noticing a backend-side delete for the round trip — harmless for a cache, wrong for a mutable namespace
 
 ## Architecture
 
@@ -124,6 +124,7 @@ The codebase has five modules:
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.
 - Connection pool — N TCP connections (default: CPU count, clamped 4–12) to the same SMB server. Concurrent S3 requests fan out across connections instead of serializing on a single mutex. File handles are pinned to the connection that opened them.
 - Least-loaded dispatch — each connection tracks its queue depth via `StreamGuard`, the only way to reach the stream (so the accounting cannot be skipped) and `SmbPool::pick` sends new work to the shallowest healthy connection, rotating on ties. A connection owns its stream for a whole round trip, so blind round-robin could put a one-round-trip HEAD behind a multi-megabyte pipelined batch.
+- Object body cache is the throughput lever — the backend saturates at a fixed rate (measured ~100 MiB/s; see `benches/baselines/`), and the cache is the only mechanism that beats it. Eviction is a `pop_first` on a use-generation index, not a scan, so the cache can be sized to a real working set. Writes populate it (write-through): a cache client reads back what it just wrote, and the bytes are already in hand. `SPICEIO_IMMUTABLE_OBJECTS` serves hits with no round trip at all.
 - Zero-copy response bodies — each SMB response is read into one allocation and handed to decoders as `Bytes` views (`send_recv`, `parse_compound_response`, `decode_read_response_bytes`), so no read payload is memcpy'd out of its buffer.
 - Proactive keepalive — the healer probes connections idle for 45s with SMB2 ECHO, and SMB sockets enable TCP keepalive, so a session dropped while idle is poisoned and reconnected before a client request lands on it.
 - Verified before publish — `WalWriter::commit` stats the temp file *before* the rename and refuses to publish if it is shorter than the bytes written, so a failed check leaves any existing object untouched. `assemble_parts` checks each part against its acknowledged size while streaming, and `collect_body` enforces Content-Length for every buffered body path. Nothing corrupt reaches the client's key, so no compensating delete (which would race a concurrent writer) is needed.

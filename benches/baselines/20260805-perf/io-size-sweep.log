@@ -1,0 +1,41 @@
+########## SPICEIO_SMB_MAX_IO=262144 (256K) ##########
+── nocache @ concurrency 1 (96 ops/phase) ─────────────
+put                96      68.7      40.3    14.6ms    4.00ms    24.2ms   301.7ms   301.7ms       0
+get                96      87.6      51.4    11.4ms    2.43ms    19.5ms   241.1ms   241.1ms       0
+── nocache @ concurrency 8 (96 ops/phase) ─────────────
+put                96     141.2      82.9    48.4ms    21.3ms   114.8ms   560.4ms   560.4ms       0
+get                96     162.5      95.4    36.4ms    8.05ms    90.7ms   531.3ms   531.3ms       0
+── nocache @ concurrency 32 (256 ops/phase) ─────────────
+put               256     164.1      99.0   170.9ms    86.6ms   398.1ms   851.1ms  1253.5ms       0
+get               256     172.7     104.2   148.9ms    81.9ms   403.2ms   868.3ms  1308.1ms       0
+########## SPICEIO_SMB_MAX_IO=1048576 (1024K) ##########
+── nocache @ concurrency 1 (96 ops/phase) ─────────────
+put                96      61.1      35.9    16.4ms    4.07ms    29.7ms   377.0ms   377.0ms       0
+get                96      70.2      41.2    14.2ms    2.46ms    25.7ms   266.4ms   266.4ms       0
+── nocache @ concurrency 8 (96 ops/phase) ─────────────
+put                96     120.5      70.7    58.5ms    23.1ms   160.2ms   660.1ms   660.1ms       0
+get                96     170.7     100.2    39.8ms    8.64ms    85.3ms   511.3ms   511.3ms       0
+── nocache @ concurrency 32 (256 ops/phase) ─────────────
+put               256     156.0      94.1   174.6ms    84.1ms   418.4ms   971.2ms  1116.4ms       0
+get               256     146.7      88.5   175.6ms    82.0ms   456.2ms  1095.5ms  1742.1ms       0
+########## SPICEIO_SMB_MAX_IO=4194304 (4096K) ##########
+── nocache @ concurrency 1 (96 ops/phase) ─────────────
+put                96      49.8      29.2    20.1ms    4.10ms    36.5ms   424.3ms   424.3ms       0
+get                96      64.0      37.6    15.6ms    2.40ms    29.6ms   367.5ms   367.5ms       0
+── nocache @ concurrency 8 (96 ops/phase) ─────────────
+put                96     121.8      71.5    47.3ms    17.0ms   145.1ms   643.1ms   643.1ms       0
+get                96     138.9      81.5    39.4ms    8.20ms    92.3ms   641.6ms   641.6ms       0
+── nocache @ concurrency 32 (256 ops/phase) ─────────────
+put               256     141.1      85.1   176.0ms    74.2ms   438.1ms   984.6ms  1447.4ms       0
+get               256     151.9      91.6   139.3ms    52.1ms   439.1ms  1209.0ms  1566.7ms       0
+########## SPICEIO_SMB_MAX_IO=8388608 (8192K) ##########
+── nocache @ concurrency 1 (96 ops/phase) ─────────────
+put                96      52.2      30.7    19.1ms    4.65ms    30.4ms   436.3ms   436.3ms       0
+get                96      64.7      38.0    15.5ms    2.38ms    25.8ms   396.1ms   396.1ms       0
+── nocache @ concurrency 8 (96 ops/phase) ─────────────
+put                96     144.7      84.9    47.5ms    18.5ms   119.4ms   562.4ms   562.4ms       0
+get                96     126.8      74.5    45.9ms    11.7ms    76.2ms   706.2ms   706.2ms       0
+── nocache @ concurrency 32 (256 ops/phase) ─────────────
+put               256     140.4      84.7   167.8ms    71.2ms   438.4ms  1003.9ms  1268.8ms       0
+get               256     157.6      95.1   154.6ms    65.4ms   432.2ms  1262.1ms  1469.2ms       0
+########## IO SWEEP DONE ##########
