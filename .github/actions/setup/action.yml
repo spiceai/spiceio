@@ -3,9 +3,9 @@ description: Install a released version of spiceio and start the S3-to-SMB proxy
 
 inputs:
   version:
-    description: Release tag to install (e.g. "v0.5.10"). Use "latest" for the most recent release.
+    description: Release tag to install (e.g. "v0.6.0"). Use "latest" for the most recent release.
     required: false
-    default: v0.5.10
+    default: v0.6.0
   smb-url:
     description: >
       SMB connection URL: smb://user:pass@server/share or smb://user:pass@server:port/share.
@@ -33,11 +33,23 @@ inputs:
     default: "8"
   immutable-objects:
     description: >
-      When "true" or "1", enable SPICEIO_IMMUTABLE_OBJECTS — key-only body-cache
-      lookup after HEAD revalidation. Safe for content-addressed stores (sccache);
-      leave off for mutable S3 keys.
+      When "true" or "1", enable SPICEIO_IMMUTABLE_OBJECTS — serve a cached body
+      by key with no SMB round trip at all. Correct for content-addressed stores
+      such as sccache, where the key is a hash of the content and nothing can put
+      different bytes under it; leave off for mutable S3 keys, where it would
+      also stop noticing a delete. This is the single largest performance
+      setting: measured 23x read throughput against revalidating every hit.
     required: false
     default: "false"
+  cache-bytes:
+    description: >
+      SPICEIO_OBJECT_CACHE_BYTES — max resident bytes for the GET body cache.
+      Empty uses spiceio's own default, which is 8 GiB. Runners that are also
+      compiling should set this explicitly: the cache is the main throughput
+      lever, but it is resident memory competing with the build. The configured
+      budget is logged at startup and the achieved hit rate at shutdown.
+    required: false
+    default: ""
   token:
     description: GitHub token for downloading release assets from private repos
     required: true
@@ -93,6 +105,7 @@ runs:
         SPICEIO_BIND: ${{ inputs.bind }}
         SPICEIO_SMB_CONNECTIONS: ${{ inputs.connections }}
         IMMUTABLE_OBJECTS: ${{ inputs.immutable-objects }}
+        CACHE_BYTES: ${{ inputs.cache-bytes }}
       run: |
         set -euo pipefail
 
@@ -141,6 +154,12 @@ runs:
         export SPICEIO_SMB_SERVER SPICEIO_SMB_PORT SPICEIO_SMB_USER SPICEIO_SMB_PASS SPICEIO_SMB_SHARE
         export SPICEIO_BUCKET SPICEIO_REGION SPICEIO_BIND SPICEIO_SMB_CONNECTIONS
         export SPICEIO_IMMUTABLE_OBJECTS
+
+        # Only export when set, so an empty input leaves spiceio's own default
+        # in place rather than pinning the cache to zero bytes.
+        if [[ -n "$CACHE_BYTES" ]]; then
+          export SPICEIO_OBJECT_CACHE_BYTES="$CACHE_BYTES"
+        fi
 
         SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"
         : > "$SPICEIO_LOG"

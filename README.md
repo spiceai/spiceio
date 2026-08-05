@@ -60,6 +60,18 @@ aws s3 cp myfile.txt s3://files/remote.txt --endpoint-url http://localhost:8333
 
 ### sccache example
 
+Start spiceio with immutable-object caching on — sccache keys are content
+hashes, so a cached body can be served without revalidating it. This is worth
+**23x read throughput** and is the single most effective setting for this
+workload (see [`benches/baselines/`](benches/baselines/)):
+
+```bash
+export SPICEIO_IMMUTABLE_OBJECTS=1
+./target/release/spiceio
+```
+
+Then point sccache at it:
+
 ```bash
 export SCCACHE_BUCKET=files
 export SCCACHE_ENDPOINT=http://localhost:8333
@@ -73,6 +85,10 @@ export CARGO_INCREMENTAL=0
 
 cargo build   # artifacts cached on your NAS via spiceio
 ```
+
+The body cache defaults to 8 GiB of resident memory; lower
+`SPICEIO_OBJECT_CACHE_BYTES` on hosts that cannot spare it. spiceio logs the
+budget at startup and the achieved hit rate at shutdown.
 
 ## Configuration
 
