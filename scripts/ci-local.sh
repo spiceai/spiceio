@@ -82,6 +82,15 @@ run_live_suites() {
         ./scripts/test-extended.sh
     )
 
+    step "write-back + disk spill (scripts/test-writeback.sh)"
+    (
+        export SPICEIO_BUCKET=writeback
+        export SPICEIO_BIND=127.0.0.1:18337
+        export SPICEIO_BIND2=127.0.0.1:18338
+        export AWS_DEFAULT_REGION="${SPICEIO_REGION}"
+        ./scripts/test-writeback.sh
+    )
+
     step "concurrent stress (scripts/stress-concurrent.sh)"
     (
         export SPICEIO_BUCKET=stress
@@ -114,7 +123,7 @@ elif [[ "$CI_REQUIRE_LIVE" == "1" || "$LIVE_ONLY" -eq 1 ]]; then
     echo ""
     echo "ci-local: FAIL — live suites required but SPICEIO_SMB_USER/PASS are not set."
     echo "  Export credentials (or source /tmp/spiceio-bench-env.sh) and re-run."
-    echo "  Live suites (test-sccache / test-extended / stress-concurrent) are what"
+    echo "  Live suites (test-sccache / test-extended / test-writeback / stress-concurrent) are what"
     echo "  CI runs; skipping them is how sccache write-error failures ship."
     exit 1
 else

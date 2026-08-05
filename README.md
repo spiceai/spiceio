@@ -90,6 +90,26 @@ The body cache defaults to 8 GiB of resident memory; lower
 `SPICEIO_OBJECT_CACHE_BYTES` on hosts that cannot spare it. spiceio logs the
 budget at startup and the achieved hit rate at shutdown.
 
+Behind it sits a **machine-wide disk spill** (`/var/tmp/spiceio-cache`, 64 GiB,
+on by default), so a working set larger than memory still avoids the NAS — and
+every spiceio instance on the host shares one pool of cached bytes. Set
+`SPICEIO_SPILL_DIR=off` to disable it.
+
+Writes are also acknowledged from memory by default: PutObject returns as soon
+as the body is cached, and the NAS write happens in the background. The client
+never waits on it, because every read of that key is served from the cache
+until the write lands — measured **2.6–6.7× faster end to end** on a
+put-then-read sweep.
+
+**This trades durability for latency.** A `kill -9` between the
+acknowledgement and the background write loses that object. Right for a cache
+(the entry is rebuilt), wrong for a system of record — turn it off with
+`SPICEIO_WRITE_BACK=0` if this endpoint is anyone's source of truth. A
+graceful stop (SIGTERM/SIGINT) drains first, and anything already written to
+the disk spill is replayed on the next start. Reads, listings, deletes and
+copies all stay consistent with what was acknowledged; see
+[Write-back](#write-back) below.
+
 ## Configuration
 
 All configuration is via environment variables:
@@ -105,7 +125,7 @@ All configuration is via environment variables:
 | `SPICEIO_SMB_DOMAIN`          | no       | *(empty)*           | SMB domain                |
 | `SPICEIO_BUCKET`              | no       | `SPICEIO_SMB_SHARE` | Virtual S3 bucket name    |
 | `SPICEIO_REGION`              | no       | `us-east-1`         | AWS region to advertise   |
-| `SPICEIO_SMB_CONNECTIONS`     | no       | CPU count (4–12)    | SMB connections in the pool |
+| `SPICEIO_SMB_CONNECTIONS`     | no       | CPU count (4–16)    | SMB connections in the pool |
 | `SPICEIO_SMB_MAX_IO`          | no       | `262144`            | Max standalone read/write I/O size, bytes |
 | `SPICEIO_MULTIPART_TTL_SECS`  | no       | `86400`             | Age at which an abandoned multipart upload is reaped |
 | `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
@@ -115,6 +135,73 @@ All configuration is via environment variables:
 | `SPICEIO_OBJECT_CACHE_MAX_OBJECT` | no   | budget / 64 (128 MiB) | Max size of a single cached object; scales with the budget so one object cannot evict a large share of the cache |
 | `SPICEIO_OBJECT_CACHE_ENTRIES`| no       | `131072`            | Max body-cache entries (sized so bytes bind first) |
 | `SPICEIO_IMMUTABLE_OBJECTS`   | no       | off                 | When `1`/`true`, serve cached bodies by key with **no backend round trip**. For content-addressed stores (sccache) where the key is a hash of the content. Gives up noticing a backend-side delete |
+| `SPICEIO_SPILL_DIR`           | no       | `/var/tmp/spiceio-cache` | Disk tier behind the memory cache, shared by every instance on the host. Created 0700, so sharing is between processes of the same user; point this at a group-shared directory for cross-user sharing. `off` (or empty) disables it |
+| `SPICEIO_SPILL_BYTES`         | no       | `68719476736` (64 GiB) | Disk budget for the whole spill directory, across all instances. Clamped so at least 10 GiB stays free, and to half the space above that |
+| `SPICEIO_WRITE_BACK`          | no       | **on**              | Acknowledge PutObject from memory and write to the NAS in the background. `0`/`false`/`off` disables. **Trades durability for latency** — see [Write-back](#write-back) |
+| `SPICEIO_WRITE_BACK_BYTES`    | no       | `1073741824` (1 GiB) | Ceiling on un-flushed bytes; past it PutObject writes through synchronously, applying backpressure |
+
+## Caching
+
+Three tiers answer a GET, in order:
+
+| Tier | Where | Size | Shared |
+| ---- | ----- | ---- | ------ |
+| L1   | process memory | 8 GiB (`SPICEIO_OBJECT_CACHE_BYTES`) | no |
+| L2   | local disk (`SPICEIO_SPILL_DIR`) | 64 GiB (`SPICEIO_SPILL_BYTES`) | every instance on the machine |
+| —    | the NAS over SMB | — | — |
+
+L2 exists because the backend saturates at a fixed rate (~100 MiB/s measured)
+while local NVMe does not, and because a second spiceio instance should not
+have to re-fetch what the first one already pulled down. Entries are addressed
+by `sha256(backend-identity \0 key)` and carry a digest of the body, so a
+half-written or power-loss-damaged entry reads as a miss rather than as a wrong
+answer, and two instances fronting different shares never see each other's
+objects. Eviction is LRU against the shared budget, serialized between
+instances by an advisory lock; whichever instance holds it sweeps, the rest
+skip that round. The directory is created 0700 — a world-writable cache would
+let any local user plant an entry, and a planted entry with a correct digest is
+served as a hit. Point `SPICEIO_SPILL_DIR` at a directory you have set up with
+group permissions if instances run as different users.
+
+Entries are also written on the way *out*: a PutObject populates both tiers, so
+a cache client that reads back what it just wrote is served from memory.
+
+### Write-back
+
+PutObject returns once the body is in the cache. A pool of background flushers
+then journals it to the disk spill, writes it to the NAS, and adopts the
+backend's real etag and mtime in both tiers. On by default; `SPICEIO_WRITE_BACK=0`
+turns it off and restores a synchronous backend write per PUT.
+
+What is guaranteed:
+
+- **Reads see it.** GET and HEAD on a key with a pending write are served from
+  the cache without revalidating — a stat would report the previous version.
+- **Deletes order correctly.** DELETE cancels a queued write and waits out one
+  in flight, so a flush cannot resurrect a deleted object.
+- **Listings include it.** ListObjects overlays this instance's pending keys.
+- **Copies work.** CopyObject and UploadPartCopy flush the source first, since
+  the NAS performs the copy itself and has to be able to open the source.
+- **Backpressure is real.** Past `SPICEIO_WRITE_BACK_BYTES` of un-flushed data,
+  PutObject writes through synchronously and clients feel the slow backend.
+- **Reads keep priority.** Flushers take the same admission slot live requests
+  do and leave a quarter of the budget free, so a write burst does not become a
+  read-latency spike. Under sustained read load they yield, the queue fills, and
+  PutObject reverts to synchronous.
+- **Shutdown drains.** A stop signal flushes acknowledged writes (30s cap)
+  before exit; signal a second time to stop immediately instead of waiting it
+  out.
+
+What is not:
+
+- **A crash between the 200 and the background write loses that object.** Once
+  it reaches the disk spill it is recoverable — dirty entries are never
+  evicted, and are replayed on the next start or by a peer instance that finds
+  them — but the window before that is real. This is the setting's whole
+  trade: right for the cache workloads spiceio fronts, and the reason
+  `SPICEIO_WRITE_BACK=0` exists for anything that is a system of record.
+- **Peer instances and other S3 clients do not see the object until it
+  flushes**, except through the shared spill on the same machine.
 
 ## Supported S3 operations
 

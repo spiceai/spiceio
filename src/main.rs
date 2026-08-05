@@ -5,7 +5,7 @@ use hyper::{Request, Response};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -21,6 +21,8 @@ use spiceio::smb;
 use s3::multipart::MultipartStore;
 use s3::object_cache::ObjectCache;
 use s3::router::AppState;
+use s3::spill::{self, Spill};
+use s3::writeback::WriteBack;
 use smb::client::SmbConfig;
 use smb::ops::ShareSession;
 use smb::pool::SmbPool;
@@ -53,6 +55,10 @@ struct Config {
     multipart_ttl_secs: u64,
     /// Age below which startup cleanup leaves a WAL temp / upload dir alone
     cleanup_grace_secs: u64,
+    /// Machine-wide disk spill directory, or None when disabled
+    spill_dir: Option<String>,
+    /// Disk budget for the whole spill directory, shared by every instance
+    spill_bytes: u64,
 }
 
 /// Exit nonzero after draining the async logger. The log writer thread dies
@@ -122,25 +128,45 @@ impl Config {
                 "SPICEIO_CLEANUP_GRACE_SECS",
                 smb::ops::DEFAULT_CLEANUP_GRACE_SECS,
             ),
+            // On by default: a read cache on local disk changes no semantics,
+            // only how often the NAS is asked. `off` (or empty) opts out.
+            spill_dir: match env::var("SPICEIO_SPILL_DIR") {
+                Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => None,
+                Ok(v) => Some(v),
+                Err(_) => Some(spill::DEFAULT_DIR.to_string()),
+            },
+            spill_bytes: parse_env_or("SPICEIO_SPILL_BYTES", spill::DEFAULT_MAX_BYTES),
         }
     }
 }
 
+/// Time allowed at shutdown for acknowledged writes to reach the NAS. Matched
+/// to the HTTP drain grace: a stop that waits for in-flight *requests* should
+/// wait as long for writes it has already told clients succeeded.
+const WRITE_BACK_DRAIN: Duration = Duration::from_secs(30);
+
 /// Default SMB connection-pool size, scaled with CPU cores so concurrent S3
 /// requests (e.g. a parallel `cargo`/sccache build) fan out across connections
 /// instead of queuing on one connection's stream lock. Floored at 4 (enough
-/// fan-out on small machines), capped at 12 to bound concurrent SMB session
+/// fan-out on small machines), capped at 16 to bound concurrent SMB session
 /// load on the server; override with `SPICEIO_SMB_CONNECTIONS`.
+///
+/// The cap is about head-of-line blocking, not backend throughput: a connection
+/// owns its stream for a whole round trip, so a request behind a multi-megabyte
+/// batch waits for it. Backend *bandwidth* saturates well below this — measured
+/// flat at ~100 MiB/s from 32 concurrent writes upward — so widening the pool
+/// buys latency under mixed load, not more bytes per second.
 fn default_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .clamp(4, 12)
+        .clamp(4, 16)
 }
 
 /// One attempt to stand up the SMB pool + share session + startup cleanup.
 /// Failures are returned to the caller for retry — they must not take the
 /// HTTP listener down.
+#[allow(clippy::too_many_arguments)]
 async fn connect_share(
     smb_config: SmbConfig,
     smb_connections: usize,
@@ -148,8 +174,10 @@ async fn connect_share(
     cleanup_grace_secs: u64,
     bucket_name: String,
     region: String,
+    spill_dir: Option<String>,
+    spill_bytes: u64,
 ) -> Result<Arc<AppState>, std::io::Error> {
-    let pool = SmbPool::connect(smb_config, smb_connections).await?;
+    let pool = SmbPool::connect(smb_config.clone(), smb_connections).await?;
     let admission = pool.admission_limit();
     // Shared with the pool so capacity shrinks reduce available permits.
     let smb_slots = pool.admission();
@@ -158,7 +186,8 @@ async fn connect_share(
     // Clean up orphaned WAL temps / stale multipart dirs from prior crashes
     // (the in-memory upload map does not survive a restart).
     share.cleanup_previous_runs().await;
-    let object_cache = Arc::new(ObjectCache::from_env());
+
+    let mut object_cache = ObjectCache::from_env();
     slog!("[spiceio] admission limit {admission} concurrent SMB ops (pool×work-depth)");
     slog!(
         "[spiceio] object cache: {} MiB budget, max_object={} MiB, {} entries, {}",
@@ -171,6 +200,54 @@ async fn connect_share(
             "etag-revalidated (one stat per hit)"
         }
     );
+
+    // L2: the machine-wide disk tier. Namespaced by backend identity so
+    // instances fronting *different* shares can share one directory without
+    // ever serving each other's objects.
+    if let Some(dir) = spill_dir.as_deref() {
+        let namespace = format!("{}:{}/{}", smb_config.server, smb_config.port, smb_share);
+        let max_object = s3::object_cache::default_max_object_bytes(spill_bytes);
+        match Spill::open(
+            std::path::Path::new(dir),
+            namespace,
+            spill_bytes,
+            max_object,
+        ) {
+            Ok(s) => {
+                slog!(
+                    "[spiceio] disk spill: {dir} ({} GiB budget, max_object={} MiB, shared machine-wide)",
+                    spill_bytes / (1024 * 1024 * 1024),
+                    max_object / (1024 * 1024),
+                );
+                object_cache = object_cache.with_spill(Arc::new(s));
+            }
+            // A cache tier that cannot be opened is a missing optimization, not
+            // a reason to refuse to serve.
+            Err(e) => serr!("[spiceio] disk spill disabled: cannot use {dir}: {e}"),
+        }
+    }
+    let object_cache = Arc::new(object_cache);
+
+    let writeback = Arc::new(WriteBack::from_env());
+    if writeback.enabled() {
+        let flushers = writeback.spawn_flushers(
+            Arc::clone(&share),
+            Arc::clone(&object_cache),
+            s3::writeback::DEFAULT_FLUSHERS,
+        );
+        slog!(
+            "[spiceio] write-back: on ({} MiB queue, {flushers} flushers) — PUT is \
+             acknowledged from memory before the NAS write (SPICEIO_WRITE_BACK=0 to disable)",
+            writeback.max_bytes() / (1024 * 1024),
+        );
+        if object_cache.spill().is_none() {
+            serr!(
+                "[spiceio] write-back is on without a disk spill: an acknowledged \
+                 write that has not flushed is lost if this process dies"
+            );
+        }
+    }
+
     Ok(Arc::new(AppState {
         share,
         bucket: bucket_name,
@@ -178,7 +255,24 @@ async fn connect_share(
         multipart: MultipartStore::new(),
         smb_slots,
         object_cache,
+        writeback,
     }))
+}
+
+/// Interval between spill sweeps, chosen from how full the last one found the
+/// directory. A cache with room to spare does not need a tree walk every
+/// minute; one near its budget does.
+fn sweep_interval(stats: &spill::SweepStats) -> Duration {
+    if stats.skipped {
+        // Another instance is sweeping — check back on its cadence, not ours.
+        return Duration::from_secs(120);
+    }
+    let used = stats.bytes as f64 / (stats.effective_budget.max(1)) as f64;
+    match used {
+        u if u > 0.9 => Duration::from_secs(30),
+        u if u > 0.5 => Duration::from_secs(120),
+        _ => Duration::from_secs(300),
+    }
 }
 
 #[tokio::main]
@@ -298,6 +392,8 @@ async fn main() {
         let multipart_ttl_secs = config.multipart_ttl_secs;
         let bucket_name = config.bucket_name.clone();
         let region = config.region.clone();
+        let spill_dir = config.spill_dir.clone();
+        let spill_bytes = config.spill_bytes;
         let bind_addr_log = bind_addr;
 
         tokio::spawn(async move {
@@ -310,6 +406,8 @@ async fn main() {
                     cleanup_grace_secs,
                     bucket_name.clone(),
                     region.clone(),
+                    spill_dir.clone(),
+                    spill_bytes,
                 )
                 .await
                 {
@@ -393,6 +491,116 @@ async fn main() {
                 });
             }
 
+            // Background spill maintenance — enforce the machine-wide disk
+            // budget, and recover acknowledged writes that never reached the
+            // NAS. The dirty scan covers this instance's own writes after a
+            // restart *and* a crashed peer's: an unflushed body exists only on
+            // this disk, so whichever instance finds it has to publish it.
+            if state.object_cache.spill().is_some() {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    // Long enough that a flush in progress on a live peer is
+                    // not duplicated; short enough that a crashed peer's writes
+                    // do not sit unwritten for long.
+                    const DIRTY_MIN_AGE: Duration = Duration::from_secs(60);
+                    // Startup recovery uses a much shorter age than the steady
+                    // state: everything this process finds before it has written
+                    // anything of its own was stranded by a previous run, and
+                    // waiting out the full age would leave a crash unrecovered
+                    // for minutes. Not zero, because a live peer's genuinely
+                    // in-flight entry is milliseconds old and is not ours to
+                    // duplicate.
+                    const STARTUP_MIN_AGE: Duration = Duration::from_secs(5);
+                    let mut min_age = STARTUP_MIN_AGE;
+                    let mut delay = Duration::ZERO;
+                    loop {
+                        tokio::time::sleep(delay).await;
+
+                        // Entries this instance journalled are already spoken
+                        // for — its own flushers promote them, and its shutdown
+                        // drains them. Replaying those would duplicate work that
+                        // is in progress; the scan is for *orphans*.
+                        let owned: std::collections::HashSet<String> =
+                            state.object_cache.spill_owned_dirty().into_iter().collect();
+                        let (dirty, young) = state.object_cache.spill_scan_dirty(min_age).await;
+                        let dirty: Vec<_> = dirty
+                            .into_iter()
+                            .filter(|d| !owned.contains(&d.key))
+                            .collect();
+                        if !dirty.is_empty() {
+                            slog!(
+                                "[spiceio] replaying {} unflushed write(s) from the disk spill",
+                                dirty.len()
+                            );
+                            for d in dirty {
+                                // Re-enqueue when write-back is on; otherwise
+                                // write straight through. Either way the spill
+                                // entry is promoted (or left dirty to retry) by
+                                // the same code path a live write uses.
+                                let queued = state
+                                    .writeback
+                                    .enqueue(
+                                        &d.key,
+                                        &d.entry.etag,
+                                        d.entry.last_modified,
+                                        d.entry.body.clone(),
+                                    )
+                                    .await;
+                                if queued {
+                                    continue;
+                                }
+                                match state.share.put_object_atomic(&d.key, &d.entry.body).await {
+                                    Ok(meta) => {
+                                        state
+                                            .object_cache
+                                            .spill_promote(
+                                                &d.key,
+                                                d.entry.body_sha,
+                                                &meta.etag,
+                                                meta.last_modified,
+                                                &d.entry.body,
+                                            )
+                                            .await;
+                                    }
+                                    Err(e) => serr!(
+                                        "[spiceio] replay of {} (stranded {}s) failed: {e}; \
+                                         will retry",
+                                        d.key,
+                                        d.age_secs
+                                    ),
+                                }
+                            }
+                        }
+
+                        let stats = state.object_cache.spill_sweep().await.unwrap_or_default();
+
+                        // Still recovering: entries skipped only for being young
+                        // are the freshest stranded writes there are, so come
+                        // back the moment they have aged rather than at the
+                        // sweep cadence. Once a pass finds none, this instance
+                        // has recovered what a previous run left and can switch
+                        // to the polite steady-state age.
+                        if min_age == STARTUP_MIN_AGE && young > 0 {
+                            delay = STARTUP_MIN_AGE;
+                            continue;
+                        }
+                        min_age = DIRTY_MIN_AGE;
+                        if stats.evicted_entries > 0 {
+                            slog!(
+                                "[spiceio] disk spill: evicted {} entries ({:.1} GiB); \
+                                 {} entries / {:.1} GiB resident of {:.1} GiB budget",
+                                stats.evicted_entries,
+                                stats.evicted_bytes as f64 / 1_073_741_824.0,
+                                stats.entries,
+                                stats.bytes as f64 / 1_073_741_824.0,
+                                stats.effective_budget as f64 / 1_073_741_824.0,
+                            );
+                        }
+                        delay = sweep_interval(&stats);
+                    }
+                });
+            }
+
             // Publish readiness. The setup action greps for "ready, listening"
             // (not merely "accepting connections") before pointing sccache at us.
             // OnceLock::set is one-shot; ignore a racing second set.
@@ -404,22 +612,57 @@ async fn main() {
     }
 
     // SIGTERM (the standard service-manager stop signal) triggers the same
-    // graceful shutdown as Ctrl-C. Registration failing is exceptional; fall
-    // back to a never-resolving future so SIGINT still works.
-    let shutdown = async {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
-        let term = async {
-            match sigterm.as_mut() {
-                Some(s) => {
-                    s.recv().await;
+    // graceful shutdown as Ctrl-C.
+    //
+    // The listener is a long-lived task rather than a future the server
+    // consumes, because shutdown does not end when the HTTP server returns:
+    // acknowledged writes are drained after it, which can take tens of seconds
+    // against a slow NAS. An operator who signals again during that means
+    // "stop now", and a future that had already been consumed by the first
+    // signal could not hear them — the process would appear wedged, and the
+    // only way out would be SIGKILL, which is precisely the outcome the drain
+    // exists to avoid.
+    //
+    // `notify_one` rather than `notify_waiters`: it leaves a permit when
+    // nobody is listening yet, so a signal arriving in the gap before the
+    // server first polls `shutdown` still stops the process.
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_again = Arc::new(tokio::sync::Notify::new());
+    {
+        let stop = Arc::clone(&stop);
+        let stop_again = Arc::clone(&stop_again);
+        tokio::spawn(async move {
+            // Registration failing is exceptional; fall back to a
+            // never-resolving future so SIGINT still works.
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+            let mut count = 0u32;
+            loop {
+                let term = async {
+                    match sigterm.as_mut() {
+                        Some(s) => {
+                            s.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let name = tokio::select! {
+                    _ = signal::ctrl_c() => "SIGINT",
+                    () = term => "SIGTERM",
+                };
+                count += 1;
+                if count == 1 {
+                    slog!("[spiceio] shutting down ({name})");
+                    stop.notify_one();
+                } else {
+                    slog!("[spiceio] {name} again — stopping without finishing the drain");
+                    stop_again.notify_one();
                 }
-                None => std::future::pending::<()>().await,
             }
-        };
-        tokio::select! {
-            _ = signal::ctrl_c() => slog!("\n[spiceio] shutting down (SIGINT)"),
-            () = term => slog!("[spiceio] shutting down (SIGTERM)"),
-        }
+        });
+    }
+    let shutdown = {
+        let stop = Arc::clone(&stop);
+        async move { stop.notified().await }
     };
 
     // Serve until a stop signal arrives, then drain in-flight requests.
@@ -454,6 +697,82 @@ async fn main() {
     )
     .await;
 
+    // Drain acknowledged writes before exiting. The client already has its 200
+    // for each of these, so this is the last chance to honour it in-process;
+    // whatever is left is a dirty spill entry the next start replays.
+    if let Some(state) = ready_for_stats.get()
+        && state.writeback.enabled()
+    {
+        let deadline = Instant::now() + WRITE_BACK_DRAIN;
+        let (pending_bytes, pending) = state.writeback.depth().await;
+        if pending > 0 {
+            slog!(
+                "[spiceio] flushing {pending} acknowledged write(s) ({:.1} MiB) to the NAS…",
+                pending_bytes as f64 / 1_048_576.0,
+            );
+        }
+        // Interruptible: a second stop signal abandons the drain rather than
+        // making the operator wait out the cap (or reach for SIGKILL).
+        //
+        // `forced` is latched rather than re-awaited below, because the signal
+        // delivers a single permit: a second `notified()` would find none and
+        // wait, so the operator who asked to stop now would still sit through
+        // the next phase.
+        let mut forced = false;
+        let residue = tokio::select! {
+            left = state.writeback.drain(WRITE_BACK_DRAIN) => left,
+            _ = stop_again.notified() => {
+                forced = true;
+                state.writeback.depth().await.1
+            }
+        };
+        if residue > 0 {
+            // Make the claim true before making it: most of these have not been
+            // journalled yet, because that is the flusher's first step and no
+            // flusher reached them.
+            let saved = state.writeback.journal_residue(&state.object_cache).await;
+            serr!(
+                "[spiceio] {residue} write(s) did not reach the NAS before shutdown; \
+                 {saved} are held in the disk spill and replayed on the next start"
+            );
+            if saved < residue {
+                serr!(
+                    "[spiceio] {} write(s) were acknowledged but are lost — no disk spill \
+                     to hold them (set SPICEIO_SPILL_DIR, or SPICEIO_WRITE_BACK=0)",
+                    residue - saved
+                );
+            }
+        }
+
+        // The queue is not the whole picture. A body reaches the spill as the
+        // first step of its flush, so an entry can be dirty on disk while no
+        // longer pending — a backend write that failed after journalling, or a
+        // promote that did not land. Nothing retries those until some later
+        // process sweeps, so finish them here.
+        //
+        // Strictly the ones *this* instance wrote: a peer's dirty entry belongs
+        // to a process that is still running and will promote it itself.
+        let (flushed, stuck) = if forced {
+            (0, state.object_cache.spill_owned_dirty().len())
+        } else {
+            tokio::select! {
+                r = state
+                    .writeback
+                    .drain_owned_spill(&state.share, &state.object_cache, deadline) => r,
+                _ = stop_again.notified() => (0, state.object_cache.spill_owned_dirty().len()),
+            }
+        };
+        if flushed > 0 {
+            slog!("[spiceio] flushed {flushed} journalled write(s) left on disk");
+        }
+        if stuck > 0 {
+            serr!(
+                "[spiceio] {stuck} journalled write(s) remain on disk; \
+                 they are replayed on the next start"
+            );
+        }
+    }
+
     // The body cache is the only mechanism that serves a GET without touching
     // the NAS, so its hit rate is the single most useful number for explaining
     // a deployment's throughput. A cache whose working set does not fit looks
@@ -467,6 +786,31 @@ async fn main() {
                  {:.1} MiB served from memory",
                 100.0 * hits as f64 / total as f64,
                 hit_bytes as f64 / 1_048_576.0,
+            );
+        }
+        if let Some(spill) = state.object_cache.spill() {
+            let (hits, misses, hit_bytes, writes) = spill.stats();
+            if hits + misses > 0 {
+                slog!(
+                    "[spiceio] disk spill: {hits} hit / {misses} miss ({:.1}% hit rate), \
+                     {:.1} MiB served from disk, {writes} entries written",
+                    100.0 * hits as f64 / (hits + misses) as f64,
+                    hit_bytes as f64 / 1_048_576.0,
+                );
+            }
+        }
+        if state.writeback.enabled() {
+            let (accepted, flushed, rejected, retries) = state.writeback.stats();
+            // `accepted - flushed` is not loss: a key overwritten before its
+            // flush starts is coalesced into one backend write, which is a win
+            // worth reporting rather than an imbalance worth wondering about.
+            // Anything genuinely unflushed was reported by the drain above.
+            let (_, unflushed) = state.writeback.depth().await;
+            let coalesced = accepted.saturating_sub(flushed + unflushed as u64);
+            slog!(
+                "[spiceio] write-back: {accepted} acknowledged, {flushed} written to the NAS, \
+                 {coalesced} coalesced by a later write to the same key, \
+                 {rejected} fell back to synchronous (queue full), {retries} flush retries"
             );
         }
     }

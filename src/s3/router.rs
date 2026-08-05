@@ -22,6 +22,7 @@ use super::body::SpiceioBody;
 use super::headers::*;
 use super::multipart::MultipartStore;
 use super::object_cache::ObjectCache;
+use super::writeback::WriteBack;
 use super::xml::{self, XmlWriter};
 use crate::smb::ops::{ShareSession, guess_content_type};
 
@@ -43,7 +44,16 @@ pub struct AppState {
     pub smb_slots: Arc<Semaphore>,
     /// GET body cache (etag-validated; optional immutable-key mode).
     pub object_cache: Arc<ObjectCache>,
+    /// Writes acknowledged from memory that have not reached the NAS yet.
+    /// Enabled by default; when `SPICEIO_WRITE_BACK=0` disables it, every
+    /// method below short-circuits on a single bool check.
+    pub writeback: Arc<WriteBack>,
 }
+
+/// How long an operation that needs an object *on the backend* — a range read,
+/// a server-side copy — waits for its pending write to flush. Generous: the
+/// alternative is answering from a view the NAS does not share yet.
+const PENDING_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Acquire an SMB work slot, or fail with 503.
 ///
@@ -51,9 +61,20 @@ pub struct AppState {
 ///   fails.
 /// * Overloaded (recent reset/busy, or half the pool poisoned): **try** only —
 ///   fail immediately with Retry-After so we stop amplifying the overload.
+///
+/// The uncontended case is one atomic compare-exchange. It is worth splitting
+/// out because `tokio::time::timeout` arms a timer whether or not the wait
+/// happens — a timer-wheel insert and a cancel on drop, on every request, to
+/// bound a wait that in the common case is not a wait at all. Trying first also
+/// subsumes the overloaded branch: that arm *is* a bare try, so when a permit
+/// is free both branches do the same thing and the overload check is only
+/// needed once the semaphore is actually contended.
 async fn acquire_smb_slot(state: &AppState) -> Result<OwnedSemaphorePermit, ()> {
+    if let Ok(permit) = state.smb_slots.clone().try_acquire_owned() {
+        return Ok(permit);
+    }
     if state.share.is_overloaded() {
-        return state.smb_slots.clone().try_acquire_owned().map_err(|_| ());
+        return Err(());
     }
     match tokio::time::timeout(ADMISSION_WAIT, state.smb_slots.clone().acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
@@ -144,6 +165,19 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         );
     }
 
+    // Requests the cache can answer outright take no admission permit: they
+    // claim no SMB connection, so queueing them behind saturated backend work
+    // would throttle the only path the backend does not limit. Nothing
+    // unbounded is admitted by this — the bodies are already resident in the
+    // cache, and the response holds a refcount, not a copy.
+    if *method == Method::GET
+        && !key.is_empty()
+        && is_plain_object_query(query)
+        && let Some(resp) = try_backendless_get(hdrs, state, key).await
+    {
+        return with_common_headers(resp, &request_id, &state.region);
+    }
+
     // Everything below talks to SMB. Hold an admission permit for the whole
     // request so a saturated NAS cannot grow unbounded work inside the process.
     let _smb_permit = match acquire_smb_slot(state).await {
@@ -158,8 +192,6 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             );
         }
     };
-
-    let share = &state.share;
 
     // ── Bucket-level operations (no key) ────────────────────────────────
     if key.is_empty() {
@@ -188,7 +220,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
                     Err(resp) => resp,
                 }
             }
-            Method::GET => handle_list_objects(share, &state.bucket, query).await,
+            Method::GET => handle_list_objects(state, query).await,
             Method::HEAD => head_bucket_response(&state.region),
             Method::PUT => ok_empty(),         // CreateBucket — noop
             Method::DELETE => ok_no_content(), // DeleteBucket — noop
@@ -327,7 +359,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             }
         }
         Method::DELETE => handle_delete_object(state, key).await,
-        Method::HEAD => handle_head_object(hdrs, share, key).await,
+        Method::HEAD => handle_head_object(hdrs, state, key).await,
         _ => error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "MethodNotAllowed",
@@ -352,11 +384,68 @@ fn parse_path(path: &str) -> (&str, &str) {
 
 // ── ListObjects V1/V2 ──────────────────────────────────────────────────────
 
-async fn handle_list_objects(
-    share: &ShareSession,
-    bucket: &str,
-    query: &str,
-) -> Response<SpiceioBody> {
+/// Fold this instance's pending write-backs into a listing.
+///
+/// Mirrors the backend walk's own prefix/delimiter rules: a key that still has
+/// a separator after the prefix is a directory the walk would have reported as
+/// a common prefix, not an object.
+///
+/// The separator is `/` regardless of the requested delimiter, because that is
+/// what the backend walk does — SMB directories are the only grouping it can
+/// report, so `smb::ops::list_objects` rolls up at directory boundaries and
+/// appends `/`. Honouring an arbitrary delimiter *here* would not fix that; it
+/// would only make the overlay disagree with the listing it is merging into. A pending key that the walk *did* find (an
+/// overwrite of an existing object) keeps its listed entry rather than being
+/// duplicated — the size and mtime it will have once the flush lands are the
+/// pending ones, so those win.
+async fn overlay_pending(
+    state: &AppState,
+    prefix: &str,
+    delimiter: Option<&str>,
+    objects: &mut Vec<crate::smb::ops::ObjectInfo>,
+    common_prefixes: &mut Vec<String>,
+) {
+    let pending = state.writeback.snapshot().await;
+    merge_pending(prefix, delimiter, pending, objects, common_prefixes);
+}
+
+/// The merge itself, split out so it is testable without a live backend.
+fn merge_pending(
+    prefix: &str,
+    delimiter: Option<&str>,
+    pending: Vec<(String, String, u64, u64)>,
+    objects: &mut Vec<crate::smb::ops::ObjectInfo>,
+    common_prefixes: &mut Vec<String>,
+) {
+    for (key, etag, last_modified, size) in pending {
+        let Some(rest) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        if delimiter.is_some()
+            && let Some(pos) = rest.find('/')
+        {
+            let roll_up = format!("{prefix}{}/", &rest[..pos]);
+            if !common_prefixes.contains(&roll_up) {
+                common_prefixes.push(roll_up);
+            }
+            continue;
+        }
+        let info = crate::smb::ops::ObjectInfo {
+            key,
+            size,
+            last_modified,
+            etag,
+        };
+        match objects.iter_mut().find(|o| o.key == info.key) {
+            Some(existing) => *existing = info,
+            None => objects.push(info),
+        }
+    }
+}
+
+async fn handle_list_objects(state: &AppState, query: &str) -> Response<SpiceioBody> {
+    let share = &state.share;
+    let bucket = &state.bucket;
     let list_type = extract_query_param(query, "list-type").unwrap_or_default();
     let prefix = extract_query_param(query, "prefix").unwrap_or_default();
     let delimiter = extract_query_param(query, "delimiter");
@@ -383,6 +472,20 @@ async fn handle_list_objects(
 
     match result {
         Ok((mut objects, mut common_prefixes)) => {
+            // Objects whose writes were acknowledged from memory are not on the
+            // NAS for the walk above to have found. Overlaying them here is what
+            // keeps a client that PUTs and then lists from concluding its write
+            // vanished. Only this instance's pending writes are visible; a peer's
+            // appear once they flush.
+            overlay_pending(
+                state,
+                &prefix,
+                delimiter.as_deref(),
+                &mut objects,
+                &mut common_prefixes,
+            )
+            .await;
+
             // SMB QueryDirectory does not guarantee order, but S3 returns keys
             // (and common prefixes) lexicographically. Sort before any marker
             // filtering / truncation — otherwise paginating with a marker drops
@@ -622,6 +725,118 @@ fn cached_get_response(
         .unwrap()
 }
 
+/// Sub-resource selectors that make a keyed request something other than a
+/// plain object read — `?acl`, `?tagging`, `?uploadId`, …
+///
+/// The dispatch below routes on these one at a time, in order. Anything that
+/// short-circuits *before* that dispatch has to reject them all, or it answers
+/// `GET /key?acl` with the object's body.
+const OBJECT_SUBRESOURCES: &[&str] = &[
+    "acl",
+    "cors",
+    "delete",
+    "encryption",
+    "legal-hold",
+    "lifecycle",
+    "location",
+    "partNumber",
+    "policy",
+    "restore",
+    "retention",
+    "select",
+    "tagging",
+    "torrent",
+    "uploadId",
+    "uploads",
+    "versioning",
+];
+
+/// True when a keyed GET is a plain object read, so the cache may answer it
+/// before the sub-resource dispatch runs.
+fn is_plain_object_query(query: &str) -> bool {
+    query.is_empty() || !OBJECT_SUBRESOURCES.iter().any(|f| has_query_flag(query, f))
+}
+
+/// Answer a GET without touching the backend, or `None` if the backend is
+/// needed after all.
+///
+/// Called *before* admission control, which is the point of it existing
+/// separately. An admission permit is a claim on the SMB pool, and it is held
+/// for the whole request; a request served from cache claims nothing, so making
+/// it queue for a permit — and then hold one while it copies bytes it already
+/// has — caps the one path in the proxy that the backend does not limit, at the
+/// backend's own concurrency. Worse, at a high hit rate most permits end up
+/// held by requests that need no connection, crowding out the misses that do.
+///
+/// Only paths that provably issue no SMB operation belong here. Both of these
+/// already answered from memory; the change is *when* they are tried, not what
+/// they return.
+async fn try_backendless_get(
+    hdrs: &http::HeaderMap,
+    state: &AppState,
+    key: &str,
+) -> Option<Response<SpiceioBody>> {
+    let cache = &state.object_cache;
+    // A range read has to seek inside the object, which only the backend can
+    // do. It still has to go through the pending check below first: returning
+    // early here would send a range read of a just-acknowledged object to a NAS
+    // that does not have it yet, and answer 404 for an object the client was
+    // told it had written.
+    let is_range = hdrs.contains_key("range");
+
+    // ── Acknowledged-but-unwritten key ──────────────────────────────
+    // Write-back returned 200 for this object before the NAS had it, so the
+    // cache is its only authority right now. Revalidating would stat the
+    // *previous* version, or nothing at all, and answer a client with a body
+    // it has already been told was replaced.
+    let hit = if state.writeback.pending_meta(key).await.is_some() {
+        match cache.lookup_pending(key).await {
+            Some(hit) if !is_range => hit,
+            // A range read, or a body evicted from both tiers — neither is ours
+            // to answer. Wait for the flush (without a permit, since waiting is
+            // not backend work) and let the caller take the normal path against
+            // a backend that now has the object.
+            _ => {
+                state.writeback.flush_key(key, PENDING_FLUSH_TIMEOUT).await;
+                return None;
+            }
+        }
+    } else if is_range {
+        return None;
+    }
+    // ── Immutable-key fast path ─────────────────────────────────────
+    //
+    // Sound only because `immutable` asserts the key determines the content:
+    // in a content-addressed store like sccache the key *is* a hash of these
+    // bytes, so nothing can put different content under it and a revalidation
+    // has nothing to discover. What it gives up is noticing a backend-side
+    // delete — harmless for a cache, since the client asked for a content hash
+    // and receives exactly those bytes.
+    else if cache.immutable() {
+        cache.lookup_key(key).await?
+    } else {
+        return None;
+    };
+
+    let etag = format!("\"{}\"", hit.etag);
+    if let Some(resp) = conditional_get_short_circuit(
+        &get_header(hdrs, IF_MATCH).map(String::from),
+        &get_header(hdrs, IF_NONE_MATCH).map(String::from),
+        &get_header(hdrs, IF_MODIFIED_SINCE).map(String::from),
+        &get_header(hdrs, IF_UNMODIFIED_SINCE).map(String::from),
+        &etag,
+        hit.last_modified,
+    ) {
+        return Some(resp);
+    }
+    Some(cached_get_response(
+        &guess_content_type(key),
+        hit.last_modified,
+        &etag,
+        hit.body,
+    ))
+}
+
 async fn handle_get_object(
     hdrs: &http::HeaderMap,
     state: &AppState,
@@ -646,55 +861,18 @@ async fn handle_get_object(
     let no_range = range_header.is_none();
 
     if no_range {
-        // Immutable-key fast path: answer entirely from memory, with no SMB
-        // round trip.
-        //
-        // This previously revalidated with a HEAD, which made a cache hit cost
-        // the same round trip as a miss — measured at 0.56ms and a pool slot,
-        // against ~0.05ms to serve the bytes we already hold. Under a backend
-        // that saturates at a fixed throughput (see benches/baselines), the
-        // round trip is the expensive part, not the bytes.
-        //
-        // Sound only because `immutable` asserts the key determines the
-        // content: in a content-addressed store like sccache the key *is* a
-        // hash of these bytes, so nothing can put different content under it
-        // and a revalidation has nothing to discover. What it gives up is
-        // noticing a backend-side delete — harmless for a cache, since the
-        // client asked for a content hash and receives exactly those bytes.
-        if cache.immutable()
-            && let Some(hit) = cache.get_by_key(key)
-        {
-            let etag = format!("\"{}\"", hit.etag);
-            if let Some(resp) = conditional_get_short_circuit(
-                &if_match,
-                &if_none_match,
-                &if_modified_since,
-                &if_unmodified_since,
-                &etag,
-                hit.last_modified,
-            ) {
-                return resp;
-            }
-            return cached_get_response(
-                &guess_content_type(key),
-                hit.last_modified,
-                &etag,
-                hit.body,
-            );
-        }
-
         // Warm cache, etag mode: revalidate with a compound stat (one round
         // trip) rather than an open.
         //
         // Opening leaves a handle that has to be closed, so a *hit* — the case
-        // `contains_key` has already made likely — cost two round trips where
+        // `may_hold` has already made likely — cost two round trips where
         // one will do. The open only pays off when revalidation fails and the
         // handle can be reused to stream, which is the rarer path; that path
         // now opens for itself below.
         //
         // Not needed at all in immutable mode, which returned above without
         // touching the backend.
-        if cache.contains_key(key) {
+        if cache.may_hold(key).await {
             match share.head_object(key).await {
                 Ok(meta) => {
                     let etag = format!("\"{}\"", meta.etag);
@@ -708,7 +886,7 @@ async fn handle_get_object(
                     ) {
                         return resp;
                     }
-                    if let Some(cached) = cache.get_if_etag(key, &meta.etag)
+                    if let Some(cached) = cache.lookup_etag(key, &meta.etag).await
                         && cached.len() as u64 == meta.size
                     {
                         return cached_get_response(
@@ -719,10 +897,10 @@ async fn handle_get_object(
                         );
                     }
                     // Stale entry — drop it and fall through to a cold read.
-                    cache.invalidate(key);
+                    cache.invalidate_stale(key).await;
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    cache.invalidate(key);
+                    cache.invalidate_stale(key).await;
                     return error_response(
                         StatusCode::NOT_FOUND,
                         "NoSuchKey",
@@ -753,12 +931,15 @@ async fn handle_get_object(
 
                 // Insert on miss so subsequent GETs can revalidate without a
                 // body re-fetch. Prefer an existing matching entry when present.
-                let body_data = cache.get_if_etag(key, &meta.etag).unwrap_or_else(|| {
-                    if (data.len() as u64) <= cache.max_object_bytes() {
-                        cache.insert(key, &meta.etag, meta.last_modified, data.clone());
+                let body_data = match cache.lookup_etag(key, &meta.etag).await {
+                    Some(cached) => cached,
+                    None => {
+                        if (data.len() as u64) <= cache.max_object_bytes() {
+                            cache.store(key, &meta.etag, meta.last_modified, data.clone());
+                        }
+                        data
                     }
-                    data
-                });
+                };
 
                 let last_modified = xml::epoch_to_http_date(meta.last_modified);
                 return Response::builder()
@@ -772,7 +953,7 @@ async fn handle_get_object(
                     .unwrap();
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                cache.invalidate(key);
+                cache.invalidate_stale(key).await;
                 return error_response(
                     StatusCode::NOT_FOUND,
                     "NoSuchKey",
@@ -792,7 +973,7 @@ async fn handle_get_object(
     let handle = match share.open_read(key).await {
         Ok(h) => h,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            cache.invalidate(key);
+            cache.invalidate_stale(key).await;
             return error_response(
                 StatusCode::NOT_FOUND,
                 "NoSuchKey",
@@ -853,7 +1034,7 @@ async fn stream_get_object(
     // Full-object GET: etag-validated cache hit after open/stat — close the
     // handle without reading the body from SMB.
     if no_range
-        && let Some(cached) = cache.get_if_etag(key, &meta.etag)
+        && let Some(cached) = cache.lookup_etag(key, &meta.etag).await
         && cached.len() as u64 == handle.file_size
     {
         let content_type = meta.content_type.clone();
@@ -1179,7 +1360,7 @@ async fn stream_get_object(
             && let Some(buf) = cache_buf
             && buf.len() as u64 == file_size
         {
-            cache_for_task.insert(
+            cache_for_task.store(
                 &cache_key,
                 &cache_etag,
                 cache_last_modified,
@@ -1231,6 +1412,16 @@ async fn handle_put_object(
     if let Some(ref inm) = if_none_match
         && inm.trim() == "*"
     {
+        // A write acknowledged from memory is an object that exists, even
+        // though the NAS cannot see it yet — the stat below would miss it and
+        // let the conditional write through.
+        if state.writeback.pending_meta(key).await.is_some() {
+            return error_response(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+            );
+        }
         // Check existence first
         if share.head_object(key).await.is_ok() {
             return error_response(
@@ -1240,6 +1431,64 @@ async fn handle_put_object(
             );
         }
     }
+
+    // ── Write-back: acknowledge from memory, reach the NAS later ────
+    //
+    // The whole body has to be in hand for this: the cache answers every read
+    // of this key until the flush lands, so a body it cannot hold is a body
+    // nobody could serve. Within that bound the backend round trip is pure
+    // latency for the client — see `writeback` for what the 200 promises.
+    if state.writeback.enabled()
+        && let Some(cl) = content_length
+        && cl <= state.object_cache.max_object_bytes()
+    {
+        let data = match collect_body(body, content_length).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
+        let now = crate::smb::ops::now_epoch_secs();
+        // Provisional metadata, in the backend's own etag format: the NAS
+        // assigns the real mtime when the flush lands, and both cache tiers
+        // adopt it then (see `WriteBack::flush_one`).
+        let etag = crate::smb::ops::provisional_etag(data.len() as u64, now);
+        if state.writeback.enqueue(key, &etag, now, data.clone()).await {
+            state.object_cache.insert(key, &etag, now, data);
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("ETag", format!("\"{etag}\""))
+                .header("x-spiceio-write", "ASYNC");
+            if let Some(ct) = content_type {
+                builder = builder.header("Content-Type", ct);
+            }
+            return builder.body(SpiceioBody::empty()).unwrap();
+        }
+        // Refused — the queue is at its ceiling or shutdown has begun. Write
+        // through synchronously with the body already collected, which is the
+        // backpressure a backlogged backend is supposed to apply to clients.
+        // Retiring any older pending body first is what keeps its flush from
+        // landing on top of this write.
+        state.writeback.cancel(key).await;
+        return match share.put_object_atomic(key, &data).await {
+            Ok(meta) => {
+                state
+                    .object_cache
+                    .store(key, &meta.etag, meta.last_modified, data);
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("ETag", format!("\"{}\"", meta.etag));
+                if let Some(ct) = content_type {
+                    builder = builder.header("Content-Type", ct);
+                }
+                builder.body(SpiceioBody::empty()).unwrap()
+            }
+            Err(e) => io_to_s3_write_error(&e),
+        };
+    }
+
+    // Every path below writes straight to the NAS, so a queued write-back for
+    // this key has to be retired first — flushing it afterwards would restore
+    // the body this request is replacing. Waits out a flush already in flight.
+    state.writeback.cancel(key).await;
 
     // ── Fast path: collect small bodies and use compound write ──────
     let max_write = share.compound_max_write_size() as u64;
@@ -1264,7 +1513,7 @@ async fn handle_put_object(
                 // this is also the invalidation the overwrite needs.
                 state
                     .object_cache
-                    .insert(key, &meta.etag, meta.last_modified, data.clone());
+                    .store(key, &meta.etag, meta.last_modified, data.clone());
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header("ETag", format!("\"{}\"", meta.etag));
@@ -1357,9 +1606,9 @@ async fn handle_put_object(
         Some(buf) if buf.len() as u64 == meta.size => {
             state
                 .object_cache
-                .insert(key, &meta.etag, meta.last_modified, Bytes::from(buf));
+                .store(key, &meta.etag, meta.last_modified, Bytes::from(buf));
         }
-        _ => state.object_cache.invalidate(key),
+        _ => state.object_cache.invalidate_stale(key).await,
     }
 
     let mut builder = Response::builder()
@@ -1426,6 +1675,21 @@ async fn handle_copy_object(
         );
     }
 
+    // A server-side copy is issued *to the NAS*, which opens the source path
+    // itself — a write still queued in memory is not there for it to read.
+    if !state
+        .writeback
+        .flush_key(&src_key, PENDING_FLUSH_TIMEOUT)
+        .await
+    {
+        return service_unavailable(
+            "A pending write to the copy source has not reached the backend yet; please retry.",
+        );
+    }
+    // The destination is replaced wholesale, so a write-back queued for it must
+    // be retired before it can land on top of the copy.
+    state.writeback.cancel(dest_key).await;
+
     // Conditional copy headers
     let if_match = get_header(hdrs, X_AMZ_COPY_SOURCE_IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, X_AMZ_COPY_SOURCE_IF_NONE_MATCH).map(String::from);
@@ -1475,7 +1739,7 @@ async fn handle_copy_object(
 
     match share.copy_object(&src_key, dest_key).await {
         Ok(meta) => {
-            state.object_cache.invalidate(dest_key);
+            state.object_cache.forget(dest_key).await;
             let mut w = XmlWriter::new();
             w.declaration();
             w.open("CopyObjectResult");
@@ -1493,16 +1757,20 @@ async fn handle_copy_object(
 // ── DeleteObject ────────────────────────────────────────────────────────────
 
 async fn handle_delete_object(state: &AppState, key: &str) -> Response<SpiceioBody> {
+    // Ordered before the delete: cancelling a queued write-back drops it, and
+    // waiting out an in-flight one keeps its backend write from landing after
+    // the object is gone.
+    state.writeback.cancel(key).await;
     match state.share.delete_object(key).await {
         // DeleteObject is idempotent: 204 for a successful delete and for a
         // missing object. Other errors (access denied, I/O) must surface so a
         // client never assumes a still-present object was deleted.
         Ok(()) => {
-            state.object_cache.invalidate(key);
+            state.object_cache.forget(key).await;
             ok_no_content()
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            state.object_cache.invalidate(key);
+            state.object_cache.forget(key).await;
             ok_no_content()
         }
         Err(e) => io_to_s3_error(&e),
@@ -1513,13 +1781,44 @@ async fn handle_delete_object(state: &AppState, key: &str) -> Response<SpiceioBo
 
 async fn handle_head_object(
     hdrs: &http::HeaderMap,
-    share: &ShareSession,
+    state: &AppState,
     key: &str,
 ) -> Response<SpiceioBody> {
+    let share = &state.share;
     let if_match = get_header(hdrs, IF_MATCH).map(String::from);
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let if_modified_since = get_header(hdrs, IF_MODIFIED_SINCE).map(String::from);
     let if_unmodified_since = get_header(hdrs, IF_UNMODIFIED_SINCE).map(String::from);
+
+    // A write acknowledged from memory is not on the NAS to be stat'd. Answer
+    // from the pending metadata instead — a stat here would 404 an object the
+    // client was told it had written.
+    if let Some((etag, last_modified, size)) = state.writeback.pending_meta(key).await {
+        let etag = format!("\"{etag}\"");
+        if let Some(ref im) = if_match
+            && !etag_matches(im, &etag)
+        {
+            return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
+        }
+        if let Some(ref inm) = if_none_match
+            && etag_matches(inm, &etag)
+        {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", &etag)
+                .body(SpiceioBody::empty())
+                .unwrap();
+        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", guess_content_type(key))
+            .header("Content-Length", size.to_string())
+            .header("ETag", &etag)
+            .header("Last-Modified", xml::epoch_to_http_date(last_modified))
+            .header("Accept-Ranges", "bytes")
+            .body(SpiceioBody::empty())
+            .unwrap();
+    }
 
     match share.head_object(key).await {
         Ok(meta) => {
@@ -1608,9 +1907,10 @@ async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<Spicei
             w.close("Error");
             continue;
         }
+        state.writeback.cancel(key).await;
         match share.delete_object(key).await {
             Ok(()) => {
-                state.object_cache.invalidate(key);
+                state.object_cache.forget(key).await;
                 if !quiet {
                     w.open("Deleted");
                     w.element("Key", key);
@@ -1618,7 +1918,7 @@ async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<Spicei
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                state.object_cache.invalidate(key);
+                state.object_cache.forget(key).await;
                 if !quiet {
                     w.open("Deleted");
                     w.element("Key", key);
@@ -1862,6 +2162,18 @@ async fn handle_upload_part_copy(
         );
     }
 
+    // A server-side copy is issued *to the NAS*, which opens the source path
+    // itself — a write still queued in memory is not there for it to read.
+    if !state
+        .writeback
+        .flush_key(&src_key, PENDING_FLUSH_TIMEOUT)
+        .await
+    {
+        return service_unavailable(
+            "A pending write to the copy source has not reached the backend yet; please retry.",
+        );
+    }
+
     // Optional byte range of the source for this part. Unlike Range, S3's
     // copy-source-range requires both bounds; we resolve/clamp in read_range.
     let range = match get_header(hdrs, X_AMZ_COPY_SOURCE_RANGE) {
@@ -2101,12 +2413,13 @@ async fn handle_complete_multipart_upload(
         .map(|p| (p.temp_path.as_str(), p.size))
         .collect();
 
+    state.writeback.cancel(key).await;
     let meta = match state.share.assemble_parts(key, &parts).await {
         Ok(m) => m,
         Err(e) => return io_to_s3_write_error(&e),
     };
 
-    state.object_cache.invalidate(key);
+    state.object_cache.forget(key).await;
 
     // Only now remove the upload from the store
     let upload = state.multipart.complete(upload_id).await;
@@ -2694,6 +3007,165 @@ async fn collect_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Pre-admission cache probe gating ─────────────────────────────
+
+    #[test]
+    fn plain_object_query_admits_only_real_object_reads() {
+        assert!(is_plain_object_query(""));
+        assert!(is_plain_object_query("response-content-type=text/plain"));
+        // Sub-resources must not be answered with the object's body.
+        for q in [
+            "acl",
+            "tagging",
+            "uploadId=abc",
+            "legal-hold",
+            "retention",
+            "torrent",
+            "partNumber=2",
+            "select",
+        ] {
+            assert!(!is_plain_object_query(q), "{q} treated as a plain GET");
+        }
+        // A sub-resource name appearing inside a *value* is not a selector —
+        // same rule `has_query_flag` applies at the dispatch below.
+        assert!(is_plain_object_query("prefix=my-acl-doc"));
+    }
+
+    #[test]
+    fn every_dispatched_subresource_is_gated() {
+        // The pre-admission probe runs before the sub-resource dispatch, so it
+        // has to reject everything that dispatch routes on. Reading the router's
+        // own source keeps the two in step: adding a `has_query_flag` branch
+        // without listing it here fails this test instead of quietly answering
+        // that sub-resource with an object body.
+        let src = include_str!("router.rs");
+        let mut missing = Vec::new();
+        for (i, _) in src.match_indices("has_query_flag(query, \"") {
+            let rest = &src[i + "has_query_flag(query, \"".len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let flag = &rest[..end];
+            if !OBJECT_SUBRESOURCES.contains(&flag) && !missing.contains(&flag) {
+                missing.push(flag);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "sub-resources dispatched but not gated out of the pre-admission \
+             cache probe: {missing:?} — add them to OBJECT_SUBRESOURCES"
+        );
+    }
+
+    // ── Pending-write listing overlay ────────────────────────────────
+
+    fn obj(key: &str, size: u64, last_modified: u64) -> crate::smb::ops::ObjectInfo {
+        crate::smb::ops::ObjectInfo {
+            key: key.into(),
+            size,
+            last_modified,
+            etag: "on-nas".into(),
+        }
+    }
+
+    fn pending(key: &str, size: u64, last_modified: u64) -> (String, String, u64, u64) {
+        (key.into(), "pending-etag".into(), last_modified, size)
+    }
+
+    #[test]
+    fn overlay_adds_keys_the_backend_walk_could_not_see() {
+        // The anomaly this exists to prevent: PUT then LIST concluding the
+        // write vanished, because it is acknowledged but not yet on the NAS.
+        let mut objects = vec![obj("a.o", 1, 100)];
+        let mut prefixes = Vec::new();
+        merge_pending(
+            "",
+            None,
+            vec![pending("b.o", 42, 200)],
+            &mut objects,
+            &mut prefixes,
+        );
+        assert_eq!(objects.len(), 2);
+        let added = objects.iter().find(|o| o.key == "b.o").unwrap();
+        assert_eq!((added.size, added.last_modified), (42, 200));
+        assert_eq!(added.etag, "pending-etag");
+    }
+
+    #[test]
+    fn overlay_replaces_a_listed_key_rather_than_duplicating_it() {
+        // An overwrite: the NAS still reports the old size, but the pending
+        // body is what every read of this key now returns.
+        let mut objects = vec![obj("a.o", 1, 100)];
+        let mut prefixes = Vec::new();
+        merge_pending(
+            "",
+            None,
+            vec![pending("a.o", 999, 300)],
+            &mut objects,
+            &mut prefixes,
+        );
+        assert_eq!(objects.len(), 1, "duplicated a key that was already listed");
+        assert_eq!((objects[0].size, objects[0].last_modified), (999, 300));
+    }
+
+    #[test]
+    fn overlay_honors_the_prefix() {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        merge_pending(
+            "keep/",
+            None,
+            vec![pending("keep/a.o", 1, 1), pending("other/b.o", 1, 1)],
+            &mut objects,
+            &mut prefixes,
+        );
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "keep/a.o");
+    }
+
+    #[test]
+    fn overlay_rolls_deeper_keys_into_common_prefixes() {
+        // With a delimiter the backend walk reports a directory, not the keys
+        // under it; a pending key has to be folded the same way or a listing
+        // grows an entry the un-delimited walk would never produce.
+        let mut objects = Vec::new();
+        let mut prefixes = vec!["p/existing/".to_string()];
+        merge_pending(
+            "p/",
+            Some("/"),
+            vec![
+                pending("p/deep/a.o", 1, 1),
+                pending("p/deep/b.o", 1, 1),
+                pending("p/existing/c.o", 1, 1),
+                pending("p/flat.o", 7, 1),
+            ],
+            &mut objects,
+            &mut prefixes,
+        );
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "p/flat.o");
+        prefixes.sort();
+        assert_eq!(
+            prefixes,
+            vec!["p/deep/", "p/existing/"],
+            "duplicated a prefix"
+        );
+    }
+
+    #[test]
+    fn overlay_without_a_delimiter_lists_deep_keys_directly() {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        merge_pending(
+            "",
+            None,
+            vec![pending("a/b/c.o", 5, 1)],
+            &mut objects,
+            &mut prefixes,
+        );
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "a/b/c.o");
+        assert!(prefixes.is_empty());
+    }
 
     #[test]
     fn query_flag_matches_name_not_value_substring() {

@@ -782,6 +782,9 @@ mod tests {
         assert_eq!(1usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 16); // floor
         assert_eq!(4usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 32);
         assert_eq!(12usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 96);
+        // The default pool caps at 16 connections, so this is the widest
+        // admission budget a default deployment builds.
+        assert_eq!(16usize.saturating_mul(WORK_SLOTS_PER_CONN).max(16), 128);
     }
 
     #[test]

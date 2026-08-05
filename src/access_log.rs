@@ -345,14 +345,8 @@ mod tests {
     /// Minimal block-on so the body tests need no async runtime. Both bodies
     /// under test are ready immediately, so a no-op waker is enough.
     fn block_on<F: Future>(fut: F) -> F::Output {
-        use std::sync::Arc;
-        use std::task::{Wake, Waker};
-        struct NoopWake;
-        impl Wake for NoopWake {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(NoopWake));
-        let mut cx = Context::from_waker(&waker);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
         let mut fut = Box::pin(fut);
         loop {
             if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
