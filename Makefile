@@ -1,4 +1,4 @@
-.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended ci clean all \
+.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback ci clean all \
 	loadgen bench-sccache bench-sccache-build bench-sccache-all
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
@@ -41,12 +41,16 @@ test-unit:
 test: build
 	./scripts/test-sccache.sh
 
-# All live SMB suites CI runs (sccache + extended + stress).
+# All live SMB suites CI runs (sccache + extended + write-back + stress).
 test-live: build
 	./scripts/ci-local.sh --live-only
 
 test-extended: build test
 	./scripts/test-sccache-spiceai.sh
+
+# Write-back acknowledgement + machine-wide disk spill, on their own.
+test-writeback: build
+	./scripts/test-writeback.sh
 
 # Full parity with .github/workflows/ci.yml. Use this before declaring a PR
 # green when NAS credentials are available. Fails if live suites are skipped

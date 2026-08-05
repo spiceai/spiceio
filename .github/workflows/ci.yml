@@ -131,6 +131,25 @@ jobs:
           SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/extended.log
         run: ./scripts/test-extended.sh
 
+      - name: Run write-back and disk-spill test
+        # Asynchronous PUT acknowledgement (SPICEIO_WRITE_BACK) and the
+        # machine-wide disk spill. Starts a second instance to read the objects
+        # back with both features off, so the assertion is that the bytes really
+        # reached the NAS rather than that a cache answered. Ports 18337/18338.
+        if: ${{ env.HAS_SMB_PASS == 'true' }}
+        env:
+          SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
+          SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
+          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
+          SPICEIO_BUCKET: writeback
+          SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_BIND: 127.0.0.1:18337
+          SPICEIO_BIND2: 127.0.0.1:18338
+          AWS_DEFAULT_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/writeback.log
+        run: ./scripts/test-writeback.sh
+
       - name: Run concurrent stress test
         # Concurrent writes/reads/contention, write-then-read patterns,
         # mixed read/write on same key, and large-file pipelined I/O.
