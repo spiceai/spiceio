@@ -8,4 +8,5 @@ pub mod headers;
 pub mod multipart;
 pub mod object_cache;
 pub mod router;
+pub mod spill;
 pub mod xml;
