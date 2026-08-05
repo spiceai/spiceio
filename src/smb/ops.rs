@@ -440,6 +440,30 @@ impl ShareSession {
         Ok((objects, common_prefixes))
     }
 
+    /// Put object with no window in which the client's key holds a partial body.
+    ///
+    /// Small bodies go out as one compound Create+Write+Close. Anything larger
+    /// goes through the WAL — write a temp, verify its length, rename — the
+    /// same path streaming PutObject uses, and the reason a failed write leaves
+    /// any existing object untouched instead of replacing it with a truncated
+    /// one (see `WalWriter::commit`).
+    ///
+    /// This is what background writes must use. `put_object`'s large-file
+    /// branch overwrites in place and deletes the destination if the write
+    /// fails, which is defensible while a client is still waiting on the
+    /// result and is not once the client has already been told it succeeded.
+    pub async fn put_object_atomic(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
+        if data.len() <= self.pool.compound_max_write_size as usize {
+            return self.put_object(key, data).await;
+        }
+        let mut wal = self.open_wal_write(key).await?;
+        if let Err(e) = wal.write(data).await {
+            wal.abort().await;
+            return Err(e);
+        }
+        wal.commit(self).await
+    }
+
     /// Put object (write file). Uses compound Create+Write+Close for small
     /// files, falling back to sequential for larger files.
     ///
@@ -479,6 +503,13 @@ impl ShareSession {
             });
         }
 
+        // NOTE: the branch below overwrites the destination in place and, on
+        // final failure, deletes it. That is acceptable only while a client is
+        // still waiting on the result and can be told the write failed. For a
+        // write nobody is waiting on any more — a background write-back flush,
+        // or a replay — use `put_object_atomic`, which routes the same body
+        // through the WAL so a failure leaves the existing object untouched.
+        //
         // Large file — sequential write with the same transient-retry wrapper
         // around open+write so a mid-body reset reconnects rather than 503s.
         let data_owned = data.to_vec();
@@ -2577,6 +2608,27 @@ fn filetime_to_epoch_secs(ft: u64) -> u64 {
     (ft - EPOCH_DIFF) / FILETIME_TICKS_PER_SEC
 }
 
+/// Wall-clock seconds since the Unix epoch.
+pub fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Etag for an object that has been acknowledged to the client but not yet
+/// written to the backend.
+///
+/// Built in the same shape as a real one — the server assigns the authoritative
+/// mtime when the write lands, and both cache tiers adopt the resulting etag
+/// then. Keeping the format identical means nothing downstream (conditional
+/// requests, listings, the cache's own revalidation) has to know which kind it
+/// is holding.
+pub fn provisional_etag(size: u64, epoch_secs: u64) -> String {
+    const EPOCH_DIFF: u64 = 116444736000000000;
+    etag_for(size, epoch_secs * FILETIME_TICKS_PER_SEC + EPOCH_DIFF)
+}
+
 /// Very simple content type guessing based on extension.
 pub(crate) fn guess_content_type(key: &str) -> String {
     let ext = key.rsplit('.').next().unwrap_or("");
@@ -3042,7 +3094,13 @@ mod tests {
 
     #[test]
     fn wal_temp_path_contains_counter() {
-        // The counter portion should differ between consecutive calls
+        // The counter portion must advance between calls, which is what makes
+        // two temps distinct within the same nanosecond.
+        //
+        // Strictly *increasing*, not "+1": the counter is process-global and
+        // the other tests in this binary draw from it on their own threads, so
+        // asserting on the exact step measures the test runner's interleaving
+        // rather than the property under test.
         let p1 = wal_temp_path();
         let p2 = wal_temp_path();
         let f1 = p1.strip_prefix(".spiceio-wal\\").unwrap();
@@ -3052,7 +3110,10 @@ mod tests {
         let c2: &str = f2.rsplit('-').next().unwrap();
         let n1: u64 = c1.parse().expect("counter should be numeric");
         let n2: u64 = c2.parse().expect("counter should be numeric");
-        assert_eq!(n2, n1 + 1, "counter should increment monotonically");
+        assert!(
+            n2 > n1,
+            "counter should advance monotonically: {n1} -> {n2}"
+        );
     }
 
     #[test]
