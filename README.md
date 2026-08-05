@@ -198,7 +198,8 @@ What is not:
   it reaches the disk spill it is recoverable — dirty entries are never
   evicted, and are replayed on the next start or by a peer instance that finds
   them — but the window before that is real. This is the setting's whole
-  trade, and why it is off by default.
+  trade: right for the cache workloads spiceio fronts, and the reason
+  `SPICEIO_WRITE_BACK=0` exists for anything that is a system of record.
 - **Peer instances and other S3 clients do not see the object until it
   flushes**, except through the shared spill on the same machine.
 

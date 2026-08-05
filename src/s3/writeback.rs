@@ -7,8 +7,9 @@
 //! a cache like sccache — is served from memory either way. The backend write
 //! is bookkeeping, and the client does not need to wait on it.
 //!
-//! With `SPICEIO_WRITE_BACK` on, PutObject inserts into the cache, hands the
-//! body to this queue, and returns. A pool of flushers then, per key:
+//! Enabled by default (`SPICEIO_WRITE_BACK=0` opts out), PutObject inserts into
+//! the cache, hands the body to this queue, and returns. A pool of flushers
+//! then, per key:
 //!
 //! 1. publishes the body to the disk spill marked **dirty**, so a crash leaves
 //!    the write recoverable and a peer instance can read it;
@@ -20,8 +21,9 @@
 //!
 //! The 200 is returned before the bytes are anywhere but this process's memory
 //! — a `kill -9` between the acknowledgement and step 1 loses the write. That
-//! is why this is opt-in, and why it is the right trade only for a *cache*
-//! backend, where a lost entry costs a rebuild rather than data. Everything
+//! is why `SPICEIO_WRITE_BACK=0` exists, and why this is the right default only
+//! for a *cache* backend, where a lost entry costs a rebuild rather than data
+//! (which is what spiceio fronts). Everything
 //! after step 1 is recoverable: dirty entries are never evicted, and are
 //! replayed by this instance on restart or by a peer that finds them aged.
 //!
@@ -620,7 +622,14 @@ impl WriteBack {
         // Through the same admission semaphore live requests use. A background
         // flush that skipped it would be invisible to admission control and
         // could bury the pool under work no client is waiting for.
-        let permit = slots.clone().acquire_owned().await;
+        //
+        // The only way this errors is a closed semaphore, which happens when
+        // the pool is being torn down. Proceeding unmetered is then the right
+        // call rather than the dangerous one: there are no client requests left
+        // to protect a share of the pool for, and the alternative is abandoning
+        // a write the client was already told had succeeded. `.ok()` rather
+        // than a discard so the fallible acquire is visible at the call site.
+        let permit = slots.clone().acquire_owned().await.ok();
 
         // Atomic: the client already has its 200, so a failed flush must not
         // replace a good object with a truncated one.

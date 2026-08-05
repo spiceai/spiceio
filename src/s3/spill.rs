@@ -471,11 +471,29 @@ impl Spill {
         };
         let mut header = [0u8; HEADER_LEN];
         f.read_exact(&mut header)?;
+        if &header[0..4] != MAGIC || u16::from_le_bytes([header[4], header[5]]) != FORMAT_VERSION {
+            return Ok(false);
+        }
         if &header[32..64] != expect_sha.as_slice() {
             return Ok(false);
         }
         let id_len = u32::from_le_bytes(header[8..12].try_into().unwrap_or_default()) as usize;
         let etag_len = u32::from_le_bytes(header[12..16].try_into().unwrap_or_default()) as usize;
+
+        // Verify the entry really is this key's before rewriting its header.
+        // The path is derived from a hash, and `read_entry` treats a mismatched
+        // id as a miss precisely because a collision or a stray file must never
+        // be mistaken for the key. Promotion writes *into* the file, so without
+        // the same check the weaker guarantee here would be the one that holds:
+        // a mismatched entry would have another key's metadata stamped onto it.
+        if id_len > 64 * 1024 || etag_len > 1024 {
+            return Ok(false);
+        }
+        let mut id = vec![0u8; id_len];
+        f.read_exact(&mut id)?;
+        if id != self.id_for(key) {
+            return Ok(false);
+        }
         drop(f);
 
         // Etags here are fixed-width (`{mtime:016x}{size:016x}`), so the new
@@ -1060,6 +1078,34 @@ mod tests {
         assert_eq!(e.last_modified, 7);
         assert_eq!(&e.body[..], b"body");
         assert!(s.scan_dirty(Duration::ZERO).0.is_empty());
+    }
+
+    #[test]
+    fn promote_refuses_an_entry_belonging_to_another_key() {
+        // `read_entry` treats a mismatched id as a miss so a hash collision or a
+        // stray file can never be served as some other key. Promotion writes
+        // *into* the file, so it has to hold the same line — otherwise the
+        // weaker guarantee would be the one that applies, and a colliding entry
+        // would get another key's etag and mtime stamped onto it.
+        let d = TempDir::new("collide");
+        let s = spill("collide", &d);
+        let sha = s.put("real-key", "e", 1, b"body", true).unwrap();
+        // Stand in for a collision: the same bytes filed under a different key's
+        // path, so the stored id names "real-key" while the path names "other".
+        let planted = s.path_for("other", DIRTY_EXT);
+        fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        fs::copy(s.path_for("real-key", DIRTY_EXT), &planted).unwrap();
+
+        assert!(
+            !s.promote("other", &sha, "newetag", 99, b"body").unwrap(),
+            "promoted an entry whose stored id names a different key"
+        );
+        // Untouched: still dirty, still the original metadata.
+        let e = s
+            .read_entry(&planted, "real-key")
+            .expect("entry was corrupted");
+        assert_eq!(e.etag, "e");
+        assert_eq!(e.last_modified, 1);
     }
 
     #[test]

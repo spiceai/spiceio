@@ -45,7 +45,8 @@ pub struct AppState {
     /// GET body cache (etag-validated; optional immutable-key mode).
     pub object_cache: Arc<ObjectCache>,
     /// Writes acknowledged from memory that have not reached the NAS yet.
-    /// Disabled by default, in which case every method below short-circuits.
+    /// Enabled by default; when `SPICEIO_WRITE_BACK=0` disables it, every
+    /// method below short-circuits on a single bool check.
     pub writeback: Arc<WriteBack>,
 }
 
@@ -387,7 +388,13 @@ fn parse_path(path: &str) -> (&str, &str) {
 ///
 /// Mirrors the backend walk's own prefix/delimiter rules: a key that still has
 /// a separator after the prefix is a directory the walk would have reported as
-/// a common prefix, not an object. A pending key that the walk *did* find (an
+/// a common prefix, not an object.
+///
+/// The separator is `/` regardless of the requested delimiter, because that is
+/// what the backend walk does — SMB directories are the only grouping it can
+/// report, so `smb::ops::list_objects` rolls up at directory boundaries and
+/// appends `/`. Honouring an arbitrary delimiter *here* would not fix that; it
+/// would only make the overlay disagree with the listing it is merging into. A pending key that the walk *did* find (an
 /// overwrite of an existing object) keeps its listed entry rather than being
 /// duplicated — the size and mtime it will have once the flush lands are the
 /// pending ones, so those win.
