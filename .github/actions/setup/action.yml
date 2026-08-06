@@ -3,9 +3,9 @@ description: Install a released version of spiceio and start the S3-to-SMB proxy
 
 inputs:
   version:
-    description: Release tag to install (e.g. "v0.6.0"). Use "latest" for the most recent release.
+    description: Release tag to install (e.g. "v0.7.0"). Use "latest" for the most recent release.
     required: false
-    default: v0.6.0
+    default: v0.7.0
   smb-url:
     description: >
       SMB connection URL: smb://user:pass@server/share or smb://user:pass@server:port/share.
@@ -48,6 +48,33 @@ inputs:
       compiling should set this explicitly: the cache is the main throughput
       lever, but it is resident memory competing with the build. The configured
       budget is logged at startup and the achieved hit rate at shutdown.
+    required: false
+    default: ""
+  write-back:
+    description: >
+      SPICEIO_WRITE_BACK — acknowledge PutObject from memory and write to the
+      NAS in the background. Empty uses spiceio's own default, which is on.
+      Set "false" on a runner that cannot tolerate losing the last few writes:
+      the acknowledgement precedes the backend write, and a job that ends
+      before the drain takes its unflushed writes with it. For an sccache
+      cache that costs a recompile next build, which is usually the right
+      trade on CI; for anything treated as a system of record it is not.
+    required: false
+    default: ""
+  spill-dir:
+    description: >
+      SPICEIO_SPILL_DIR — machine-wide disk tier behind the memory cache.
+      Empty uses spiceio's own default (/var/tmp/spiceio-cache); "off"
+      disables it. On an ephemeral runner the directory does not outlive the
+      job, so it only helps when several spiceio instances share the host.
+    required: false
+    default: ""
+  spill-bytes:
+    description: >
+      SPICEIO_SPILL_BYTES — disk budget for the spill directory, shared by
+      every instance on the host. Empty uses spiceio's own default of 64 GiB,
+      which is already clamped to leave at least 10 GiB free and to half the
+      space above that. Set it lower on a runner whose disk the build needs.
     required: false
     default: ""
   token:
@@ -106,6 +133,9 @@ runs:
         SPICEIO_SMB_CONNECTIONS: ${{ inputs.connections }}
         IMMUTABLE_OBJECTS: ${{ inputs.immutable-objects }}
         CACHE_BYTES: ${{ inputs.cache-bytes }}
+        WRITE_BACK: ${{ inputs.write-back }}
+        SPILL_DIR: ${{ inputs.spill-dir }}
+        SPILL_BYTES: ${{ inputs.spill-bytes }}
       run: |
         set -euo pipefail
 
@@ -159,6 +189,21 @@ runs:
         # in place rather than pinning the cache to zero bytes.
         if [[ -n "$CACHE_BYTES" ]]; then
           export SPICEIO_OBJECT_CACHE_BYTES="$CACHE_BYTES"
+        fi
+        if [[ -n "$SPILL_DIR" ]]; then
+          export SPICEIO_SPILL_DIR="$SPILL_DIR"
+        fi
+        if [[ -n "$SPILL_BYTES" ]]; then
+          export SPICEIO_SPILL_BYTES="$SPILL_BYTES"
+        fi
+        # Same normalization as immutable-objects, but only when the input is
+        # non-empty: spiceio's default is on, so an unset input must not be
+        # turned into an explicit 0.
+        if [[ -n "$WRITE_BACK" ]]; then
+          case "$(printf '%s' "$WRITE_BACK" | tr '[:upper:]' '[:lower:]')" in
+            1|true|yes) export SPICEIO_WRITE_BACK=1 ;;
+            *)          export SPICEIO_WRITE_BACK=0 ;;
+          esac
         fi
 
         SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"
