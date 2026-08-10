@@ -376,6 +376,15 @@ sccache --stop-server 2>/dev/null || true
 unset SCCACHE_DIR SCCACHE_GCS_BUCKET SCCACHE_AZURE_CONNECTION_STRING \
     SCCACHE_REDIS SCCACHE_MEMCACHED SCCACHE_WEBDAV_ENDPOINT 2>/dev/null || true
 
+# Also drop the ambient *S3 credential mode*. A developer whose shell already
+# points sccache at a running spiceio sets SCCACHE_S3_NO_CREDENTIALS=1, which
+# directly contradicts the anonymous-but-present credentials this test exports
+# below — sccache 0.17 refuses the combination outright ("If setting S3
+# credentials, SCCACHE_S3_NO_CREDENTIALS must not be set") and `--start-server`
+# fails. AWS_PROFILE goes for the same reason: it would put a real credential
+# chain ahead of the test's, against an endpoint that authenticates nothing.
+unset SCCACHE_S3_NO_CREDENTIALS AWS_PROFILE 2>/dev/null || true
+
 export SCCACHE_BUCKET="$BUCKET"
 export SCCACHE_ENDPOINT="$ENDPOINT"
 export SCCACHE_REGION="$REGION"

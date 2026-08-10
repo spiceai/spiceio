@@ -17,15 +17,24 @@
 //! 3. promotes the spill entry to clean, adopting the backend's real etag and
 //!    mtime (see [`crate::s3::spill::Spill::promote`]).
 //!
+//! Step 1 is not tied to steps 2–3. Flushers stand down from the *backend*
+//! while clients are using it, and journalling is local disk, so a standing-down
+//! flusher keeps doing step 1 for whatever is still memory-only (`journal_one`).
+//! Bolting the journal to the front of the NAS write meant deferring the write
+//! also deferred the write becoming recoverable, and under continuous client
+//! traffic that window ran until the backlog hit the urgent threshold —
+//! hundreds of MiB of already-acknowledged objects held in memory alone.
+//!
 //! # What the client is promised
 //!
-//! The 200 is returned before the bytes are anywhere but this process's memory
-//! — a `kill -9` between the acknowledgement and step 1 loses the write. That
-//! is why `SPICEIO_WRITE_BACK=0` exists, and why this is the right default only
-//! for a *cache* backend, where a lost entry costs a rebuild rather than data
-//! (which is what spiceio fronts). Everything
-//! after step 1 is recoverable: dirty entries are never evicted, and are
-//! replayed by this instance on restart or by a peer that finds them aged.
+//! The 200 is returned before the bytes are anywhere but this process's memory.
+//! They reach the disk journal shortly after — promptly, but *not* synchronously
+//! with the acknowledgement — so a `kill -9` in that window still loses the
+//! write. That is why `SPICEIO_WRITE_BACK=0` exists, and why this is the right
+//! default only for a *cache* backend, where a lost entry costs a rebuild rather
+//! than data (which is what spiceio fronts). Once journalled, a write is
+//! recoverable: dirty entries are never evicted, and are replayed by this
+//! instance on restart or by a peer that finds them aged.
 //!
 //! # What stays consistent
 //!
@@ -47,7 +56,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -69,23 +78,106 @@ pub const DEFAULT_FLUSHERS: usize = 4;
 /// How long a failed flush waits before its key is retried.
 const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
-/// Share of the SMB admission budget kept clear of background flushing.
+/// Client SMB operations in flight past which flushers stand down.
 ///
-/// A read blocks a client; a write-back does not. Fair queueing against live
-/// requests measured a read-latency spike during a write drain worse than the
-/// write latency the feature removes, so flushers only take a slot while this
-/// much of the budget is still free. Under sustained read load they starve, the
-/// queue fills, and PutObject reverts to synchronous — the honest outcome when
-/// the backend has no spare capacity.
-const CLIENT_RESERVE_FRACTION: usize = 4; // keep 1/4 for clients
+/// A read blocks a client; a write-back does not, so background flushing should
+/// yield whenever clients are actually using the backend. The signal has to be
+/// *client demand*, not spare admission permits: admission is sized to keep
+/// every connection pipelined (`pool × 8` — 128 permits at the default pool of
+/// 16), while the NAS saturates at a measured concurrency of about 8. A reserve
+/// expressed as a fraction of permits therefore only engaged once ~96 client
+/// requests were in flight — an order of magnitude past the point where reads
+/// have already started queueing behind the drain. Measured with the old
+/// permit-fraction reserve: 32% of GETs in a put-then-get sweep took over 1 ms,
+/// median 48 ms among them, in seconds when *no client PUT was running at all*.
+///
+/// Small on purpose. The backend is bandwidth-bound, not concurrency-bound, so
+/// a handful of concurrent client reads is already enough to want the drain out
+/// of the way.
+const CLIENT_BUSY_THRESHOLD: usize = 2;
 
-/// How long a flusher stands down when the pool reports overload.
+/// Fraction of the pending-byte ceiling past which flushers stop yielding.
 ///
-/// Nobody is waiting on a write-back, so it is precisely the work that should
-/// yield when the backend is struggling. Without this the flushers compete with
-/// live requests for the same connections and turn a write burst into a *read*
-/// latency spike measurably worse than the one write-back removed.
+/// Standing down for readers is right until the backlog is close enough to the
+/// ceiling that PutObject is about to start writing through synchronously.
+/// Past this point deferring costs clients *more* than it saves them: they
+/// would pay the full backend write latency on the PUT and still contend with
+/// the drain that eventually has to happen.
+const URGENT_BACKLOG_FRACTION: u64 = 2; // half the ceiling
+
+/// How long a flusher stands down when the backend is busy with client work.
+///
+/// Short, because it is a poll: the drain should resume in the gaps between
+/// read bursts, and every millisecond spent sleeping past the end of a burst is
+/// backend capacity nobody used. The old 50 ms was sized for the pool-overload
+/// case alone, where standing down longer is harmless.
+const YIELD_BACKOFF: Duration = Duration::from_millis(5);
+
+/// How long a flusher stands down when the pool itself reports overload.
+///
+/// Longer than [`YIELD_BACKOFF`]: an overloaded pool means resets and poisoned
+/// connections, and retrying into that quickly only adds to it.
 const OVERLOAD_BACKOFF: Duration = Duration::from_millis(50);
+
+/// How long a flusher should stand down before trying again, or `None` to
+/// proceed now.
+///
+/// Pure, so the policy that decides whether a background write may compete with
+/// client reads can be tested without a runtime, a pool, or a NAS. The caller
+/// still overrides a yield when the backlog is urgent or shutdown has begun —
+/// both of those cost more to evaluate, and neither depends on this decision.
+///
+/// Every flusher yields, with no always-on exemption. Keeping one working was
+/// measured on the sustained case it was meant for — a working set past the
+/// write-back ceiling, so the backlog really does reach the urgent threshold —
+/// and was slightly *worse* on every metric (mixed phase at concurrency 32:
+/// −7% throughput, +10% p90, +8% p99). The urgent override already stops the
+/// backlog from growing untouched, so the exemption bought nothing and cost
+/// exactly what any flush during a client read costs.
+///
+/// `waiters` inverts the policy, and must: a caller inside
+/// [`WriteBack::flush_key`] is a client blocked *on the drain itself*, so
+/// counting it as a reason to defer the drain deadlocks it against its own
+/// prerequisite. Two concurrent CopyObjects of a not-yet-claimed pending source
+/// are enough — each holds an admission slot while waiting, together they hold
+/// `clients` at the threshold, and no flusher ever claims the key they are
+/// waiting for. They then both wait out `PENDING_FLUSH_TIMEOUT` and answer 503.
+/// Overload still wins over everything: a pool that is resetting connections
+/// cannot serve the waiter either, and piling on makes it worse.
+fn yield_for(overloaded: bool, clients: usize, waiters: usize) -> Option<Duration> {
+    if overloaded {
+        return Some(OVERLOAD_BACKOFF);
+    }
+    if waiters > 0 {
+        return None;
+    }
+    if clients >= CLIENT_BUSY_THRESHOLD {
+        return Some(YIELD_BACKOFF);
+    }
+    None
+}
+
+/// Counts one caller blocked in [`WriteBack::flush_key`] for as long as it
+/// lives.
+///
+/// A guard rather than a bare increment/decrement pair because the future it
+/// lives in is cancellable: a client that hangs up mid-wait drops it, and a
+/// leaked increment would pin the drain permanently urgent — which is exactly
+/// the read-latency spike the yield policy exists to prevent.
+struct FlushWaiter<'a>(&'a AtomicUsize);
+
+impl<'a> FlushWaiter<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for FlushWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// One acknowledged-but-unwritten object.
 struct Pending {
@@ -99,6 +191,12 @@ struct Pending {
     /// A flusher currently owns this key. Keeps a second one from taking it,
     /// and tells DELETE it must wait rather than cancel.
     flushing: bool,
+    /// Body digest, set once this body has been journalled to the disk spill —
+    /// i.e. once a crash would leave it recoverable rather than lost. `None`
+    /// means it exists only in this process's memory. Always `None` on a fresh
+    /// body: an overwrite has different bytes, so the predecessor's journal
+    /// entry does not vouch for it.
+    sha: Option<[u8; 32]>,
 }
 
 /// One key checked out by a flusher.
@@ -110,6 +208,8 @@ struct Claim {
     etag: String,
     last_modified: u64,
     seq: u64,
+    /// Digest of an already-journalled body, so the flush does not rewrite it.
+    sha: Option<[u8; 32]>,
 }
 
 struct Inner {
@@ -134,6 +234,10 @@ pub struct WriteBack {
     /// Mirrors `Inner::closed` for readers that must not take the lock — the
     /// flushers check it on every pass through their backoff.
     closing: AtomicBool,
+    /// Callers currently blocked in [`Self::flush_key`]. Read by the flushers
+    /// without the lock; see `yield_for` for why a waiter must *raise* the
+    /// drain's priority rather than lower it.
+    flush_waiters: AtomicUsize,
     accepted: AtomicU64,
     flushed: AtomicU64,
     rejected: AtomicU64,
@@ -155,6 +259,7 @@ impl WriteBack {
             max_bytes: max_bytes.max(1),
             enabled,
             closing: AtomicBool::new(false),
+            flush_waiters: AtomicUsize::new(0),
             accepted: AtomicU64::new(0),
             flushed: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -232,6 +337,10 @@ impl WriteBack {
                 last_modified,
                 seq,
                 flushing: false,
+                // Deliberately not inherited from `prev`: these are different
+                // bytes, and claiming they are already journalled would let a
+                // crash lose them silently.
+                sha: None,
             },
         );
         g.bytes = g.bytes + len - displaced;
@@ -330,6 +439,11 @@ impl WriteBack {
         if !self.enabled {
             return true;
         }
+        // Published for the whole wait: this caller is a client blocked on the
+        // drain, so the flushers must stop treating client traffic as a reason
+        // to defer it. Without this the wait is self-defeating — see
+        // `yield_for`.
+        let _waiting = FlushWaiter::new(&self.flush_waiters);
         let deadline = Instant::now() + timeout;
         loop {
             let waiter = self.progress.notified();
@@ -500,6 +614,7 @@ impl WriteBack {
                 etag: p.etag.clone(),
                 last_modified: p.last_modified,
                 seq: p.seq,
+                sha: p.sha,
             });
         }
         None
@@ -543,15 +658,77 @@ impl WriteBack {
     ) -> usize {
         let n = flushers.max(1);
         let slots = share.admission();
-        let reserve = (share.admission_limit() / CLIENT_RESERVE_FRACTION).max(1);
+        let clients = share.client_inflight();
         for _ in 0..n {
             let wb = Arc::clone(self);
             let share = Arc::clone(&share);
             let cache = Arc::clone(&cache);
             let slots = Arc::clone(&slots);
-            tokio::spawn(async move { wb.flush_loop(share, cache, slots, reserve).await });
+            let clients = Arc::clone(&clients);
+            tokio::spawn(async move { wb.flush_loop(share, cache, slots, clients).await });
         }
         n
+    }
+
+    /// True while the backlog is close enough to the ceiling that yielding to
+    /// readers would cost clients more than it saves them.
+    async fn backlog_urgent(&self) -> bool {
+        let g = self.inner.lock().await;
+        g.bytes >= self.max_bytes / URGENT_BACKLOG_FRACTION
+    }
+
+    /// Journal one acknowledged body that is still memory-only. Returns false
+    /// when there is nothing left to journal.
+    ///
+    /// Run *while yielding*, not only as the first step of a flush. Yielding
+    /// defers the NAS write, and journalling used to be bolted to the front of
+    /// that write — so a deferred flush also deferred the moment the write
+    /// became crash-recoverable, and under continuous client traffic an
+    /// acknowledged object could sit in memory alone until the backlog reached
+    /// the urgent threshold (512 MiB by default). Nothing about the disk spill
+    /// needs the backend: it is local, and the client reads being protected are
+    /// not competing for it. So the durability step keeps running when the
+    /// bandwidth step stands down.
+    async fn journal_one(&self, cache: &ObjectCache) -> bool {
+        // Pick a victim under the lock, journal it outside — the spill write
+        // goes through the blocking pool and must not hold up enqueue.
+        let (key, etag, last_modified, body, seq) = {
+            let g = self.inner.lock().await;
+            match g
+                .pending
+                .iter()
+                .find(|(_, p)| p.sha.is_none())
+                .map(|(k, p)| {
+                    (
+                        k.clone(),
+                        p.etag.clone(),
+                        p.last_modified,
+                        p.body.clone(),
+                        p.seq,
+                    )
+                }) {
+                Some(v) => v,
+                None => return false,
+            }
+        };
+        let Some(sha) = cache
+            .spill_put_dirty(&key, &etag, last_modified, &body)
+            .await
+        else {
+            // No spill configured, or the body is too large for it. Either way
+            // there is nothing to record, and retrying would spin.
+            return false;
+        };
+        let mut g = self.inner.lock().await;
+        if let Some(p) = g.pending.get_mut(&key)
+            && p.seq == seq
+        {
+            // Still the same body. A newer one would have its own `sha: None`,
+            // and stamping this digest onto it would claim a journal entry that
+            // holds different bytes.
+            p.sha = Some(sha);
+        }
+        true
     }
 
     async fn flush_loop(
@@ -559,7 +736,7 @@ impl WriteBack {
         share: Arc<ShareSession>,
         cache: Arc<ObjectCache>,
         slots: Arc<Semaphore>,
-        reserve: usize,
+        clients: Arc<AtomicUsize>,
     ) {
         loop {
             // Register interest *before* checking, so a write enqueued between
@@ -568,17 +745,33 @@ impl WriteBack {
             tokio::pin!(idle);
             idle.as_mut().enable();
             // Stand down while the backend is signalling overload, or while
-            // the admission budget is down to the slice held for clients: a
-            // client request is waiting on its response, and this one is not.
+            // clients are using it: a client request is waiting on its
+            // response, and this one is not.
             //
-            // Both yield to the drain. Once shutdown has begun there is no
-            // client left to defer to, and standing down would only spend the
-            // drain's whole budget sleeping while writes the client was told
-            // had succeeded sit unwritten.
+            // Both yield to the drain, and to a backlog near its ceiling. Once
+            // shutdown has begun there is no client left to defer to, and
+            // standing down would only spend the drain's whole budget sleeping
+            // while writes the client was told had succeeded sit unwritten.
+            //
+            // `backlog_urgent` is checked last, and only when something else
+            // already wants to yield, because it is the one input that costs a
+            // lock to read.
             if !self.closing.load(Ordering::Relaxed)
-                && (share.is_overloaded() || slots.available_permits() <= reserve)
+                && let Some(backoff) = yield_for(
+                    share.is_overloaded(),
+                    clients.load(Ordering::Relaxed),
+                    self.flush_waiters.load(Ordering::Relaxed),
+                )
+                && !self.backlog_urgent().await
             {
-                tokio::time::sleep(OVERLOAD_BACKOFF).await;
+                // Standing down from the *backend*, not from durability. If any
+                // acknowledged body is still memory-only, put it on disk now
+                // and come back round immediately rather than sleeping through
+                // a window in which a crash would lose it.
+                if self.journal_one(&cache).await {
+                    continue;
+                }
+                tokio::time::sleep(backoff).await;
                 continue;
             }
             match self.claim().await {
@@ -614,10 +807,18 @@ impl WriteBack {
         c: &Claim,
     ) -> bool {
         // Journal first: from here on a crash is recoverable, because a dirty
-        // entry is never evicted and is replayed by whoever finds it.
-        let sha = cache
-            .spill_put_dirty(&c.key, &c.etag, c.last_modified, &c.body)
-            .await;
+        // entry is never evicted and is replayed by whoever finds it. Skipped
+        // when `journal_one` already wrote this exact body while standing down
+        // for clients — the digest is over the bytes, so a carried-over one
+        // names the same entry.
+        let sha = match c.sha {
+            Some(sha) => Some(sha),
+            None => {
+                cache
+                    .spill_put_dirty(&c.key, &c.etag, c.last_modified, &c.body)
+                    .await
+            }
+        };
 
         // Through the same admission semaphore live requests use. A background
         // flush that skipped it would be invisible to admission control and
@@ -665,6 +866,122 @@ mod tests {
 
     fn wb() -> Arc<WriteBack> {
         Arc::new(WriteBack::new(true, 1024))
+    }
+
+    // ── Who gets the backend when both want it ───────────────────────
+
+    #[test]
+    fn an_idle_backend_lets_flushers_run() {
+        assert_eq!(yield_for(false, 0, 0), None);
+        assert_eq!(yield_for(false, CLIENT_BUSY_THRESHOLD - 1, 0), None);
+    }
+
+    #[test]
+    fn flushers_yield_to_client_traffic() {
+        // The regression this exists for: the previous policy compared spare
+        // *admission permits* (pool × 8) against a quarter of them, so it did
+        // not engage until ~72 concurrent client requests — long past the
+        // measured ~8 at which the NAS saturates. A handful of clients has to
+        // be enough, or the drain queues in front of client reads.
+        assert_eq!(
+            yield_for(false, CLIENT_BUSY_THRESHOLD, 0),
+            Some(YIELD_BACKOFF)
+        );
+        assert_eq!(yield_for(false, 64, 0), Some(YIELD_BACKOFF));
+    }
+
+    #[test]
+    fn a_caller_waiting_on_the_drain_is_not_a_reason_to_defer_it() {
+        // The deadlock this closes: CopyObject holds an admission slot while
+        // awaiting `flush_key`, so waiters are *also* counted as clients. Two
+        // concurrent copies of a not-yet-claimed pending source would then hold
+        // `clients` at the threshold and stall the flusher they are both
+        // blocked on, until each timed out into a 503.
+        assert_eq!(yield_for(false, 64, 1), None);
+        assert_eq!(yield_for(false, CLIENT_BUSY_THRESHOLD, 2), None);
+    }
+
+    #[test]
+    fn an_overloaded_pool_stands_down_longer() {
+        // Resets and poisoned connections are not a queue to push through, and
+        // retrying into one quickly only adds to it — not even for a waiter,
+        // who cannot be served by a pool in that state either.
+        assert_eq!(yield_for(true, 0, 0), Some(OVERLOAD_BACKOFF));
+        assert_eq!(yield_for(true, 0, 4), Some(OVERLOAD_BACKOFF));
+        assert!(OVERLOAD_BACKOFF > YIELD_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_waiter_does_not_pin_the_drain_urgent() {
+        // `flush_key` lives in a cancellable future — a client that hangs up
+        // drops it mid-wait. A leaked waiter count would make the flushers
+        // defer to nobody forever, which is the read-latency spike the yield
+        // policy exists to prevent.
+        let w = wb();
+        w.enqueue("a", "e", 1, Bytes::from_static(b"v1")).await;
+        {
+            let fut = w.flush_key("a", Duration::from_secs(30));
+            tokio::pin!(fut);
+            // Poll once so the wait is actually entered, then drop it.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut fut)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(w.flush_waiters.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn journalling_does_not_wait_for_a_flusher_to_stop_yielding() {
+        // Durability must not be coupled to backend bandwidth. Yielding defers
+        // the NAS write; it must not also defer the moment an acknowledged
+        // write becomes crash-recoverable, or a busy proxy keeps hundreds of
+        // MiB of already-200'd objects in memory alone.
+        let dir = std::env::temp_dir().join(format!("spiceio-wb-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill = super::super::spill::Spill::open(&dir, "ns".into(), 1 << 20, 1 << 18).unwrap();
+        let cache = ObjectCache::new(false, 1 << 20, 1 << 18, 64).with_spill(Arc::new(spill));
+
+        let w = WriteBack::new(true, 1 << 20);
+        w.enqueue("a", "e", 1, Bytes::from_static(b"body-a")).await;
+        assert!(w.journal_one(&cache).await, "nothing was journalled");
+        assert!(
+            cache.spill().unwrap().contains_key("a"),
+            "acknowledged body never reached the disk journal"
+        );
+        // Idempotent: the digest is recorded, so a second pass finds no work
+        // rather than rewriting the same body forever.
+        assert!(!w.journal_one(&cache).await);
+
+        // An overwrite is different bytes, so it must be journalled again
+        // rather than inheriting its predecessor's digest.
+        w.enqueue("a", "e", 2, Bytes::from_static(b"body-a2")).await;
+        assert!(
+            w.journal_one(&cache).await,
+            "overwrite was not re-journalled"
+        );
+
+        // And the flush reuses that digest instead of writing it a third time.
+        let c = w.claim().await.unwrap();
+        assert!(
+            c.sha.is_some(),
+            "flush did not inherit the journalled digest"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_backlog_near_the_ceiling_is_urgent() {
+        // Past this point deferring costs clients more than it saves them:
+        // PutObject is about to start writing through synchronously.
+        let w = WriteBack::new(true, 100);
+        assert!(!w.backlog_urgent().await);
+        w.enqueue("a", "e", 1, Bytes::from(vec![b'x'; 49])).await;
+        assert!(!w.backlog_urgent().await);
+        w.enqueue("b", "e", 1, Bytes::from(vec![b'x'; 1])).await;
+        assert!(w.backlog_urgent().await, "half the ceiling is urgent");
     }
 
     #[tokio::test]

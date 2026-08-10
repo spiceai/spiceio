@@ -105,6 +105,12 @@ impl ShareSession {
         self.pool.admission()
     }
 
+    /// Gauge of client SMB operations in flight, for background work deciding
+    /// whether to yield. See [`crate::smb::pool::SmbPool::client_inflight`].
+    pub fn client_inflight(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.pool.client_inflight()
+    }
+
     /// Pick the next connection + tree_id via round-robin (owned `Arc`).
     fn pick(&self) -> (Arc<SmbClient>, u32) {
         self.pool.pick()

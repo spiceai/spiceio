@@ -3,7 +3,7 @@
 | field | value |
 | --- | --- |
 | label | `baseline-v0.5.10` |
-| build | `/Users/lukim/dev/spiceio/.claude/worktrees/prancy-tickling-dijkstra` |
+| build | `~/dev/spiceio/.claude/worktrees/prancy-tickling-dijkstra` |
 
 `local` is sccache on local disk — the floor a network backend is measured
 against. `nocache` is the compile-everything ceiling.

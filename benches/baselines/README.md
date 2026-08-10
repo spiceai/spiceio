@@ -1,37 +1,82 @@
-# sccache performance baseline — 2026-08-04, spiceio v0.5.10
+# sccache performance baseline
 
-Reference run for `make bench-sccache` and `make bench-sccache-build`. Compare a
-change against these numbers before claiming it helped.
+Reference runs for `make bench-sccache` and `make bench-sccache-build`. Compare
+a change against these numbers before claiming it helped.
 
 | | |
 | --- | --- |
-| spiceio | v0.5.10 (`dc53e1f`) |
+| current baseline | **2026-08-09**, v0.7.0 + write-back scheduling fixes |
+| superseded | 2026-08-04/05, v0.5.10 (`dc53e1f`) — kept below for the defect writeup |
 | host | macOS 26 (Darwin 25.6.0), Mac15,8, 16 cores, **10GbE** uplink |
-| NAS | `smb://192.168.3.148/ai_platform_dev` (shared — expect some run-to-run noise) |
-| SMB pool | 12 connections unless stated |
-| working set | 512 objects, weighted 4 KiB–16 MiB (mean ≈ 589 KiB) |
+| NAS | `smb://<nas>/<share>` (shared — expect run-to-run noise) |
 | sccache | 0.17.0 |
 
-Raw artifacts: `20260804-synthetic/` (per-point JSON + server-side summaries),
-`20260804-build/`, `20260804-pool-sweep.log`, and the two spiceai build runs
-`20260804-build-spiceai/` (pre-fix) and `20260805-build-spiceai-postfix/`.
+Raw artifacts: `20260809-build-spiceai/` and `20260809-writeback-pool/` are the
+current ones. `20260804-synthetic/`, `20260804-build/`, `20260804-pool-sweep.log`,
+`20260804-build-spiceai/` and `20260805-build-spiceai-postfix/` are the
+superseded runs, kept because §5 and §6 reference their evidence.
+
+### What is not committed
+
+**No logs, and no host or share identifiers.** This repository is public. The
+proxy log (`SPICEIO_LOG_FILE`) and the per-request access log
+(`SPICEIO_ACCESS_LOG`) both carry the backend's address, the share name and
+local filesystem paths; the access log is also ~0.5–0.75 MB per run. Neither is
+needed to read a baseline, so committed artifacts are limited to reports,
+result tables and `sccache --show-stats` output, with the backend written as
+`smb://<nas>/<share>`. Everything is still written to `benches/results/`
+(gitignored) on every run, so the detail is there locally when a run needs
+diagnosing.
+
+`.gitignore` enforces the log half of this; the identifiers are on whoever adds
+a run to scrub.
+
+> Some pre-2026-08-09 baselines still contain proxy logs with those details.
+> They predate this rule and are already in the public history, so removing them
+> now would need a history rewrite rather than a deletion commit.
+
+## How to compare against these
+
+**A single before/after pair does not decide anything on this rig.** The NAS is
+shared, and a plain baseline-then-change comparison has moved metrics in *both*
+directions by more than the effect under test — one change read as +333% on one
+phase and −37% on another in the same run. Alternate the arms (A,B,A,B,…), take
+at least three reps, and compare medians **with the per-rep spread printed**; a
+median difference smaller than the spread is not a result. The `mixed` phase
+(70% GET hit / 20% miss / 10% PUT) is the one that tracks a real sccache client.
+`put` alone measures memory bandwidth, since write-back acknowledges from memory.
+
+Note that the standard synthetic sweep's ~300 MiB working set never reaches the
+write-back ceiling, so any change to backlog or backpressure behaviour needs
+`BENCH_OBJECTS`/`BENCH_OPS_PER_WORKER` raised past it to be exercised at all.
 
 ## Headline
 
 1. **The data path saturates at ~100 MiB/s and reaches it at concurrency 8.**
    Beyond that, added concurrency buys zero throughput and adds latency
-   proportionally. spiceio's in-memory GET cache is the only thing that beats
-   the ceiling — it triples read throughput for objects it can hold.
-2. **A real warm build was 1.40× slower through spiceio than on local disk**
-   (34.2s vs 24.4s for spiceai's 1163 units at -j16). That gap was entirely
-   finding 3 — it is **24.4s, matching local disk, once fixed**.
-3. **spiceio dropped 3.3% of large writes under burst load** (§5), costing
-   cache-hit rate on the *next* build. **Fixed** — see §5 for the mechanism,
-   the fix, and the post-fix numbers.
+   proportionally. The in-memory GET cache is the only thing that beats the
+   ceiling. (§1, still current.)
+2. **A real warm build is now 1.16–1.26× local disk, and a cold build is at
+   parity.** Was 1.40× warm / 1.16× cold. Per *write*, spiceio is now faster
+   than local disk — write-back acknowledges from memory. (§4.)
+3. **The proxy's own write drain was the main source of read tail latency.**
+   32% of GETs in a put-then-get sweep took over 1 ms (median 48 ms among them)
+   in seconds when no client PUT was running at all: they were queued behind
+   write-back flushing. Fixing what the flushers yield to measured +66%/+130%
+   throughput and −35%/−52% p90 on the mixed phase. (§6.)
+4. **The connection pool is a latency knob, and 12–16 was too small.** The
+   default is now 2 × CPU clamped 8–32. At 32 the mixed phase's p90 fell 52% at
+   concurrency 32 and 36% at 64 versus 16, and the run-to-run spread tightened
+   markedly. (§3.)
+5. **spiceio dropped 3.3% of large writes under burst load** — found 2026-08-04,
+   fixed. Kept in §5 because the mechanism and the gate that missed it are worth
+   remembering.
 
 ## 1. Throughput ceiling (synthetic, concurrency sweep)
 
-`nocache` disables spiceio's GET body cache, so every read reaches the NAS.
+From the 2026-08-04 run at pool 12; the ceiling is a property of the NAS and has
+not moved. `nocache` disables spiceio's GET body cache, so every read reaches
+the NAS.
 
 | conc | PUT MiB/s | GET MiB/s (nocache) | GET MiB/s (cached) | PUT p50 | GET p50 (nocache) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -71,9 +116,14 @@ Two conclusions:
    the SMB open plus first read, *not* streaming the body out. Bulk transfer is
    comparatively free; per-request setup is what costs.
 
-## 3. The ceiling is not spiceio's connection pool
+In the current write-back configuration the same log reads very differently:
+GET p50 is **0.01 ms** (a cache hit does no backend I/O at all) and the whole
+distribution is bimodal, so read *percentiles* — not means — are what to watch.
 
-Concurrency fixed at 32, `nocache`, pool size swept:
+## 3. Pool size is a latency knob
+
+The ceiling is not the connection pool. Concurrency fixed at 32, `nocache`, pool
+size swept (2026-08-04):
 
 | SMB connections | PUT MiB/s | GET MiB/s | PUT p50 | GET p50 |
 | ---: | ---: | ---: | ---: | ---: |
@@ -82,18 +132,97 @@ Concurrency fixed at 32, `nocache`, pool size swept:
 | 24 | 93.6 | 94.8 | 64.0ms | 47.9ms |
 | 48 | 105.2 | 97.7 | 67.0ms | 28.1ms |
 
-4 → 48 connections is a 12× increase in pool size for **no throughput gain**
-past 12. Latency does improve (GET p50 123ms → 28ms) because requests start
-service sooner, but the aggregate rate is pinned. The local link is 10GbE, so
-~100 MiB/s (≈840 Mbit/s) is not our NIC either — the constraint is on the NAS
-side (its uplink, its disks, or its SMB server), not in spiceio's pooling.
+4 → 48 connections is a 12× increase for **no throughput gain** past 12, so the
+~100 MiB/s ceiling is on the NAS side, not in spiceio's pooling. But latency
+keeps improving all the way out (GET p50 123ms → 28ms), and **that is what the
+pool is for.**
 
-**The default pool of 12 is already the right size.** Raising it trades memory
-and NAS sessions for lower queueing latency only.
+The 2026-08-04 run concluded "the default pool of 12 is already the right size",
+reading only the throughput column. That was wrong, and it was also measuring a
+pool the product did not ship: `default_pool_size` was CPU-count clamped 4–16,
+so this 16-core host actually ran 16 while every recorded bench pinned 12. Both
+bench scripts now leave `SPICEIO_SMB_CONNECTIONS` unset so they measure whatever
+the binary defaults to.
+
+Re-measured 16 versus 32 on the mixed phase, 3 interleaved reps
+(`20260809-writeback-pool/`), against the v0.7.0 baseline as arm A:
+
+| conc | metric | v0.7.0 pool 16 | fixed pool 16 | fixed pool 32 |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | p90 | 3.82ms | 2.35ms (−38%) | **1.60ms (−58%)** |
+| 32 | p90 | 8.91ms | 10.28ms (+15%) | **4.30ms (−52%)** |
+| 64 | p90 | 10.48ms | 17.31ms (+65%) | **6.70ms (−36%)** |
+
+Per-rep p90 spread is the important part — the medians alone hide it:
+
+| conc | v0.7.0 pool 16 | fixed pool 16 | fixed pool 32 |
+| ---: | --- | --- | --- |
+| 32 | 9.5, 8.9, 8.5 | 3.7, 10.3, 13.6 | **4.3, 3.8, 4.9** |
+| 64 | 8.4, 13.7, 10.5 | 19.7, 15.5, 17.3 | **6.7, 7.4, 6.1** |
+
+Pool 32 is both faster and far steadier. It also removes a real regression: the
+flusher fix *alone* at pool 16 is worse than baseline at concurrency 64 (p90 reps
+19.7/15.5/17.3 against 8.4/13.7/10.5, non-overlapping), and the wider pool is
+what absorbs it. Cost is one extra second of startup — 0.68/0.69 s to
+authenticate 16 connections versus 1.33/1.67 s for 32 — and more concurrent SMB
+sessions on the server, which is why it is still capped.
+
+**Not verified:** aggregate session load with several spiceio instances against
+one NAS. Two instances on this host would open 64 sessions at startup. If a
+deployment runs more than one, check the server's session limits before
+accepting the default.
 
 ## 4. Real builds
 
-### Small: this repo, `--all-targets --all-features`, 68 units, -j16
+spiceai `-p spice`, 1163 compile units, `-j16`, two reps
+(`20260809-build-spiceai/`). `local` is sccache on local disk — the floor a
+network backend is measured against; `nocache` is the compile-everything ceiling.
+
+| arm | phase | rep 1 | rep 2 | vs local |
+| --- | --- | ---: | ---: | ---: |
+| no cache | full | 127.3s | — | — |
+| local disk | cold | 151.9s | 159.5s | — |
+| local disk | warm | **19.7s** | **20.9s** | floor |
+| spiceio | cold | 155.4s | 160.0s | **1.00–1.02×** |
+| spiceio | warm | **24.9s** | **24.2s** | **1.16–1.26×** |
+
+Per operation, from sccache's own JSON stats:
+
+| | local disk | spiceio |
+| --- | ---: | ---: |
+| cache write avg | 1.46 / 1.53 ms | **1.13 / 1.24 ms** |
+| cache read hit avg | 1.55 / 1.21 ms | 25.16 / 25.39 ms |
+| read / write errors, timeouts | 0 | 0 |
+
+Three things worth carrying forward:
+
+1. **The cold build is at parity with local disk** (1.00–1.02×, was 1.16×), and
+   spiceio's per-*write* cost is *below* local disk's. Write-back acknowledges
+   from memory, so storing to a NAS-backed cache beats storing to a local file.
+2. **The warm gap is 1.16–1.26×** (+3.3–5.2s on a ~20s build), down from 1.40×
+   (+9.8s). What remains is per-hit latency: 25 ms against 1.5 ms is a 16×
+   per-op gap that only shows up as 1.2× in wall clock because `-j16` hides it
+   behind compilation. A less parallel build would feel more of it.
+3. **Versus no cache the cache saves 80%** (127.3s → 24.9s).
+
+### Immutable objects did not change wall clock
+
+`SPICEIO_IMMUTABLE_OBJECTS=1` serves a hit with no backend round trip at all,
+and the per-hit number moves exactly as designed — **25.16 ms → 2.06 ms, 12×**.
+The warm build did not follow: 26.7s, no better than the 24.9s without it. At
+`-j16` the ~1.7s of aggregate latency this removes is already hidden behind
+compilation and sits under the run-to-run spread. Its cold arm read 189.0s
+against 155–160s elsewhere, which is machine state on a third consecutive heavy
+build rather than the setting.
+
+So: the setting's synthetic read-throughput win is real, and it is still the
+right default for a content-addressed store — but **do not expect it to show up
+in build wall clock at high `-j`**. Claim it for per-request latency and for
+backend load, not for build time.
+
+### Small builds cannot measure the backend
+
+This repo, `--all-targets --all-features`, 68 units, -j16 (2026-08-04):
 
 | arm | cold | warm | per-hit | per-write | write errors |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -101,24 +230,16 @@ and NAS sessions for lower queueing latency only.
 | local disk | 13.5s | 4.0s | 0.58ms | 1.20ms | 0 |
 | spiceio | 9.5s | 4.0s | 28.02ms | 29.24ms | 0 |
 
-Per operation spiceio costs ~48× local disk on a read and ~24× on a write, yet
-warm wall clock is identical at 4.0s: at 68 units and -j16 there is enough
-parallelism to hide 1.9s of aggregate backend latency behind cargo's own
-overhead. **A build this small cannot tell you anything about the backend** —
-which is why the run below exists.
-
-### Large: spiceai `-p spice`, 1163 units, -j16
-
-| arm | cold | warm | per-hit | per-write | write errors |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| local disk | 167.9s | 24.4s | 0.62ms | 1.22ms | 0 |
-| spiceio | 194.3s | 34.2s | 22.90ms | 20.30ms | **40** |
-
-**Warm build: 34.2s vs 24.4s — spiceio is 1.40× slower, +9.8s on a 24s build.**
-Cold: 194.3s vs 167.9s (1.16×). These are the *pre-fix* figures; §5 explains
-where the 9.8s went and what it is now.
+Per operation spiceio cost ~48× local disk on a read, yet warm wall clock was
+identical at 4.0s: at 68 units and -j16 there is enough parallelism to hide 1.9s
+of aggregate backend latency behind cargo's own overhead. **Use the spiceai run
+above, not this one, to judge a backend change.**
 
 ## 5. Defect found and fixed: spiceio dropped large writes under burst load
+
+*Historical, 2026-08-04/05. Every wall-clock figure in this section is from that
+run and is superseded by §4 — it is kept because the mechanism, and the reason
+the gate missed it, are the parts worth remembering.*
 
 The large run turned up something the wall clock alone would not have:
 
@@ -144,8 +265,9 @@ Evidence: `20260804-build-spiceai/failed-puts.tsv` (the 40 failing requests) and
 `summary.txt` (the per-path split). The full per-request logs are ~740 KB each
 and are not committed — regenerate with `SPICEIO_ACCESS_LOG` set, which the
 bench scripts do automatically.
-A `spiceio.log` is now preserved alongside future runs so the SMB-level cause
-can be attributed; this run predates that change.
+The proxy's own `spiceio.log` records the SMB-level cause; it is written to
+`benches/results/` on every run but **not committed** — see *What is not
+committed* above.
 
 ### Mechanism
 
@@ -206,8 +328,10 @@ resolution under load — is still open; the recovery does not depend on which.)
 | before | 194.3s | 34.2s | 22.90ms | 20.30ms | **40** | **41** |
 | after | 163.2s | **24.4s** | 26.50ms | 22.11ms | **0** | **0** |
 
-Warm build 34.2s → 24.4s, which is exactly the local-disk figure from §4: **the
-whole 1.40× penalty was this bug**, not backend latency. Two post-fix runs, zero
+Warm build 34.2s → 24.4s, matching the local-disk arm *of that run* (24.4s):
+**the whole 1.40× penalty was this bug**, not backend latency. Both arms are
+faster today — see §4, where local disk measures 19.7–20.9s — so do not compare
+these figures against the current ones. Two post-fix runs, zero
 non-200 PUTs in 1162 and 1163 attempts.
 
 A third run then produced the direct evidence: the recovery **fired once and
@@ -234,45 +358,138 @@ probe, and 5xx never passes. A negative control (PUTs against a nonexistent
 bucket) reports `ops=0, err=16, PUT status 404×16`; the same run previously
 reported `ops=16, err=0`. With that in place the burst budget is **0**.
 
+## 6. The proxy's own write drain was starving client reads
+
+Found 2026-08-09 while looking for headroom in cached write-back mode, and the
+largest single win in this refresh.
+
+### Symptom
+
+In a put-then-get sweep the GET distribution is bimodal: p50 **0.01 ms** (a
+cache hit does no backend I/O) but p99 **224–638 ms**. Splitting the access log
+at 1 ms:
+
+| | share | median | p99 |
+| --- | ---: | ---: | ---: |
+| GETs answered from cache | 67.5% | ~0.01ms | — |
+| GETs that reached the backend | 32.5% | 48ms | 800ms |
+
+Bucketing the slow ones by wall-clock second placed them in seconds where **no
+client PUT was running at all** — the second after a 512-object PUT burst, and
+the ten seconds after that. They were queued behind write-back flushing: the
+proxy's own deferred writes, competing with client reads for the same NAS.
+
+### Mechanism
+
+The flushers did yield, but against the wrong signal. They stood down when spare
+*admission permits* fell below a quarter of the budget — and admission is sized
+to keep every connection pipelined (`pool × 8`, so 128 permits at the default
+pool of 16), while the NAS saturates at a measured concurrency of about 8. The
+reserve therefore did not engage until ~96 client requests were in flight, an
+order of magnitude past the point where reads had already started queueing. At
+any realistic sccache concurrency it never engaged at all.
+
+### Fix
+
+Yield to *client demand* — a gauge of foreground requests actually holding an
+SMB slot — rather than to spare permits. Measured at pool 12, 3 interleaved reps,
+mixed phase:
+
+| conc | throughput | p90 | p99 |
+| ---: | ---: | ---: | ---: |
+| 8 | **+66%** | −35% | −28% |
+| 32 | **+130%** | −52% | −32% |
+
+`put` alone is unchanged (±2%), as expected: nothing about it touches the
+backend on the critical path. See §3 for the same change re-measured at the real
+default pool, where concurrency 64 needs the wider pool to come out ahead.
+
+### Three things that did *not* work, recorded so they are not retried
+
+- **Keeping one flusher always-on** so the drain never fully stalls. Measured on
+  the sustained case it was meant for — a working set past the write-back
+  ceiling, so the backlog genuinely reaches the urgent threshold — and came out
+  slightly *worse* on every metric (−7% throughput, +10% p90, +8% p99). The
+  urgent-backlog override already stops the backlog growing untouched.
+- **Micro-optimising the cache hit path** (lock contention, per-hit allocations).
+  Server-side p50 for a hit is 0.00–0.01 ms and for a write-back PUT 0.03 ms; the
+  proxy is not on the critical path at all in this mode. There is nothing to win
+  there until something else changes.
+- **Raising the clamp ceiling alone** to widen the pool. `default_pool_size` was
+  `available_parallelism().clamp(4, 16)`, so on a 16-core host the CPU count
+  binds first and raising the ceiling changes nothing. The formula had to change.
+
+### Two hazards the fix introduced, both fixed
+
+Recorded because both were found by adversarial review rather than by any
+benchmark, and neither would have shown up as a slow number:
+
+1. **A copy waiting on the drain suppressed the drain.** CopyObject and
+   UploadPartCopy await `flush_key` while holding an admission slot, so they
+   counted as the client traffic the flushers defer to. Two concurrent copies of
+   a not-yet-claimed pending source were enough to stall the flusher they were
+   both blocked on. Reproduced: **503, 503 after 30.0s** (exactly
+   `PENDING_FLUSH_TIMEOUT`) versus **200, 200 in 2.1s** with the fix, which is
+   to let a waiter *raise* the drain's priority. Covered by
+   `scripts/test-writeback.sh` §9.
+2. **Yielding also deferred durability.** A body used to reach the disk journal
+   only as the first step of its own flush, so deferring the flush deferred the
+   write becoming crash-recoverable — under continuous client traffic,
+   acknowledged objects could sit in memory alone until the backlog hit the
+   urgent threshold. Journalling is local disk and costs the NAS nothing, so it
+   now continues while the flusher stands down from the *backend*.
+
+### Related: uncatchable-signal loss
+
+Not a performance number, but measured in the same session and worth keeping.
+v0.7.0 handled SIGTERM and SIGINT only. Against a 240 MiB backlog:
+
+| signal | v0.7.0 | now |
+| --- | --- | --- |
+| SIGHUP | exit 129, **225 of 240 acknowledged writes lost** | 240/240 on the NAS, exit 0 |
+| SIGQUIT | still running after 30s | exit 0 |
+
 ## Reproducing
 
 ```bash
 source /tmp/spiceio-bench-env.sh          # or export SPICEIO_SMB_USER/PASS/SERVER/SHARE
 
+# Synthetic sweep. Leave BENCH_SMB_CONNECTIONS unset so it measures the pool
+# spiceio actually ships with; set it only to sweep the pool deliberately.
 BENCH_CONCURRENCY="1 8 32 64 128 256" BENCH_OBJECTS=512 BENCH_OPS_PER_WORKER=16 \
-  BENCH_SMB_CONNECTIONS=12 BENCH_LABEL=baseline ./scripts/bench-sccache.sh
+  BENCH_LABEL=baseline ./scripts/bench-sccache.sh
 
-BUILD_ARMS="nocache local spiceio" BUILD_JOBS=16 \
-  BUILD_CARGO_EXTRA="--all-targets --all-features" ./scripts/bench-sccache-build.sh
-
-# The large build (§4, §5) — this is the one that finds things
+# The large build (§4) — this is the one that finds things.
 BUILD_TARGET="$HOME/dev/spiceai" BUILD_PACKAGE=spice \
-  BUILD_ARMS="local spiceio" BUILD_JOBS=16 ./scripts/bench-sccache-build.sh
+  BUILD_ARMS="nocache local spiceio" BUILD_JOBS=16 ./scripts/bench-sccache-build.sh
 
-# Pool sweep (section 3)
-for pool in 4 12 24 48; do
-  BENCH_PASSES=nocache BENCH_CONCURRENCY=32 BENCH_OBJECTS=192 \
-    BENCH_OPS_PER_WORKER=12 BENCH_SMB_CONNECTIONS=$pool BENCH_PHASES="put,get" \
-    ./scripts/bench-sccache.sh
+# Backlog/backpressure behaviour needs a working set past the write-back
+# ceiling; the standard sweep's ~300 MiB never reaches it.
+BENCH_PASSES=writeback BENCH_PHASES="put,mixed" BENCH_CONCURRENCY=32 \
+  BENCH_OBJECTS=2048 BENCH_OPS_PER_WORKER=512 ./scripts/bench-sccache.sh
+
+# Pool sweep (§3).
+for pool in 8 16 32; do
+  BENCH_PASSES=writeback BENCH_PHASES="put,mixed" BENCH_CONCURRENCY="8 32 64" \
+    BENCH_SMB_CONNECTIONS=$pool ./scripts/bench-sccache.sh
 done
 ```
 
 ## Where to look next
 
-Ranked by the evidence above, not by guesswork:
+Ranked by the evidence above, not by guesswork.
 
-0. ~~Fix the dropped writes (§5).~~ **Done** — and it was worth more than any
-   throughput work here: it alone closed the entire warm-build gap to local disk.
-1. **Avoid the transfer.** The body cache is the only measure that beat the
-   ceiling (3.2× on reads). Its limits — 256 MiB total, 4 MiB per object — are
-   what capped it here; the 16 MiB objects in the mix never qualified. Sizing
-   these to the working set, and `SPICEIO_IMMUTABLE_OBJECTS` for
-   content-addressed keys like sccache's, is the highest-leverage knob.
-2. **Cut per-request setup, not bulk transfer.** `head_us ≈ total_us` on GET
-   says the open-and-first-read round trips are the cost. Compounding or
-   eliminating round trips on the open path helps; making the streaming path
-   faster does not.
-3. **Confirm the NAS-side limit before optimizing further.** Measure the same
-   share from a second client, or from the macOS SMB client directly. If ~100
-   MiB/s is the NAS's own limit, throughput work in spiceio cannot pay off and
-   the remaining wins are all in (1) and (2).
+0. ~~Fix the dropped writes (§5).~~ **Done.**
+1. ~~Stop the write drain queueing in front of client reads (§6).~~ **Done** —
+   the largest win in this refresh.
+2. ~~Size the pool for latency rather than throughput (§3).~~ **Done.**
+3. **Per-hit latency is what is left.** 25 ms against local disk's 1.5 ms is the
+   whole remaining warm-build gap (§4). `SPICEIO_IMMUTABLE_OBJECTS` already
+   takes it to 2.06 ms without changing wall clock at `-j16`, so the win is not
+   in shaving the hit further — it is in workloads with less parallelism to hide
+   it. Measure at `-j4` before investing here.
+4. **Confirm the NAS-side limit.** Measure the same share from a second client,
+   or from the macOS SMB client directly. If ~100 MiB/s is the NAS's own limit,
+   bulk-throughput work in spiceio cannot pay off.
+5. **Verify multi-instance session load** before trusting the pool default on a
+   host that runs more than one spiceio (§3).

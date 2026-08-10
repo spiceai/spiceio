@@ -1,3 +1,9 @@
 /target
 # Timestamped benchmark output. Committed baselines live in benches/baselines/.
 /benches/results
+
+# Committed baselines must not carry logs: this repo is public, and both the
+# proxy log and the per-request access log record the backend's address, the
+# share name and local paths. Reports, result tables and sccache stats are
+# enough to read a baseline; the logs stay in the gitignored results dir.
+/benches/baselines/**/*.log

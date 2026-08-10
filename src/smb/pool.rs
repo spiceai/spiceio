@@ -225,6 +225,17 @@ pub struct SmbPool {
     /// when `shrink_by_one` drops a connection so a capacity-shrunk pool does
     /// not keep admitting more work than it can sustain.
     admission: Arc<Semaphore>,
+    /// Client SMB operations in flight right now — foreground requests only,
+    /// never background work.
+    ///
+    /// Separate from the admission semaphore because the two answer different
+    /// questions. `admission` bounds work *inside the process* and is sized to
+    /// keep every connection pipelined (`size × WORK_SLOTS_PER_CONN`); it says
+    /// nothing about whether the NAS is busy. This is the signal background
+    /// work needs: how many clients are waiting on the backend right now. See
+    /// `WriteBack::flush_loop` for why a reserve expressed in permits engages
+    /// far too late to keep a write drain off a client read's path.
+    client_inflight: Arc<AtomicUsize>,
 }
 
 /// How long a connection may sit idle before the healer probes it with an
@@ -373,6 +384,7 @@ impl SmbPool {
             heal_lock: tokio::sync::Mutex::new(()),
             overload_until_ms: AtomicU64::new(0),
             admission: Arc::new(Semaphore::new(admission_n)),
+            client_inflight: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -387,6 +399,13 @@ impl SmbPool {
     /// live pool size (see `shrink_by_one`).
     pub fn admission(&self) -> Arc<Semaphore> {
         Arc::clone(&self.admission)
+    }
+
+    /// Gauge of client SMB operations in flight. The HTTP layer bumps it for
+    /// the life of every request that touches the backend; background work
+    /// reads it to decide whether to stand down.
+    pub fn client_inflight(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.client_inflight)
     }
 
     /// True while the NAS recently reset/busy'd us, or half+ of the pool is

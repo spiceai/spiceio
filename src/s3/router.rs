@@ -15,6 +15,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -42,6 +43,10 @@ pub struct AppState {
     /// (`admission_limit`) so an sccache stampede cannot bury spiceio under
     /// unbounded blocked handlers when the NAS is slow or overloaded.
     pub smb_slots: Arc<Semaphore>,
+    /// Client requests currently holding an SMB admission slot. Background
+    /// write-back yields to this rather than to spare admission permits, which
+    /// only run out long after the backend is saturated.
+    pub client_inflight: Arc<AtomicUsize>,
     /// GET body cache (etag-validated; optional immutable-key mode).
     pub object_cache: Arc<ObjectCache>,
     /// Writes acknowledged from memory that have not reached the NAS yet.
@@ -69,17 +74,64 @@ const PENDING_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 /// subsumes the overloaded branch: that arm *is* a bare try, so when a permit
 /// is free both branches do the same thing and the overload check is only
 /// needed once the semaphore is actually contended.
-async fn acquire_smb_slot(state: &AppState) -> Result<OwnedSemaphorePermit, ()> {
+async fn acquire_smb_slot(state: &AppState) -> Result<ClientSlot, ()> {
     if let Ok(permit) = state.smb_slots.clone().try_acquire_owned() {
-        return Ok(permit);
+        return Ok(ClientSlot::new(permit, state));
     }
     if state.share.is_overloaded() {
         return Err(());
     }
     match tokio::time::timeout(ADMISSION_WAIT, state.smb_slots.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => Ok(permit),
+        Ok(Ok(permit)) => Ok(ClientSlot::new(permit, state)),
         // Closed semaphore (process shutting down) or wait timed out.
         _ => Err(()),
+    }
+}
+
+/// Counts one unit of foreground backend demand for as long as it lives.
+///
+/// A guard rather than matching increment/decrement calls because several of
+/// the paths that hold one are cancellable — a client that hangs up drops the
+/// future — and a leaked increment would make the write-back flushers defer to
+/// a client that is no longer there.
+pub struct BackendActivity(Arc<AtomicUsize>);
+
+impl BackendActivity {
+    pub fn new(gauge: &Arc<AtomicUsize>) -> Self {
+        gauge.fetch_add(1, AtomicOrdering::Relaxed);
+        Self(Arc::clone(gauge))
+    }
+}
+
+impl Drop for BackendActivity {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// An admission permit that also counts as one client waiting on the backend.
+///
+/// The count is what background write-back flushing yields to. It has to be
+/// held for exactly as long as the permit — a request that has been admitted
+/// but not finished is a client still waiting — so the two are tied together in
+/// one guard rather than left to matching increment/decrement calls.
+///
+/// It stops at the response *head*, which is not where a streaming GET stops:
+/// that hands back a channel body and keeps reading from SMB in a detached
+/// task. Such a task takes its own [`BackendActivity`] for its whole life, so
+/// the largest reads in the system stay visible to the policy instead of
+/// vanishing the moment their headers are written.
+struct ClientSlot {
+    _permit: OwnedSemaphorePermit,
+    _activity: BackendActivity,
+}
+
+impl ClientSlot {
+    fn new(permit: OwnedSemaphorePermit, state: &AppState) -> Self {
+        Self {
+            _permit: permit,
+            _activity: BackendActivity::new(&state.client_inflight),
+        }
     }
 }
 
@@ -1120,6 +1172,14 @@ async fn stream_get_object(
     let channel_cap = stream_channel_capacity(chunk_size);
     let (body, tx) = SpiceioBody::channel(channel_cap);
 
+    // Foreground demand for the whole stream, not just its headers. The
+    // request handler's own `ClientSlot` drops as soon as the response head is
+    // returned, but the task below goes on issuing pipelined SMB reads until
+    // EOF — the single largest thing a client can be waiting on. Without this
+    // the write-back flushers would see an idle backend mid-stream and start
+    // competing for the very connections feeding it.
+    let stream_activity = BackendActivity::new(&share.client_inflight());
+
     // Owned handles so the streaming task can transparently reconnect after a
     // mid-stream connection drop (see the resume loop below).
     let resume_share = share.clone();
@@ -1141,6 +1201,9 @@ async fn stream_get_object(
     // drop on an overwhelmed NAS reconnects and resumes from the current
     // offset (bounded by MAX_GET_RESUMES).
     tokio::spawn(async move {
+        // Moved in, so it is released exactly when the stream ends — including
+        // the error and client-hangup paths, which return early.
+        let _stream_activity = stream_activity;
         const MAX_GET_RESUMES: u32 = 16;
         const MAX_GET_REOPEN_TRIES: u32 = 12;
         let mut handle = handle;

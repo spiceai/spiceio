@@ -41,7 +41,7 @@ set -euo pipefail
 #   BUILD_CARGO_EXTRA extra cargo flags (e.g. "--all-targets --all-features")
 #   BUILD_JOBS        space-separated cargo -j sweep (default "$(nproc)")
 #   BUILD_ARMS        space-separated subset of "nocache local spiceio"
-#   BENCH_SMB_CONNECTIONS  spiceio pool size (default 12)
+#   BENCH_SMB_CONNECTIONS  spiceio pool size (default: spiceio's own)
 #   BENCH_OUT         results directory (default benches/results)
 #   BENCH_LABEL       label recorded in the report (default: git describe)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -53,7 +53,12 @@ SMB_DOMAIN="${SPICEIO_SMB_DOMAIN:-}"
 REGION="${SPICEIO_REGION:-us-east-1}"
 BUCKET="${SPICEIO_BUCKET:-sccache-bench}"
 BIND="${SPICEIO_BIND:-127.0.0.1:18392}"
-SMB_CONNS="${BENCH_SMB_CONNECTIONS:-12}"
+# Pool size: unset by default, so the bench measures the pool spiceio actually
+# ships with (`default_pool_size`, 2x CPU clamped 8-32) rather than a number
+# pinned here. A hard-coded default silently drifts from the product — this was
+# 12 while the binary defaulted to 16, so every recorded run under-provisioned
+# the thing under test. Set BENCH_SMB_CONNECTIONS to sweep it deliberately.
+SMB_CONNS="${BENCH_SMB_CONNECTIONS:-}"
 
 : "${SPICEIO_SMB_USER:?SPICEIO_SMB_USER is required}"
 : "${SPICEIO_SMB_PASS:?SPICEIO_SMB_PASS is required}"
@@ -81,7 +86,8 @@ mkdir -p "$RESULTS"
 # one would silently make three arms measure the same thing.
 unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION \
     SCCACHE_S3_KEY_PREFIX SCCACHE_S3_USE_SSL SCCACHE_GCS_BUCKET SCCACHE_REDIS \
-    SCCACHE_MEMCACHED SCCACHE_WEBDAV_ENDPOINT SCCACHE_AZURE_CONNECTION_STRING
+    SCCACHE_MEMCACHED SCCACHE_WEBDAV_ENDPOINT SCCACHE_AZURE_CONNECTION_STRING \
+    SCCACHE_S3_NO_CREDENTIALS AWS_PROFILE
 
 if [[ ! -f "${BUILD_TARGET}/Cargo.toml" ]]; then
     echo "[bench] BUILD_TARGET ${BUILD_TARGET} has no Cargo.toml" >&2
@@ -146,20 +152,29 @@ start_spiceio() {
         kill $stale 2>/dev/null || true
         sleep 1
     fi
-    SPICEIO_BIND="$BIND" \
-    SPICEIO_SMB_SERVER="$SMB_SERVER" \
-    SPICEIO_SMB_PORT="$SMB_PORT" \
-    SPICEIO_SMB_USER="$SPICEIO_SMB_USER" \
-    SPICEIO_SMB_PASS="$SPICEIO_SMB_PASS" \
-    SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
-    SPICEIO_SMB_SHARE="$SMB_SHARE" \
-    SPICEIO_BUCKET="$BUCKET" \
-    SPICEIO_REGION="$REGION" \
-    SPICEIO_SMB_CONNECTIONS="$SMB_CONNS" \
-    SPICEIO_IMMUTABLE_OBJECTS="${SPICEIO_IMMUTABLE_OBJECTS:-}" \
-    SPICEIO_OBJECT_CACHE_BYTES="${SPICEIO_OBJECT_CACHE_BYTES:-}" \
-    SPICEIO_LOG_FILE="$log" \
-    SPICEIO_ACCESS_LOG="${RESULTS}/access-build.tsv" \
+    # Through `env`, not a bare assignment prefix: the optional settings below
+    # expand to nothing when unset, and a word that is not *syntactically* an
+    # assignment ends the prefix — bash then takes the next word as the command
+    # name and tries to execute `SPICEIO_IMMUTABLE_OBJECTS=`. As arguments to
+    # `env` an empty expansion simply disappears, which is what is wanted.
+    #
+    # Optional rather than passed empty: an empty value is not "unset" to
+    # `parse_env_or`, which warns about it and falls back to the default anyway.
+    env \
+        SPICEIO_BIND="$BIND" \
+        SPICEIO_SMB_SERVER="$SMB_SERVER" \
+        SPICEIO_SMB_PORT="$SMB_PORT" \
+        SPICEIO_SMB_USER="$SPICEIO_SMB_USER" \
+        SPICEIO_SMB_PASS="$SPICEIO_SMB_PASS" \
+        SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
+        SPICEIO_SMB_SHARE="$SMB_SHARE" \
+        SPICEIO_BUCKET="$BUCKET" \
+        SPICEIO_REGION="$REGION" \
+        ${SMB_CONNS:+SPICEIO_SMB_CONNECTIONS="$SMB_CONNS"} \
+        ${SPICEIO_IMMUTABLE_OBJECTS:+SPICEIO_IMMUTABLE_OBJECTS="$SPICEIO_IMMUTABLE_OBJECTS"} \
+        ${SPICEIO_OBJECT_CACHE_BYTES:+SPICEIO_OBJECT_CACHE_BYTES="$SPICEIO_OBJECT_CACHE_BYTES"} \
+        SPICEIO_LOG_FILE="$log" \
+        SPICEIO_ACCESS_LOG="${RESULTS}/access-build.tsv" \
         "$SPICEIO_BIN" >/dev/null 2>&1 &
     SPICEIO_PID=$!
     local i
@@ -183,7 +198,8 @@ configure_sccache() {
     local arm="$1" jobs="$2"
     sccache --stop-server >/dev/null 2>&1 || true
     unset SCCACHE_DIR SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION \
-        SCCACHE_S3_KEY_PREFIX SCCACHE_S3_USE_SSL RUSTC_WRAPPER
+        SCCACHE_S3_KEY_PREFIX SCCACHE_S3_USE_SSL RUSTC_WRAPPER \
+        SCCACHE_S3_NO_CREDENTIALS AWS_PROFILE
     case "$arm" in
         local)
             rm -rf "$LOCAL_CACHE"
@@ -282,7 +298,7 @@ for arm in $ARMS; do
     [[ "$arm" == "spiceio" ]] && NEEDS_PROXY=1
 done
 if [[ "$NEEDS_PROXY" == "1" ]]; then
-    echo "[bench] starting spiceio (pool=${SMB_CONNS})..."
+    echo "[bench] starting spiceio (pool=${SMB_CONNS:-default})..."
     start_spiceio
 fi
 
