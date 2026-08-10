@@ -123,6 +123,13 @@ done
 
 sccache --stop-server 2>/dev/null || true
 
+# Drop the ambient S3 credential mode before setting our own. A developer whose
+# shell already points sccache at a running spiceio exports
+# SCCACHE_S3_NO_CREDENTIALS=1, which contradicts the credentials below; sccache
+# 0.17 refuses that combination and `--start-server` fails. AWS_PROFILE would
+# likewise put a real credential chain ahead of the test's.
+unset SCCACHE_S3_NO_CREDENTIALS AWS_PROFILE 2>/dev/null || true
+
 export SCCACHE_BUCKET="$BUCKET"
 export SCCACHE_ENDPOINT="$ENDPOINT"
 export SCCACHE_REGION="$REGION"

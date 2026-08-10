@@ -481,6 +481,138 @@ done
 stop PID2
 rm -rf "$OWN_SPILL"
 
+# ════════════════════════════════════════════════════════════════════════════
+# 8. Every terminating signal drains, not just SIGTERM
+#
+#    A signal whose default disposition kills the process takes the write-back
+#    queue with it: a body is journalled to the spill as the *first* step of
+#    its flush, so anything still queued exists only in memory, and only the
+#    graceful path's `journal_residue` puts it on disk. Measured against the
+#    v0.7.0 binary, which caught SIGTERM/SIGINT but not SIGHUP/SIGQUIT: an
+#    uncaught SIGHUP against a 240 MiB backlog lost 225 of 240 acknowledged
+#    writes outright, and SIGQUIT did not stop the process at all within 30s.
+#
+#    Backlog matters — issued serially the flushers keep up and there is
+#    nothing queued to lose, so the writes go out concurrently.
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo " 8. SIGHUP / SIGQUIT / SIGINT drain like SIGTERM"
+echo "═══════════════════════════════════════════════════════════════"
+
+SIG_SPILL="$(mktemp -d /tmp/spiceio-wb-sig.XXXXXX)"
+head -c 262144 /dev/urandom >"${WORK}/sig.bin"
+
+for sig in HUP QUIT INT; do
+    sig_prefix="${PREFIX}/sig-${sig}"
+    rm -rf "${SIG_SPILL:?}"/*
+    start PID1 "$BIND" SPICEIO_WRITE_BACK=1 SPICEIO_SPILL_DIR="$SIG_SPILL"
+    seq 1 40 | xargs -P 16 -I{} curl -s -o /dev/null -X PUT \
+        --data-binary "@${WORK}/sig.bin" \
+        "${ENDPOINT}/${BUCKET}/${sig_prefix}/obj-{}.bin"
+
+    kill -"$sig" "$PID1" 2>/dev/null
+    exited=0
+    for _ in $(seq 1 160); do
+        kill -0 "$PID1" 2>/dev/null || { exited=1; break; }
+        sleep 0.25
+    done
+    if [[ "$exited" == "1" ]]; then
+        ok "SIG${sig} stopped the process"
+    else
+        bad "SIG${sig} did not stop the process within 40s"
+        kill -9 "$PID1" 2>/dev/null
+    fi
+    wait "$PID1" 2>/dev/null
+    PID1=""
+    if grep -q "shutting down (SIG${sig})" "$LAST_LOG" 2>/dev/null; then
+        ok "SIG${sig} took the graceful shutdown path"
+    else
+        bad "SIG${sig} did not log the graceful shutdown path"
+    fi
+
+    # Read back with no write-back and no spill, so only a real NAS object can
+    # answer — the instance that took the writes cannot vouch for itself.
+    start PID2 "$BIND2" SPICEIO_WRITE_BACK=0 SPICEIO_SPILL_DIR=off
+    landed=0
+    for i in $(seq 1 40); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "${ENDPOINT2}/${BUCKET}/${sig_prefix}/obj-${i}.bin")
+        [[ "$code" == "200" ]] && landed=$((landed + 1))
+    done
+    check "SIG${sig}: every acknowledged write reached the NAS" "$landed" "40"
+    for i in $(seq 1 40); do
+        curl -s -o /dev/null -X DELETE "${ENDPOINT2}/${BUCKET}/${sig_prefix}/obj-${i}.bin"
+    done
+    stop PID2
+done
+rm -rf "$SIG_SPILL"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 9. A copy waiting on a pending source is not starved by its own waiting
+#
+#    CopyObject and UploadPartCopy need the source *on the NAS* (the file server
+#    performs the copy), so they await `flush_key`. They do that holding an
+#    admission slot — which the flushers' yield policy reads as client traffic.
+#    Two concurrent copies of a not-yet-claimed pending source are therefore
+#    enough to hold the policy above its threshold and stall the very flusher
+#    both are blocked on, until each times out into a 503.
+#
+#    Deterministic only while the sources are still queued, so the copies fire
+#    against a backlog large enough that the drain cannot have reached them —
+#    but below the urgent threshold, which would lift the yield and hide it.
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo " 9. Concurrent copies of a pending source do not deadlock"
+echo "═══════════════════════════════════════════════════════════════"
+
+COPY_SPILL="$(mktemp -d /tmp/spiceio-wb-copy.XXXXXX)"
+copy_prefix="${PREFIX}/copy-pending"
+head -c 1048576 /dev/urandom >"${WORK}/copysrc.bin"
+
+start PID1 "$BIND" SPICEIO_WRITE_BACK=1 SPICEIO_SPILL_DIR="$COPY_SPILL"
+# ~200 MiB of backlog: well past what the drain clears in the moment before the
+# copies land, and well short of the 512 MiB urgent threshold.
+seq 1 200 | xargs -P 16 -I{} curl -s -o /dev/null -X PUT \
+    --data-binary "@${WORK}/copysrc.bin" \
+    "${ENDPOINT}/${BUCKET}/${copy_prefix}/src-{}.bin"
+
+copy_start=$(python3 -c 'import time;print(time.time())')
+# Wait on these two PIDs specifically, never a bare `wait`: the spiceio servers
+# `start` launches are background jobs of this same shell, so a bare wait blocks
+# on a process that is not supposed to exit.
+copy_pids=()
+for i in 199 200; do
+    curl -s -o /dev/null -w '%{http_code}' -X PUT \
+        -H "x-amz-copy-source: /${BUCKET}/${copy_prefix}/src-${i}.bin" \
+        "${ENDPOINT}/${BUCKET}/${copy_prefix}/dst-${i}.bin" \
+        >"${WORK}/copy-${i}.code" &
+    copy_pids+=($!)
+done
+for p in "${copy_pids[@]}"; do wait "$p"; done
+copy_elapsed=$(python3 -c "import time;print(f'{time.time() - $copy_start:.1f}')")
+copy_rc="$(cat "${WORK}"/copy-199.code 2>/dev/null),$(cat "${WORK}"/copy-200.code 2>/dev/null)"
+check "concurrent copies of a pending source both succeed" "$copy_rc" "200,200"
+# The failure mode is a 30s PENDING_FLUSH_TIMEOUT per copy, so anything near
+# that is the deadlock even if the status codes eventually came back.
+if python3 -c "import sys; sys.exit(0 if $copy_elapsed < 20 else 1)"; then
+    ok "copies completed in ${copy_elapsed}s (no flush-key stall)"
+else
+    bad "copies took ${copy_elapsed}s — the flusher they waited on was starved"
+fi
+
+start PID2 "$BIND2" SPICEIO_WRITE_BACK=0 SPICEIO_SPILL_DIR=off
+for i in 199 200; do
+    curl -s -o /dev/null -X DELETE "${ENDPOINT2}/${BUCKET}/${copy_prefix}/dst-${i}.bin"
+done
+for i in $(seq 1 200); do
+    curl -s -o /dev/null -X DELETE "${ENDPOINT2}/${BUCKET}/${copy_prefix}/src-${i}.bin"
+done
+stop PID2
+stop PID1
+rm -rf "$COPY_SPILL"
+
 # ── Cleanup of test objects ────────────────────────────────────────────────
 start PID1 "$BIND" SPICEIO_WRITE_BACK=0 SPICEIO_SPILL_DIR=off
 for key in "${PREFIX}/small.bin" "${PREFIX}/large.bin" "$range_key" "$ow_key"; do

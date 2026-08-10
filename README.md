@@ -105,8 +105,8 @@ put-then-read sweep.
 acknowledgement and the background write loses that object. Right for a cache
 (the entry is rebuilt), wrong for a system of record — turn it off with
 `SPICEIO_WRITE_BACK=0` if this endpoint is anyone's source of truth. A
-graceful stop (SIGTERM/SIGINT) drains first, and anything already written to
-the disk spill is replayed on the next start. Reads, listings, deletes and
+graceful stop (SIGTERM, SIGINT, SIGHUP or SIGQUIT) drains first, and anything
+already written to the disk spill is replayed on the next start. Reads, listings, deletes and
 copies all stay consistent with what was acknowledged; see
 [Write-back](#write-back) below.
 
@@ -125,7 +125,7 @@ All configuration is via environment variables:
 | `SPICEIO_SMB_DOMAIN`          | no       | *(empty)*           | SMB domain                |
 | `SPICEIO_BUCKET`              | no       | `SPICEIO_SMB_SHARE` | Virtual S3 bucket name    |
 | `SPICEIO_REGION`              | no       | `us-east-1`         | AWS region to advertise   |
-| `SPICEIO_SMB_CONNECTIONS`     | no       | CPU count (4–16)    | SMB connections in the pool |
+| `SPICEIO_SMB_CONNECTIONS`     | no       | 2× CPU count (8–32) | SMB connections in the pool |
 | `SPICEIO_SMB_MAX_IO`          | no       | `262144`            | Max standalone read/write I/O size, bytes |
 | `SPICEIO_MULTIPART_TTL_SECS`  | no       | `86400`             | Age at which an abandoned multipart upload is reaped |
 | `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
@@ -185,12 +185,26 @@ What is guaranteed:
 - **Backpressure is real.** Past `SPICEIO_WRITE_BACK_BYTES` of un-flushed data,
   PutObject writes through synchronously and clients feel the slow backend.
 - **Reads keep priority.** Flushers take the same admission slot live requests
-  do and leave a quarter of the budget free, so a write burst does not become a
-  read-latency spike. Under sustained read load they yield, the queue fills, and
+  do, and stand down while clients are using the backend — so the proxy's own
+  write drain does not become a read-latency spike. They resume once the backlog
+  passes half of `SPICEIO_WRITE_BACK_BYTES`, where PutObject is about to write
+  through synchronously anyway. Under sustained read load the queue fills and
   PutObject reverts to synchronous.
-- **Shutdown drains.** A stop signal flushes acknowledged writes (30s cap)
-  before exit; signal a second time to stop immediately instead of waiting it
-  out.
+- **Shutdown drains.** **SIGTERM, SIGINT, SIGHUP and SIGQUIT** — the four ways a
+  process is normally asked to stop — flush acknowledged writes (30s cap) before
+  exit; signal a second time to stop immediately instead of waiting it out.
+  These four specifically, not "every terminating signal": SIGUSR1, SIGALRM and
+  friends still terminate without draining, and SIGKILL cannot be caught at all.
+  Catching them matters because an uncaught stop takes the queue with it —
+  measured against v0.7.0, which handled only SIGTERM/SIGINT, a `kill -HUP`
+  against a 240 MiB backlog lost 225 of 240 acknowledged writes.
+- **A hard kill loses only the newest writes.** Acknowledged bodies are written
+  to the disk journal continuously — including while the flushers are standing
+  down for client reads, since that is local disk and costs the NAS nothing — so
+  what a SIGKILL or a power cut loses is the objects acknowledged in the moments
+  before it, not the whole queue. Whatever reached the journal is replayed by the
+  next start or by a peer instance. Journalling is *not* synchronous with the
+  200; if you need it to be, use `SPICEIO_WRITE_BACK=0`.
 
 What is not:
 

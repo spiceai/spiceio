@@ -3,7 +3,7 @@
 | field | value |
 | --- | --- |
 | label | `baseline-v0.5.10` |
-| target | `smb://192.168.3.148/ai_platform_dev` |
+| target | `smb://<nas>/<share>` |
 | SMB pool | 12 |
 | key space | 512 objects |
 | ops per worker per phase | 16 |

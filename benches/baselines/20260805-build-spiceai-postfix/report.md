@@ -3,7 +3,7 @@
 | field | value |
 | --- | --- |
 | label | `post-review-fixes` |
-| build | `/Users/lukim/dev/spiceai` (-p spice) |
+| build | `~/dev/spiceai` (-p spice) |
 
 `local` is sccache on local disk — the floor a network backend is measured
 against. `nocache` is the compile-everything ceiling.

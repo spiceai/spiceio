@@ -27,7 +27,7 @@ set -euo pipefail
 #   BENCH_CONCURRENCY      space-separated sweep (default "1 8 32 64 128 256")
 #   BENCH_OBJECTS          distinct keys per phase (default 512)
 #   BENCH_OPS_PER_WORKER   requests each worker issues per phase (default 24)
-#   BENCH_SMB_CONNECTIONS  spiceio pool size (default 12)
+#   BENCH_SMB_CONNECTIONS  spiceio pool size (default: spiceio's own)
 #   BENCH_PHASES           loadgen phases (default put,get,head-hit,head-miss,mixed)
 #   BENCH_PASSES           which passes to run (default "cached nocache")
 #                          `cached`/`nocache` pin SPICEIO_WRITE_BACK=0 so they
@@ -49,7 +49,12 @@ BIND="${SPICEIO_BIND:-127.0.0.1:18390}"
 
 CONCURRENCY_SWEEP="${BENCH_CONCURRENCY:-1 8 32 64 128 256}"
 OBJECTS="${BENCH_OBJECTS:-512}"
-SMB_CONNS="${BENCH_SMB_CONNECTIONS:-12}"
+# Pool size: unset by default, so the bench measures the pool spiceio actually
+# ships with (`default_pool_size`, 2x CPU clamped 8-32) rather than a number
+# pinned here. A hard-coded default silently drifts from the product — this was
+# 12 while the binary defaulted to 16, so every recorded run under-provisioned
+# the thing under test. Set BENCH_SMB_CONNECTIONS to sweep it deliberately.
+SMB_CONNS="${BENCH_SMB_CONNECTIONS:-}"
 PHASES="${BENCH_PHASES:-put,get,head-hit,head-miss,mixed}"
 # Which passes to run. `cached` is the shipping configuration; `nocache`
 # disables the GET body cache so every read reaches the NAS. Narrowing this is
@@ -147,7 +152,7 @@ start_spiceio() {
         SPICEIO_SMB_SHARE="$SMB_SHARE" \
         SPICEIO_BUCKET="$BUCKET" \
         SPICEIO_REGION="$REGION" \
-        SPICEIO_SMB_CONNECTIONS="$SMB_CONNS" \
+        ${SMB_CONNS:+SPICEIO_SMB_CONNECTIONS=$SMB_CONNS} \
         SPICEIO_LOG_FILE="$log" \
         SPICEIO_ACCESS_LOG="$ACCESS_FILE" \
         "$SPICEIO_BIN" >/dev/null 2>&1 &
@@ -325,7 +330,7 @@ run_pass() {
 echo "═══════════════════════════════════════════════════════════════════"
 echo " spiceio sccache bench — ${LABEL}"
 echo " target : smb://${SMB_SERVER}/${SMB_SHARE}  bucket=${BUCKET}"
-echo " pool   : ${SMB_CONNS} SMB connections"
+echo " pool   : ${SMB_CONNS:-spiceio default} SMB connections"
 echo " sweep  : concurrency [${CONCURRENCY_SWEEP}]  objects=${OBJECTS}  ops/worker=${OPS_PER_WORKER}"
 echo " phases : ${PHASES}"
 echo " results: ${RESULTS}"
@@ -380,7 +385,7 @@ REPORT="${RESULTS}/report.md"
     echo "| --- | --- |"
     echo "| label | \`${LABEL}\` |"
     echo "| target | \`smb://${SMB_SERVER}/${SMB_SHARE}\` |"
-    echo "| SMB pool | ${SMB_CONNS} |"
+    echo "| SMB pool | ${SMB_CONNS:-spiceio default} |"
     echo "| key space | ${OBJECTS} objects |"
     echo "| ops per worker per phase | ${OPS_PER_WORKER} |"
     echo "| phases | \`${PHASES}\` |"

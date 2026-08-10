@@ -47,7 +47,7 @@ struct Config {
     bucket_name: String,
     /// AWS region to advertise
     region: String,
-    /// Number of SMB TCP connections in the pool (default 8)
+    /// Number of SMB TCP connections in the pool (see `default_pool_size`)
     smb_connections: usize,
     /// Max I/O size for standalone read/write operations (default 256KB)
     smb_max_io: u32,
@@ -145,22 +145,40 @@ impl Config {
 /// wait as long for writes it has already told clients succeeded.
 const WRITE_BACK_DRAIN: Duration = Duration::from_secs(30);
 
-/// Default SMB connection-pool size, scaled with CPU cores so concurrent S3
-/// requests (e.g. a parallel `cargo`/sccache build) fan out across connections
-/// instead of queuing on one connection's stream lock. Floored at 4 (enough
-/// fan-out on small machines), capped at 16 to bound concurrent SMB session
-/// load on the server; override with `SPICEIO_SMB_CONNECTIONS`.
+/// Default SMB connection-pool size: **two per CPU, clamped to 8–32**.
+/// Override with `SPICEIO_SMB_CONNECTIONS`.
 ///
-/// The cap is about head-of-line blocking, not backend throughput: a connection
-/// owns its stream for a whole round trip, so a request behind a multi-megabyte
-/// batch waits for it. Backend *bandwidth* saturates well below this — measured
-/// flat at ~100 MiB/s from 32 concurrent writes upward — so widening the pool
-/// buys latency under mixed load, not more bytes per second.
+/// Connections are not a CPU resource — they are how the proxy hides NAS
+/// round-trip latency and avoids head-of-line blocking. A connection owns its
+/// stream for a whole round trip, so a one-round-trip HEAD behind a
+/// multi-megabyte pipelined batch waits for it, and the only cure is another
+/// connection. Scaling off core count is a proxy for offered concurrency, which
+/// is why it is *two* per core rather than one: an `-j16` build keeps well over
+/// 16 requests outstanding.
+///
+/// Sizing is a latency decision, not a throughput one. Backend *bandwidth* is
+/// flat at ~100 MiB/s from 32 concurrent writes upward, and a pool sweep at
+/// fixed concurrency measured no throughput gain past 12 connections while GET
+/// p50 kept falling (123 ms at 4 → 83 ms at 12 → 48 ms at 24 → 28 ms at 48).
+/// Re-measured on the mixed sccache-shaped phase, 3 interleaved reps, 16 vs 32:
+/// p90 fell 52% at concurrency 32 and 36% at 64, and the run-to-run spread
+/// tightened markedly (p90 reps 3.7/10.3/13.6 ms at 16 versus 4.3/3.8/4.9 ms at
+/// 32) — the wider pool is both faster and steadier. Cost is one extra second
+/// of startup (0.7 s → 1.4 s to authenticate the pool) and more concurrent SMB
+/// sessions on the server, which is why it is still capped.
 fn default_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(4, 16)
+    pool_size_for(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    )
+}
+
+/// The sizing rule itself, split out so it can be checked at core counts this
+/// host does not have — the floor and the ceiling are the parts worth testing,
+/// and neither is reachable on a 16-core machine.
+fn pool_size_for(cpus: usize) -> usize {
+    cpus.saturating_mul(2).clamp(8, 32)
 }
 
 /// One attempt to stand up the SMB pool + share session + startup cleanup.
@@ -249,6 +267,7 @@ async fn connect_share(
     }
 
     Ok(Arc::new(AppState {
+        client_inflight: share.client_inflight(),
         share,
         bucket: bucket_name,
         region,
@@ -257,6 +276,40 @@ async fn connect_share(
         object_cache,
         writeback,
     }))
+}
+
+/// Register a terminating signal for graceful shutdown.
+///
+/// Returns `None` if the kernel refuses the registration, which is exceptional
+/// but must not be fatal: one signal failing to register should leave the others
+/// working rather than abort startup. It is logged because the consequence is
+/// invisible until someone tries to stop the process and has to reach for
+/// SIGKILL — which is exactly the case the drain exists to avoid.
+fn register_signal(kind: signal::unix::SignalKind, name: &str) -> Option<signal::unix::Signal> {
+    match signal::unix::signal(kind) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            serr!(
+                "[spiceio] could not install a {name} handler: {e}; \
+                 that signal will terminate without draining"
+            );
+            None
+        }
+    }
+}
+
+/// Wait for the next delivery of a registered signal.
+///
+/// An unregistered one parks forever instead of resolving, so it simply never
+/// wins its `select!` arm — the alternative, resolving immediately, would spin
+/// the shutdown listener at full tilt.
+async fn next_signal(sig: &mut Option<signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Interval between spill sweeps, chosen from how full the last one found the
@@ -611,8 +664,25 @@ async fn main() {
         });
     }
 
-    // SIGTERM (the standard service-manager stop signal) triggers the same
-    // graceful shutdown as Ctrl-C.
+    // Every signal whose default disposition would terminate the process
+    // triggers the same graceful shutdown.
+    //
+    // Which signals, and why all of them: write-back means this process can be
+    // holding writes it has already answered 200 for. Any *uncaught* terminating
+    // signal drops the ones that have not reached the spill journal yet. SIGTERM
+    // is the obvious one (plain `kill`, `launchctl bootout`, a container stop),
+    // but it is not the only way an operator ends a process:
+    //
+    // * **SIGHUP** — `kill -HUP`, and what the kernel sends when a controlling
+    //   terminal goes away. Uncaught, it kills instantly; anyone running spiceio
+    //   from a shell that then closes would silently lose acknowledged writes.
+    // * **SIGQUIT** — `kill -QUIT`. Normally "terminate and dump core", but
+    //   `crash::install` does not report on SIGQUIT, so catching it costs no
+    //   diagnostic we would otherwise produce and buys the drain.
+    // * **SIGINT** — Ctrl-C.
+    //
+    // SIGKILL cannot be caught, by design; that case is covered instead by the
+    // dirty spill journal, which the next start (or a peer instance) replays.
     //
     // The listener is a long-lived task rather than a future the server
     // consumes, because shutdown does not end when the HTTP server returns:
@@ -621,7 +691,7 @@ async fn main() {
     // "stop now", and a future that had already been consumed by the first
     // signal could not hear them — the process would appear wedged, and the
     // only way out would be SIGKILL, which is precisely the outcome the drain
-    // exists to avoid.
+    // exists to avoid. A second signal of *any* of these kinds counts.
     //
     // `notify_one` rather than `notify_waiters`: it leaves a permit when
     // nobody is listening yet, so a signal arriving in the gap before the
@@ -632,22 +702,22 @@ async fn main() {
         let stop = Arc::clone(&stop);
         let stop_again = Arc::clone(&stop_again);
         tokio::spawn(async move {
-            // Registration failing is exceptional; fall back to a
-            // never-resolving future so SIGINT still works.
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+            use signal::unix::SignalKind;
+            // A registration that fails must not take the others down with it,
+            // so each is independently optional and a missing one simply never
+            // fires (see `next_signal`). Logged rather than silent: losing a
+            // stop signal turns a graceful shutdown into a SIGKILL later.
+            let mut sigint = register_signal(SignalKind::interrupt(), "SIGINT");
+            let mut sigterm = register_signal(SignalKind::terminate(), "SIGTERM");
+            let mut sighup = register_signal(SignalKind::hangup(), "SIGHUP");
+            let mut sigquit = register_signal(SignalKind::quit(), "SIGQUIT");
             let mut count = 0u32;
             loop {
-                let term = async {
-                    match sigterm.as_mut() {
-                        Some(s) => {
-                            s.recv().await;
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                };
                 let name = tokio::select! {
-                    _ = signal::ctrl_c() => "SIGINT",
-                    () = term => "SIGTERM",
+                    () = next_signal(&mut sigint) => "SIGINT",
+                    () = next_signal(&mut sigterm) => "SIGTERM",
+                    () = next_signal(&mut sighup) => "SIGHUP",
+                    () = next_signal(&mut sigquit) => "SIGQUIT",
                 };
                 count += 1;
                 if count == 1 {
@@ -819,4 +889,35 @@ async fn main() {
     // the process exits and takes the writer thread with it.
     access_log::flush(Duration::from_millis(500));
     log::flush(Duration::from_millis(500));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_pool_stays_within_its_bounds_on_this_host() {
+        // The bounds are the point: connections cost SMB sessions on the
+        // server, and a machine's core count is only a proxy for how much
+        // request concurrency it will offer.
+        let n = default_pool_size();
+        assert!((8..=32).contains(&n), "pool {n} outside 8..=32");
+    }
+
+    #[test]
+    fn pool_size_is_two_per_core_between_a_floor_and_a_ceiling() {
+        // Two per core, because a connection owns its stream for a whole round
+        // trip and an `-j16` build keeps well over 16 requests outstanding.
+        assert_eq!(pool_size_for(8), 16);
+        assert_eq!(pool_size_for(16), 32);
+        // Floor: one connection per core on a 2-core box would put a whole
+        // build behind two streams.
+        assert_eq!(pool_size_for(1), 8);
+        assert_eq!(pool_size_for(2), 8);
+        // Ceiling: past this the pool buys no measured latency and costs the
+        // server sessions.
+        assert_eq!(pool_size_for(64), 32);
+        // A pathological core count must clamp, not wrap.
+        assert_eq!(pool_size_for(usize::MAX), 32);
+    }
 }

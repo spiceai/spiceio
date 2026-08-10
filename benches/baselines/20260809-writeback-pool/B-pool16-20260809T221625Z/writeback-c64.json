@@ -1,0 +1,36 @@
+{
+  "label": "B-rep1 writeback c64",
+  "endpoint": "http://127.0.0.1:18390",
+  "bucket": "sccache-bench",
+  "concurrency": 64,
+  "objects": 512,
+  "ops_per_phase": 1536,
+  "phases": [
+    {
+      "phase": "put",
+      "concurrency": 64,
+      "ops": 1536,
+      "bytes": 965419008,
+      "wall_ms": 98,
+      "ops_per_sec": 15570.99,
+      "mib_per_sec": 9333.42,
+      "latency_us": {"mean": 3966, "p50": 3556, "p90": 4851, "p99": 16060, "p999": 28056, "max": 29142},
+      "ttfb_us": {"mean": 3936, "p50": 3554, "p90": 4839, "p99": 16058, "p999": 28055, "max": 29140},
+      "statuses": {"200": 1536},
+      "errors": {}
+    },
+    {
+      "phase": "mixed",
+      "concurrency": 64,
+      "ops": 1536,
+      "bytes": 777200460,
+      "wall_ms": 324,
+      "ops_per_sec": 4733.39,
+      "mib_per_sec": 2284.10,
+      "latency_us": {"mean": 7174, "p50": 1118, "p90": 19652, "p99": 114941, "p999": 207885, "max": 320139},
+      "ttfb_us": {"mean": 6378, "p50": 951, "p90": 18791, "p99": 85449, "p999": 181347, "max": 181840},
+      "statuses": {"200": 1230, "404": 306},
+      "errors": {}
+    }
+  ]
+}
