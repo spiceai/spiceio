@@ -486,6 +486,10 @@ impl WriteBack {
             let g = self.inner.lock().await;
             g.pending
                 .iter()
+                // Already on disk — a flusher journalled it, or one did while
+                // standing down for readers. Rewriting it would only make
+                // shutdown slower.
+                .filter(|(_, p)| p.sha.is_none())
                 .map(|(k, p)| (k.clone(), p.etag.clone(), p.last_modified, p.body.clone()))
                 .collect()
         };
@@ -690,45 +694,104 @@ impl WriteBack {
     /// not competing for it. So the durability step keeps running when the
     /// bandwidth step stands down.
     async fn journal_one(&self, cache: &ObjectCache) -> bool {
-        // Pick a victim under the lock, journal it outside — the spill write
-        // goes through the blocking pool and must not hold up enqueue.
-        let (key, etag, last_modified, body, seq) = {
-            let g = self.inner.lock().await;
-            match g
-                .pending
-                .iter()
-                .find(|(_, p)| p.sha.is_none())
-                .map(|(k, p)| {
-                    (
-                        k.clone(),
-                        p.etag.clone(),
-                        p.last_modified,
-                        p.body.clone(),
-                        p.seq,
-                    )
-                }) {
-                Some(v) => v,
-                None => return false,
-            }
-        };
-        let Some(sha) = cache
-            .spill_put_dirty(&key, &etag, last_modified, &body)
-            .await
-        else {
-            // No spill configured, or the body is too large for it. Either way
-            // there is nothing to record, and retrying would spin.
+        // Claimed through the same `flushing` flag a flush takes, never picked
+        // out of the map directly. Publishing to the spill is a rename into a
+        // path shared with the flush of that same key, so it needs the same
+        // exclusion:
+        //
+        // * a flusher mid-`flush_one` would otherwise be racing this rename,
+        //   and a journal write landing after its `promote` turns a clean entry
+        //   back into a dirty one — which a later replay writes to the NAS
+        //   again, on top of whatever came after it;
+        // * `cancel` (a DELETE) would otherwise remove the pending entry, and
+        //   the caller's `forget` clear the spill, while this rename is still
+        //   in flight — resurrecting the deleted object. Holding the claim
+        //   makes `cancel` wait for it instead.
+        //
+        // The sequence check below is *not* what makes that safe; it only keeps
+        // an overwrite from being stamped with its predecessor's digest.
+        // No spill configured means nothing to journal, ever.
+        let Some(max_object) = cache.spill().map(|s| s.max_object_bytes()) else {
             return false;
         };
+        let Some(c) = self.claim_for_journal(max_object).await else {
+            return false;
+        };
+        let sha = cache
+            .spill_put_dirty(&c.key, &c.etag, c.last_modified, &c.body)
+            .await;
+        let journalled = sha.is_some();
+        self.finish_journal(&c.key, c.seq, sha).await;
+        journalled
+    }
+
+    /// Claim the next queued key whose body is not on disk yet and that the
+    /// spill can actually accept.
+    ///
+    /// Scans rather than popping the front, because a key that is already
+    /// journalled still needs its backend write and must keep its place.
+    ///
+    /// `max_object` is the filter that keeps one un-journalable body from
+    /// blocking every other. An object over the spill's per-object cap can
+    /// never be journalled, so selecting the first unjournalled entry out of a
+    /// `HashMap` — whose iteration order is stable for an unchanged map —
+    /// returned that same entry on every pass while every smaller pending body
+    /// stayed memory-only. Skipping it here is also why the scan does not have
+    /// to cycle such entries through the queue to get past them.
+    async fn claim_for_journal(&self, max_object: u64) -> Option<Claim> {
         let mut g = self.inner.lock().await;
-        if let Some(p) = g.pending.get_mut(&key)
-            && p.seq == seq
-        {
-            // Still the same body. A newer one would have its own `sha: None`,
-            // and stamping this digest onto it would claim a journal entry that
-            // holds different bytes.
-            p.sha = Some(sha);
+        let mut found = None;
+        for (i, key) in g.queue.iter().enumerate() {
+            if let Some(p) = g.pending.get(key)
+                && !p.flushing
+                && p.sha.is_none()
+                && p.body.len() as u64 <= max_object
+            {
+                found = Some(i);
+                break;
+            }
         }
-        true
+        let key = g.queue.remove(found?)?;
+        let p = g.pending.get_mut(&key)?;
+        p.flushing = true;
+        Some(Claim {
+            key,
+            body: p.body.clone(),
+            etag: p.etag.clone(),
+            last_modified: p.last_modified,
+            seq: p.seq,
+            sha: None,
+        })
+    }
+
+    /// Release a journal claim, recording the digest when it still describes
+    /// the body that is queued.
+    ///
+    /// Always re-queues: journalling is only the first half of the work, and
+    /// the key still owes its backend write.
+    async fn finish_journal(&self, key: &str, seq: u64, sha: Option<[u8; 32]>) {
+        {
+            let mut g = self.inner.lock().await;
+            let Some(p) = g.pending.get_mut(key) else {
+                // Cancelled while we held the claim. `cancel` waits out a
+                // claim, so this only happens when the entry went away for
+                // another reason; either way there is nothing to record.
+                drop(g);
+                self.progress.notify_waiters();
+                return;
+            };
+            p.flushing = false;
+            if p.seq == seq {
+                // Still the same body. An overwrite carries its own
+                // `sha: None`, and stamping this digest onto it would claim a
+                // journal entry that holds different bytes.
+                p.sha = sha;
+            }
+            g.queue.push_back(key.to_string());
+        }
+        // A `cancel` may be parked on this key's claim.
+        self.progress.notify_waiters();
+        self.work.notify_one();
     }
 
     async fn flush_loop(
@@ -970,6 +1033,108 @@ mod tests {
             "flush did not inherit the journalled digest"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_body_the_spill_cannot_hold_does_not_block_the_others() {
+        // An object over the spill's per-object cap can never be journalled.
+        // Selecting the first unjournalled entry out of a `HashMap` — whose
+        // iteration order is stable for an unchanged map — returned that same
+        // entry on every pass, so every smaller body behind it stayed
+        // memory-only for as long as it was queued.
+        let dir = std::env::temp_dir().join(format!("spiceio-wb-oversize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill = super::super::spill::Spill::open(&dir, "ns".into(), 1 << 20, 64).unwrap();
+        let cache = ObjectCache::new(false, 1 << 20, 1 << 20, 64).with_spill(Arc::new(spill));
+
+        // Many oversized bodies against one journalable body, so a scan that
+        // does not filter them lands on one of them with high probability
+        // rather than by luck of the hash order.
+        let w = WriteBack::new(true, 1 << 20);
+        for i in 0..20 {
+            w.enqueue(
+                &format!("too-big{i}"),
+                "e",
+                1,
+                Bytes::from(vec![b'x'; 4096]),
+            )
+            .await;
+        }
+        w.enqueue("small", "e", 1, Bytes::from_static(b"small-body"))
+            .await;
+
+        // One pass: the oversized entries are skipped, not cycled past.
+        assert!(
+            w.journal_one(&cache).await,
+            "the oversized bodies starved the one entry the spill could hold"
+        );
+        assert!(
+            cache.spill().unwrap().contains_key("small"),
+            "the journalable body never reached disk"
+        );
+        // And they are not retried forever — with nothing journalable left,
+        // the pass reports no progress instead of spinning on them.
+        assert!(!w.journal_one(&cache).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn journalling_holds_the_claim_so_a_delete_waits_for_it() {
+        // Publishing to the spill is a rename into the same path that key's
+        // flush uses. Without the claim a DELETE could clear the spill while
+        // the rename was still in flight and the entry would come back — and a
+        // flusher could be inside `flush_one` on the same key at the same time.
+        let w = wb();
+        w.enqueue("a", "e", 1, Bytes::from_static(b"v1")).await;
+        let c = w
+            .claim_for_journal(1 << 20)
+            .await
+            .expect("nothing claimable");
+
+        assert!(
+            w.claim_for_journal(1 << 20).await.is_none(),
+            "journal claim did not exclude a second journaller"
+        );
+        assert!(
+            w.claim().await.is_none(),
+            "journal claim did not exclude a flusher"
+        );
+
+        let w2 = Arc::clone(&w);
+        let canceller = tokio::spawn(async move { w2.cancel("a").await });
+        tokio::task::yield_now().await;
+        assert!(
+            !canceller.is_finished(),
+            "cancel removed a key whose journal write was still in flight"
+        );
+
+        w.finish_journal(&c.key, c.seq, Some([7u8; 32])).await;
+        tokio::time::timeout(Duration::from_secs(5), canceller)
+            .await
+            .expect("cancel never woke")
+            .unwrap();
+        assert!(w.pending_meta("a").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_journalled_key_still_owes_its_backend_write() {
+        // Journalling is half the work; the key has to stay queued for its NAS
+        // write rather than being retired by the journal pass.
+        let w = wb();
+        w.enqueue("a", "e", 1, Bytes::from_static(b"v1")).await;
+        let c = w.claim_for_journal(1 << 20).await.unwrap();
+        w.finish_journal(&c.key, c.seq, Some([9u8; 32])).await;
+        assert_eq!(w.depth().await.1, 1, "journalling retired the write");
+        let next = w
+            .claim()
+            .await
+            .expect("key was not re-queued for its flush");
+        assert_eq!(
+            next.sha,
+            Some([9u8; 32]),
+            "flush lost the journalled digest"
+        );
     }
 
     #[tokio::test]
