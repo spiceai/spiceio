@@ -77,6 +77,26 @@ inputs:
       space above that. Set it lower on a runner whose disk the build needs.
     required: false
     default: ""
+  export-aws-endpoint:
+    description: >
+      When "true" or "1", also export AWS_ENDPOINT_URL to $GITHUB_ENV so later
+      steps reach this proxy without hard-coding a port that auto-increment may
+      have moved.
+
+      Off by default, deliberately. AWS_ENDPOINT_URL is not scoped to a tool —
+      it is the AWS SDK's global endpoint override, honoured by every AWS SDK
+      client and by object_store's AmazonS3Builder::from_env(). Exported into
+      $GITHUB_ENV it applies to everything else the job runs, not just the AWS
+      CLI: a test binary fetching public s3:// fixtures, or a Bedrock or S3
+      Vectors client, is silently redirected at this SMB-backed proxy. Nothing
+      in the resulting failure names S3, so it reads as a product bug.
+
+      Prefer the `endpoint` output — it is what an `aws` invocation would pass
+      to --endpoint-url anyway, and it stays scoped to the step that uses it.
+      SCCACHE_ENDPOINT is exported unconditionally because it is tool-scoped
+      and affects nothing but sccache.
+    required: false
+    default: "false"
   token:
     description: GitHub token for downloading release assets from private repos
     required: true
@@ -136,6 +156,7 @@ runs:
         WRITE_BACK: ${{ inputs.write-back }}
         SPILL_DIR: ${{ inputs.spill-dir }}
         SPILL_BYTES: ${{ inputs.spill-bytes }}
+        EXPORT_AWS_ENDPOINT: ${{ inputs.export-aws-endpoint }}
       run: |
         set -euo pipefail
 
@@ -256,12 +277,18 @@ runs:
                 echo "spiceio ready at $ENDPOINT (PID $PID)"
                 echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
                 echo "pid=$PID" >> "$GITHUB_OUTPUT"
-                # Export for subsequent steps (sccache, aws cli) so they do not
-                # hard-code a port that auto-increment may have moved.
-                {
-                  echo "SCCACHE_ENDPOINT=$ENDPOINT"
-                  echo "AWS_ENDPOINT_URL=$ENDPOINT"
-                } >> "$GITHUB_ENV"
+                # Export for subsequent steps so they do not hard-code a port
+                # that auto-increment may have moved. SCCACHE_ENDPOINT only:
+                # it is tool-scoped and affects nothing but sccache.
+                echo "SCCACHE_ENDPOINT=$ENDPOINT" >> "$GITHUB_ENV"
+                # AWS_ENDPOINT_URL is the AWS SDK's *global* endpoint override,
+                # not an aws-cli setting, so exporting it job-wide redirects
+                # every SDK client the job later runs — including a runtime
+                # fetching public s3:// fixtures — at this SMB-backed proxy.
+                # Opt-in; see the input description and issue #38.
+                case "$(printf '%s' "$EXPORT_AWS_ENDPOINT" | tr '[:upper:]' '[:lower:]')" in
+                  1|true|yes) echo "AWS_ENDPOINT_URL=$ENDPOINT" >> "$GITHUB_ENV" ;;
+                esac
                 exit 0
               fi
             fi
