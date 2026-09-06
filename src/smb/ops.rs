@@ -448,20 +448,15 @@ impl ShareSession {
 
     /// Put object with no window in which the client's key holds a partial body.
     ///
-    /// Small bodies go out as one compound Create+Write+Close. Anything larger
-    /// goes through the WAL — write a temp, verify its length, rename — the
-    /// same path streaming PutObject uses, and the reason a failed write leaves
-    /// any existing object untouched instead of replacing it with a truncated
-    /// one (see `WalWriter::commit`).
+    /// Every body goes through the WAL: write a temp, verify its length, then
+    /// rename. A compound OverwriteIf+Write+Close is not atomic: CREATE can
+    /// truncate the previous object even when WRITE subsequently fails.
     ///
     /// This is what background writes must use. `put_object`'s large-file
     /// branch overwrites in place and deletes the destination if the write
     /// fails, which is defensible while a client is still waiting on the
     /// result and is not once the client has already been told it succeeded.
     pub async fn put_object_atomic(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
-        if data.len() <= self.pool.compound_max_write_size as usize {
-            return self.put_object(key, data).await;
-        }
         let mut wal = self.open_wal_write(key).await?;
         if let Err(e) = wal.write(data).await {
             wal.abort().await;
@@ -2659,6 +2654,38 @@ pub(crate) fn guess_content_type(key: &str) -> String {
 }
 
 #[cfg(test)]
+impl ShareSession {
+    pub(crate) fn test_from_pool(pool: Arc<SmbPool>) -> Self {
+        Self {
+            pool,
+            cleanup_grace_ft: 0,
+            ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ShareSession {
+    pub(crate) fn test_file(&self, key: &str, size: u64) -> FileHandle {
+        let (client, tree_id) = self.pick();
+        FileHandle {
+            client,
+            pool: self.pool.clone(),
+            tree_id,
+            file_id: [1; 16],
+            meta: ObjectMeta {
+                size,
+                last_modified: 1,
+                etag: "e".into(),
+                content_type: guess_content_type(key),
+            },
+            file_size: size,
+            max_chunk: 65536,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3135,5 +3162,81 @@ mod tests {
         // Timestamp part should be a large number (nanoseconds)
         let ts: u128 = parts[0].parse().expect("timestamp should be numeric");
         assert!(ts > 1_000_000_000_000_000_000, "timestamp looks too small");
+    }
+}
+
+#[cfg(test)]
+mod regression_pipeline {
+    use super::*;
+    use crate::test_support::{pair, read_frame};
+    use bytes::BufMut;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn regression_short_pipelined_write_must_not_leave_unwritten_hole() {
+        let (c, mut s) = pair().await;
+        let pool = SmbPool::test_from_client(c.clone());
+        let expected: Vec<u8> = (0..131072).map(|i| (i % 251 + 1) as u8).collect();
+        let backend = tokio::spawn(async move {
+            let mut file = vec![0u8; 131072];
+            for round in 0..2 {
+                let count = 2;
+                let mut responses = Vec::new();
+                for i in 0..count {
+                    let request = read_frame(&mut s).await;
+                    let b = &request[64..];
+                    let data_offset = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
+                    let length = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+                    let written = if round == 0 && i == 0 {
+                        length / 2
+                    } else {
+                        length
+                    };
+                    println!(
+                        "SMB WRITE offset={offset}, requested={length}, acknowledged={written}"
+                    );
+                    file[offset..offset + written]
+                        .copy_from_slice(&request[data_offset..data_offset + written]);
+                    let mut h = Header::decode(&request).unwrap();
+                    h.flags = 1;
+                    responses.push(build_request(&h, |b| {
+                        b.put_u16_le(17);
+                        b.put_u16_le(0);
+                        b.put_u32_le(written as u32);
+                        b.put_u32_le(0);
+                        b.put_u32_le(0);
+                    }));
+                }
+                for r in responses.into_iter().rev() {
+                    s.write_all(&r).await.unwrap();
+                }
+            }
+            file
+        });
+        let mut wal = WalWriter {
+            client: c,
+            pool,
+            tree_id: 1,
+            file_id: [1; 16],
+            wal_path: "temp".into(),
+            final_path: "dest".into(),
+            buf: expected.clone(),
+            flush_cap: 131072,
+            offset: 0,
+            total_size: 131072,
+        };
+        wal.flush().await.unwrap();
+        let actual = backend.await.unwrap();
+        println!(
+            "WAL reports {} bytes flushed; backend size={}; unwritten zero bytes={}",
+            wal.offset,
+            actual.len(),
+            actual.iter().filter(|v| **v == 0).count()
+        );
+        assert!(
+            actual == expected,
+            "short count in earlier pipeline slot left a hole despite successful flush and correct file length"
+        );
     }
 }

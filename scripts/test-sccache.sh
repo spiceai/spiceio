@@ -21,6 +21,18 @@ ENDPOINT="http://${BIND}"
 # (no AWS_DEFAULT_REGION in env, no ~/.aws/config).
 AWS="aws --endpoint-url $ENDPOINT --no-sign-request --region $REGION"
 TEST_PREFIX="spiceio-test-$$"
+TEST_WORK=$(mktemp -d /tmp/spiceio-sccache-work.XXXXXX)
+# Never stop or reconfigure a developer's default sccache daemon.
+if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
+    SCCACHE_SERVER_PORT=$(python3 - <<'PORT'
+import socket
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PORT
+)
+fi
+export SCCACHE_SERVER_PORT
 PASS=0
 FAIL=0
 
@@ -46,7 +58,7 @@ cleanup() {
         kill "$SPICEIO_PID" 2>/dev/null || true
         wait "$SPICEIO_PID" 2>/dev/null || true
     fi
-    rm -rf /tmp/spiceio-test-*
+    rm -rf "$TEST_WORK"
     rm -f "$SPICEIO_STDERR"
 }
 trap cleanup EXIT
@@ -179,8 +191,8 @@ assert_ok "HeadBucket on existing bucket" $AWS s3api head-bucket --bucket "$BUCK
 
 echo ""
 echo "[s3] PutObject / GetObject (small)"
-echo "hello spiceio" > /tmp/spiceio-test-small.txt
-$AWS s3 cp /tmp/spiceio-test-small.txt "s3://${BUCKET}/${TEST_PREFIX}/small.txt" --quiet 2>/dev/null
+echo "hello spiceio" > "${TEST_WORK}/small.txt"
+$AWS s3 cp "${TEST_WORK}/small.txt" "s3://${BUCKET}/${TEST_PREFIX}/small.txt" --quiet 2>/dev/null
 GOT=$($AWS s3 cp "s3://${BUCKET}/${TEST_PREFIX}/small.txt" - 2>/dev/null)
 assert_eq "small file round-trip" "hello spiceio" "$GOT"
 
@@ -188,22 +200,22 @@ assert_eq "small file round-trip" "hello spiceio" "$GOT"
 
 echo ""
 echo "[s3] PutObject / GetObject (64KB)"
-dd if=/dev/urandom of=/tmp/spiceio-test-64k.bin bs=1024 count=64 2>/dev/null
-$AWS s3 cp /tmp/spiceio-test-64k.bin "s3://${BUCKET}/${TEST_PREFIX}/64k.bin" --quiet 2>/dev/null
-$AWS s3 cp "s3://${BUCKET}/${TEST_PREFIX}/64k.bin" /tmp/spiceio-test-64k-dl.bin --quiet 2>/dev/null
-ORIG_MD5=$(md5 -q /tmp/spiceio-test-64k.bin)
-DL_MD5=$(md5 -q /tmp/spiceio-test-64k-dl.bin)
+dd if=/dev/urandom of="${TEST_WORK}/64k.bin" bs=1024 count=64 2>/dev/null
+$AWS s3 cp "${TEST_WORK}/64k.bin" "s3://${BUCKET}/${TEST_PREFIX}/64k.bin" --quiet 2>/dev/null
+$AWS s3 cp "s3://${BUCKET}/${TEST_PREFIX}/64k.bin" "${TEST_WORK}/64k-dl.bin" --quiet 2>/dev/null
+ORIG_MD5=$(md5 -q "${TEST_WORK}/64k.bin")
+DL_MD5=$(md5 -q "${TEST_WORK}/64k-dl.bin")
 assert_eq "64KB file integrity" "$ORIG_MD5" "$DL_MD5"
 
 # ── PutObject + GetObject (1MB) ─────────────────────────────────────────────
 
 echo ""
 echo "[s3] PutObject / GetObject (1MB)"
-dd if=/dev/urandom of=/tmp/spiceio-test-1m.bin bs=1024 count=1024 2>/dev/null
-$AWS s3 cp /tmp/spiceio-test-1m.bin "s3://${BUCKET}/${TEST_PREFIX}/1m.bin" --quiet 2>/dev/null
-$AWS s3 cp "s3://${BUCKET}/${TEST_PREFIX}/1m.bin" /tmp/spiceio-test-1m-dl.bin --quiet 2>/dev/null
-ORIG_MD5=$(md5 -q /tmp/spiceio-test-1m.bin)
-DL_MD5=$(md5 -q /tmp/spiceio-test-1m-dl.bin)
+dd if=/dev/urandom of="${TEST_WORK}/1m.bin" bs=1024 count=1024 2>/dev/null
+$AWS s3 cp "${TEST_WORK}/1m.bin" "s3://${BUCKET}/${TEST_PREFIX}/1m.bin" --quiet 2>/dev/null
+$AWS s3 cp "s3://${BUCKET}/${TEST_PREFIX}/1m.bin" "${TEST_WORK}/1m-dl.bin" --quiet 2>/dev/null
+ORIG_MD5=$(md5 -q "${TEST_WORK}/1m.bin")
+DL_MD5=$(md5 -q "${TEST_WORK}/1m-dl.bin")
 assert_eq "1MB file integrity" "$ORIG_MD5" "$DL_MD5"
 
 # ── HeadObject ──────────────────────────────────────────────────────────────
@@ -276,7 +288,7 @@ echo "======================================="
 
 # Start a second instance requesting the same bind address.
 # It should auto-increment to the next port.
-SPICEIO_LOG2=$(mktemp /tmp/spiceio-test-log2.XXXXXX)
+SPICEIO_LOG2=$(mktemp "${TEST_WORK}/log2.XXXXXX")
 
 SPICEIO_BIND="$BIND" \
 SPICEIO_SMB_SERVER="$SMB_SERVER" \
@@ -669,6 +681,12 @@ if grep -q -i 'capacity\|reduced from\|too many sessions\|0xC00000C[ED]' "$SPICE
 else
     echo "  NOTE: no capacity reduction messages in sccache test (server allowed 128 conns)"
 fi
+
+# Exercise retention through the running test instance. Restrict this CI call
+# to the test's own namespace; make test-sccache-clean can target a live cache.
+SCCACHE_ENDPOINT="$ENDPOINT" SCCACHE_BUCKET="$BUCKET" \
+    SCCACHE_S3_KEY_PREFIX="$TEST_PREFIX/retention" \
+    ./scripts/test-sccache-clean.py
 
 # ── Stderr guard ────────────────────────────────────────────────────────────
 #

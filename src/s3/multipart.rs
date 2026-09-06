@@ -4,6 +4,7 @@
 //! files under a `.spiceio-uploads/` directory on the share.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
@@ -20,6 +21,7 @@ pub struct UploadState {
     pub key: String,
     pub parts: HashMap<u32, PartInfo>,
     pub initiated: u64,
+    operation_lock: Arc<RwLock<()>>,
 }
 
 /// Info about a single uploaded part.
@@ -56,6 +58,7 @@ impl MultipartStore {
             key: key.to_string(),
             parts: HashMap::new(),
             initiated: epoch_secs(),
+            operation_lock: Arc::new(RwLock::new(())),
         };
 
         self.uploads.write().await.insert(upload_id.clone(), state);
@@ -70,10 +73,10 @@ impl MultipartStore {
         size: u64,
         etag: String,
         temp_path: String,
-    ) -> Option<()> {
+    ) -> Option<Option<PartInfo>> {
         let mut uploads = self.uploads.write().await;
         let state = uploads.get_mut(upload_id)?;
-        state.parts.insert(
+        let previous = state.parts.insert(
             part_number,
             PartInfo {
                 part_number,
@@ -82,7 +85,18 @@ impl MultipartStore {
                 temp_path,
             },
         );
-        Some(())
+        Some(previous)
+    }
+
+    /// Part uploads share this lock; completion/abort take it exclusively.
+    /// Different parts may still upload concurrently, while the completion's
+    /// validated part versions remain fixed through assembly and cleanup.
+    pub async fn operation_lock(&self, upload_id: &str) -> Option<Arc<RwLock<()>>> {
+        self.uploads
+            .read()
+            .await
+            .get(upload_id)
+            .map(|u| Arc::clone(&u.operation_lock))
     }
 
     /// Get upload state (for listing parts).
@@ -107,7 +121,10 @@ impl MultipartStore {
         let mut uploads = self.uploads.write().await;
         let expired: Vec<String> = uploads
             .iter()
-            .filter(|(_, u)| now_secs.saturating_sub(u.initiated) > ttl_secs)
+            .filter(|(_, u)| {
+                now_secs.saturating_sub(u.initiated) > ttl_secs
+                    && u.operation_lock.try_write().is_ok()
+            })
             .map(|(id, _)| id.clone())
             .collect();
         expired.iter().filter_map(|id| uploads.remove(id)).collect()
@@ -134,6 +151,16 @@ impl MultipartStore {
     /// Get the temp file path for a specific part.
     pub fn temp_part_path(upload_id: &str, part_number: u32) -> String {
         format!(".spiceio-uploads\\{}\\part-{:05}", upload_id, part_number)
+    }
+
+    /// Immutable path per attempt: replacing the same part concurrently must
+    /// never overwrite bytes referenced by another acknowledged ETag.
+    pub fn new_part_path(&self, upload_id: &str, part_number: u32) -> String {
+        let generation = self.next_id.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "{}-{generation:016x}",
+            Self::temp_part_path(upload_id, part_number)
+        )
     }
 
     /// Path of an upload's liveness marker — written when the upload is

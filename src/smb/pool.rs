@@ -789,6 +789,31 @@ impl SmbPool {
 }
 
 #[cfg(test)]
+impl SmbPool {
+    pub(crate) fn test_from_client(client: Arc<SmbClient>) -> Arc<Self> {
+        Arc::new(Self {
+            slots: RwLock::new(vec![Slot { client, tree_id: 1 }]),
+            n: AtomicUsize::new(1),
+            next: AtomicUsize::new(0),
+            config: crate::test_support::config(),
+            share: OnceLock::new(),
+            max_read_size: 65536,
+            max_write_size: 65536,
+            compound_max_read_size: 65536,
+            compound_max_write_size: 65536,
+            write_inflight: AtomicU32::new(INFLIGHT_MAX),
+            read_inflight: AtomicU32::new(INFLIGHT_MAX),
+            reset_since_grow: AtomicBool::new(false),
+            copychunk_ok: AtomicBool::new(false),
+            heal_lock: tokio::sync::Mutex::new(()),
+            overload_until_ms: AtomicU64::new(0),
+            admission: Arc::new(Semaphore::new(16)),
+            client_inflight: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;

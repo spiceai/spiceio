@@ -127,9 +127,10 @@ pub struct SpillEntry {
 
 /// A dirty entry found by [`Spill::scan_dirty`] — an acknowledged write that
 /// has not reached the backend.
+#[derive(Clone)]
 pub struct DirtyEntry {
     pub key: String,
-    pub entry: SpillEntry,
+    pub body_sha: [u8; 32],
     /// Seconds since the entry was published, on the local clock.
     pub age_secs: u64,
 }
@@ -538,6 +539,13 @@ impl Spill {
             .collect()
     }
 
+    pub fn owns_dirty(&self, key: &str) -> bool {
+        self.owned_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(key)
+    }
+
     /// True if an entry file exists for `key`.
     ///
     /// A name check only — the body is not read or verified, so a corrupt entry
@@ -608,16 +616,50 @@ impl Spill {
                     young += 1;
                     continue;
                 }
-                if let Some((key, e)) = self.read_dirty_by_path(&entry) {
+                // Enumerate headers and keys only. A dirty journal may exceed
+                // the disk eviction budget; loading every body here would
+                // allocate that whole journal before queue backpressure works.
+                if let Some((key, body_sha)) = self.dirty_identity(&entry) {
                     out.push(DirtyEntry {
                         key,
-                        entry: e,
+                        body_sha,
                         age_secs: age.as_secs(),
                     });
                 }
             }
         }
         (out, young)
+    }
+
+    fn dirty_identity(&self, path: &Path) -> Option<(String, [u8; 32])> {
+        let mut f = File::open(path).ok()?;
+        let mut header = [0u8; HEADER_LEN];
+        f.read_exact(&mut header).ok()?;
+        if &header[..4] != MAGIC
+            || u16::from_le_bytes(header[4..6].try_into().ok()?) != FORMAT_VERSION
+        {
+            return None;
+        }
+        let id_len = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
+        let body_len = u64::from_le_bytes(header[16..24].try_into().ok()?);
+        if id_len > 64 * 1024 || body_len > self.max_object_bytes {
+            return None;
+        }
+        let mut id = vec![0; id_len];
+        f.read_exact(&mut id).ok()?;
+        let prefix = self.namespace.as_bytes();
+        if !id.starts_with(prefix) || id.get(prefix.len()) != Some(&0) {
+            return None;
+        }
+        let key = String::from_utf8(id[prefix.len() + 1..].to_vec()).ok()?;
+        Some((key, header[32..64].try_into().ok()?))
+    }
+
+    /// Load one enumerated generation. Entries replaced or promoted since the
+    /// scan are skipped; recovery never substitutes a newer clean cache copy.
+    pub fn load_dirty(&self, descriptor: &DirtyEntry) -> Option<SpillEntry> {
+        let (key, entry) = self.read_dirty_by_path(&self.path_for(&descriptor.key, DIRTY_EXT))?;
+        (key == descriptor.key && entry.body_sha == descriptor.body_sha).then_some(entry)
     }
 
     /// Read an entry whose key is not known up front, recovering it from the
@@ -1014,7 +1056,7 @@ mod tests {
         let (dirty, _) = s.scan_dirty(Duration::ZERO);
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].key, "pending/k");
-        assert_eq!(&dirty[0].entry.body[..], b"body");
+        assert_eq!(&s.load_dirty(&dirty[0]).unwrap().body[..], b"body");
     }
 
     #[test]
@@ -1120,7 +1162,7 @@ mod tests {
         assert!(!s.promote("k", &sha_v1, "e1", 3, b"v1").unwrap());
         let (dirty, _) = s.scan_dirty(Duration::ZERO);
         assert_eq!(dirty.len(), 1);
-        assert_eq!(&dirty[0].entry.body[..], b"v2-longer");
+        assert_eq!(&s.load_dirty(&dirty[0]).unwrap().body[..], b"v2-longer");
     }
 
     #[test]
