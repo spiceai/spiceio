@@ -30,17 +30,25 @@ def main():
                    "--prefix", prefix, "--older-than-days", "10"]
         result = subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE)
         summary = json.loads(result.stdout)
+        print(json.dumps(summary, sort_keys=True), flush=True)
         if client.request("GET", key) != content:
             raise RuntimeError("cleanup removed or changed the fresh sentinel")
         # Verify the exact fixed cutoff used by the cleanup, rather than moving
         # the threshold while a long listing is in progress.
         cutoff = api["timestamp"](summary["cutoff"])
-        remaining = sum(obj["modified"] < cutoff for page in client.pages(prefix) for obj in page)
+        remaining = 0
+        examples = []
+        for page in client.pages(prefix):
+            for obj in page:
+                if obj["modified"] < cutoff:
+                    remaining += 1
+                    if len(examples) < 5:
+                        examples.append({"key": obj["key"], "modified": obj["modified"].isoformat()})
         if remaining:
-            raise RuntimeError(f"{remaining} object(s) older than the ten-day cutoff remain")
+            raise RuntimeError(f"{remaining} object(s) older than {summary['cutoff']} remain: "
+                               f"{json.dumps(examples, sort_keys=True)}")
         print(f"PASS: {summary['deleted']} old objects deleted; fresh sentinel preserved; "
               f"no objects remain older than {summary['cutoff']}")
-        print(json.dumps(summary, sort_keys=True))
     finally:
         if created:
             client.delete([key])
