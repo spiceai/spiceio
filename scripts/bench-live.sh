@@ -11,8 +11,8 @@ set -euo pipefail
 # Environment knobs:
 #   BENCH_CONCURRENCY    parallel streams in the concurrent tests (default 8)
 #   BENCH_MOUNT_BASELINE 1 to also benchmark a raw mount_smbfs mount of the
-#                          same share — gives a hard ceiling on what the link
-#                          can do, so we can see spiceio's translation overhead
+#                          same share, using buffered cp for comparison with
+#                          the native client (includes OS caching and buffering)
 #
 # Requires: aws cli, dd, curl, bc, perl (Time::HiRes).
 
@@ -43,6 +43,12 @@ fi
 # ── Cleanup ─────────────────────────────────────────────────────────────
 SPICEIO_PID=""
 MOUNT_POINT=""
+unmount_benchmark_share() {
+    # macOS may report a native SMB mount busy after the transfers finish.
+    # Disk Arbitration can release it without forcing the unmount.
+    umount "$MOUNT_POINT" 2>/dev/null || diskutil unmount "$MOUNT_POINT" >/dev/null
+}
+
 cleanup() {
     echo ""
     echo "[bench] cleaning up..."
@@ -52,7 +58,7 @@ cleanup() {
         wait "$SPICEIO_PID" 2>/dev/null || true
     fi
     if [[ -n "$MOUNT_POINT" && -d "$MOUNT_POINT" ]]; then
-        umount "$MOUNT_POINT" 2>/dev/null || true
+        unmount_benchmark_share || true
         rmdir "$MOUNT_POINT" 2>/dev/null || true
     fi
     rm -f /tmp/spiceio-bench-*
@@ -189,10 +195,9 @@ bench_concurrent_read() {
     rm -f /tmp/spiceio-bench-cread-${label}-*
 }
 
-# Optional raw-SMB baseline via mount_smbfs. Mounts the same share locally
-# and runs the same dd-based write/read tests. Establishes the hard
-# ceiling for what the link can do, so we can attribute spiceio's
-# translation overhead.
+# Optional native-SMB baseline via mount_smbfs. Mounts the same share locally
+# and copies generated files in both directions. These buffered cp timings
+# include OS caching; they do not isolate link speed or durable-write latency.
 #
 # The mount uses the macOS Keychain for credentials rather than embedding
 # the password in the mount URL — embedded passwords leak via shell
@@ -249,7 +254,7 @@ bench_mount_baseline() {
     done
 
     rm -rf "$target" 2>/dev/null
-    umount "$MOUNT_POINT" 2>/dev/null
+    unmount_benchmark_share
     rmdir "$MOUNT_POINT" 2>/dev/null
     MOUNT_POINT=""
 }
@@ -303,7 +308,7 @@ bench_concurrent_read "$CONCURRENCY" 524288000  "500M"
 
 if [[ "$MOUNT_BASELINE" == "1" ]]; then
     echo ""
-    echo "── Raw mount_smbfs baseline (link ceiling) ──"
+    echo "── Native mount_smbfs baseline (buffered cp) ──"
     bench_mount_baseline
 fi
 
