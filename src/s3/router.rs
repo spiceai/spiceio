@@ -39,6 +39,7 @@ pub struct AppState {
     pub bucket: String,
     pub region: String,
     pub multipart: MultipartStore,
+    pub listings: super::listing::ListingCache,
     /// Caps concurrent S3 ops that hit the SMB pool. Sized from the pool
     /// (`admission_limit`) so an sccache stampede cannot bury spiceio under
     /// unbounded blocked handlers when the NAS is slow or overloaded.
@@ -116,11 +117,8 @@ impl Drop for BackendActivity {
 /// but not finished is a client still waiting — so the two are tied together in
 /// one guard rather than left to matching increment/decrement calls.
 ///
-/// It stops at the response *head*, which is not where a streaming GET stops:
-/// that hands back a channel body and keeps reading from SMB in a detached
-/// task. Such a task takes its own [`BackendActivity`] for its whole life, so
-/// the largest reads in the system stay visible to the policy instead of
-/// vanishing the moment their headers are written.
+/// Streaming GET transfers this guard into its producer task. Both admission
+/// and foreground demand remain charged until the body finishes or disconnects.
 struct ClientSlot {
     _permit: OwnedSemaphorePermit,
     _activity: BackendActivity,
@@ -230,19 +228,24 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         return with_common_headers(resp, &request_id, &state.region);
     }
 
-    // Everything below talks to SMB. Hold an admission permit for the whole
-    // request so a saturated NAS cannot grow unbounded work inside the process.
-    let _smb_permit = match acquire_smb_slot(state).await {
-        Ok(p) => p,
-        Err(()) => {
-            return with_common_headers(
-                service_unavailable(
-                    "spiceio is at capacity waiting on the SMB backend; please retry.",
-                ),
-                &request_id,
-                &state.region,
-            );
+    // Mutations acquire their permit inside the handler, after waiting for
+    // write-back/upload coordination. A waiter must leave admission capacity
+    // available for the background operation it needs to finish.
+    let smb_permit = if matches!(*method, Method::GET | Method::HEAD) {
+        match acquire_smb_slot(state).await {
+            Ok(p) => Some(p),
+            Err(()) => {
+                return with_common_headers(
+                    service_unavailable(
+                        "spiceio is at capacity waiting on the SMB backend; please retry.",
+                    ),
+                    &request_id,
+                    &state.region,
+                );
+            }
         }
+    } else {
+        None
     };
 
     // ── Bucket-level operations (no key) ────────────────────────────────
@@ -269,7 +272,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             Method::POST if has_query_flag(query, "delete") => {
                 match collect_body(body, declared_len).await {
                     Ok(body) => handle_delete_objects(body, state).await,
-                    Err(resp) => resp,
+                    Err(resp) => *resp,
                 }
             }
             Method::GET => handle_list_objects(state, query).await,
@@ -294,7 +297,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         } else if let Some(upload_id) = extract_query_param(query, "uploadId") {
             match collect_body(body, declared_len).await {
                 Ok(body) => handle_complete_multipart_upload(body, state, key, &upload_id).await,
-                Err(resp) => resp,
+                Err(resp) => *resp,
             }
         } else {
             error_response(
@@ -401,7 +404,15 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     }
 
     let resp = match *method {
-        Method::GET => handle_get_object(hdrs, state, key).await,
+        Method::GET => {
+            handle_get_object(
+                hdrs,
+                state,
+                key,
+                smb_permit.expect("GET acquired admission"),
+            )
+            .await
+        }
         Method::PUT => {
             // CopyObject: PUT with x-amz-copy-source header
             if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
@@ -514,170 +525,157 @@ async fn handle_list_objects(state: &AppState, query: &str) -> Response<SpiceioB
         .map(|s| s == "true")
         .unwrap_or(false);
 
-    let result = share.list_objects(&prefix, delimiter.as_deref()).await;
-
-    let skip_marker = if list_type == "2" {
+    let raw_marker = if list_type == "2" {
         continuation_token.as_deref().unwrap_or(&start_after)
     } else {
         &marker
     };
-
-    match result {
-        Ok((mut objects, mut common_prefixes)) => {
-            // Objects whose writes were acknowledged from memory are not on the
-            // NAS for the walk above to have found. Overlaying them here is what
-            // keeps a client that PUTs and then lists from concluding its write
-            // vanished. Only this instance's pending writes are visible; a peer's
-            // appear once they flush.
-            overlay_pending(
-                state,
-                &prefix,
-                delimiter.as_deref(),
-                &mut objects,
-                &mut common_prefixes,
-            )
-            .await;
-
-            // SMB QueryDirectory does not guarantee order, but S3 returns keys
-            // (and common prefixes) lexicographically. Sort before any marker
-            // filtering / truncation — otherwise paginating with a marker drops
-            // or duplicates keys across pages.
-            objects.sort_by(|a, b| a.key.cmp(&b.key));
-            common_prefixes.sort();
-
-            // Apply marker / start-after / continuation-token filtering.
-            if !skip_marker.is_empty() {
-                objects.retain(|o| o.key.as_str() > skip_marker);
-                common_prefixes.retain(|p| p.as_str() > skip_marker);
-            }
-
-            // Merge keys + common prefixes into one lexicographic order and
-            // truncate the combined set at max_keys (S3 counts both toward
-            // max-keys and KeyCount). Track original indices so each group can
-            // be emitted in order.
-            let mut merged: Vec<(&str, bool, usize)> = Vec::new();
-            for (i, o) in objects.iter().enumerate() {
-                merged.push((o.key.as_str(), false, i));
-            }
-            for (i, p) in common_prefixes.iter().enumerate() {
-                merged.push((p.as_str(), true, i));
-            }
-            merged.sort_by(|a, b| a.0.cmp(b.0));
-
-            let total = merged.len();
-            let truncated = total > max_keys;
-            let shown = &merged[..total.min(max_keys)];
-            let next_marker = if truncated {
-                shown.last().map(|e| e.0.to_string())
-            } else {
-                None
+    let (snapshot_id, skip_marker) = if list_type == "2" && continuation_token.is_some() {
+        super::listing::decode_token(raw_marker)
+    } else {
+        (None, raw_marker)
+    };
+    let continuing = if list_type == "2" {
+        continuation_token.is_some()
+    } else {
+        !marker.is_empty()
+    };
+    let cached = continuing
+        .then(|| {
+            state
+                .listings
+                .get(snapshot_id, &prefix, delimiter.as_deref())
+        })
+        .flatten();
+    let snapshot = if let Some(snapshot) = cached {
+        snapshot
+    } else {
+        let (mut objects, mut common_prefixes) =
+            match share.list_objects(&prefix, delimiter.as_deref()).await {
+                Ok(listing) => listing,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
+                Err(e) => return io_to_s3_error(&e),
             };
-            let key_count = shown.len();
-            let shown_obj_idx: Vec<usize> = shown.iter().filter(|e| !e.1).map(|e| e.2).collect();
-            let shown_pref_idx: Vec<usize> = shown.iter().filter(|e| e.1).map(|e| e.2).collect();
+        // The prefix may not exist on the NAS yet even though a pending PUT
+        // beneath it has been acknowledged. Apply the same overlay in both cases.
+        overlay_pending(
+            state,
+            &prefix,
+            delimiter.as_deref(),
+            &mut objects,
+            &mut common_prefixes,
+        )
+        .await;
+        let snapshot = Arc::new(super::listing::Snapshot::new(
+            prefix.clone(),
+            delimiter.clone(),
+            objects,
+            common_prefixes,
+        ));
+        state.listings.insert(Arc::clone(&snapshot));
+        snapshot
+    };
+    let (shown, truncated) = snapshot.page(skip_marker, max_keys);
+    let next_marker = if truncated {
+        shown.last().map(|entry| entry.key())
+    } else {
+        None
+    };
+    let key_count = shown.len();
 
-            let mut w = XmlWriter::new();
-            w.declaration();
+    let mut w = XmlWriter::new();
+    w.declaration();
 
-            if list_type == "2" {
-                // ListObjectsV2
-                w.open_ns("ListBucketResult", S3_XMLNS);
-                w.element("Name", bucket);
-                w.element("Prefix", &prefix);
-                if let Some(d) = &delimiter {
-                    w.element("Delimiter", d);
-                }
-                w.element("MaxKeys", &max_keys.to_string());
-                if let Some(et) = &encoding_type {
-                    w.element("EncodingType", et);
-                }
-                w.element("KeyCount", &key_count.to_string());
-                w.element("IsTruncated", if truncated { "true" } else { "false" });
-                if let Some(ct) = &continuation_token {
-                    w.element("ContinuationToken", ct);
-                }
-                if let Some(ref nm) = next_marker {
-                    w.element("NextContinuationToken", nm);
-                }
-                if !start_after.is_empty() {
-                    w.element("StartAfter", &start_after);
-                }
-
-                for &oi in &shown_obj_idx {
-                    let obj = &objects[oi];
-                    w.open("Contents");
-                    w.element("Key", &obj.key);
-                    w.element("LastModified", &xml::epoch_to_iso8601(obj.last_modified));
-                    w.element("ETag", &format!("\"{}\"", obj.etag));
-                    w.element("Size", &obj.size.to_string());
-                    w.element("StorageClass", "STANDARD");
-                    if fetch_owner {
-                        w.open("Owner");
-                        w.element("ID", "spiceio");
-                        w.element("DisplayName", "spiceio");
-                        w.close("Owner");
-                    }
-                    w.close("Contents");
-                }
-            } else {
-                // ListObjectsV1
-                w.open_ns("ListBucketResult", S3_XMLNS);
-                w.element("Name", bucket);
-                w.element("Prefix", &prefix);
-                if !marker.is_empty() {
-                    w.element("Marker", &marker);
-                }
-                if let Some(d) = &delimiter {
-                    w.element("Delimiter", d);
-                }
-                w.element("MaxKeys", &max_keys.to_string());
-                if let Some(et) = &encoding_type {
-                    w.element("EncodingType", et);
-                }
-                w.element("IsTruncated", if truncated { "true" } else { "false" });
-                if let Some(ref nm) = next_marker {
-                    w.element("NextMarker", nm);
-                }
-
-                for &oi in &shown_obj_idx {
-                    let obj = &objects[oi];
-                    w.open("Contents");
-                    w.element("Key", &obj.key);
-                    w.element("LastModified", &xml::epoch_to_iso8601(obj.last_modified));
-                    w.element("ETag", &format!("\"{}\"", obj.etag));
-                    w.element("Size", &obj.size.to_string());
-                    w.open("Owner");
-                    w.element("ID", "spiceio");
-                    w.element("DisplayName", "spiceio");
-                    w.close("Owner");
-                    w.element("StorageClass", "STANDARD");
-                    w.close("Contents");
-                }
-            }
-
-            for &pi in &shown_pref_idx {
-                let cp = &common_prefixes[pi];
-                w.open("CommonPrefixes");
-                w.element("Prefix", cp);
-                w.close("CommonPrefixes");
-            }
-            w.close("ListBucketResult");
-            xml_response(StatusCode::OK, w.finish())
+    if list_type == "2" {
+        // ListObjectsV2
+        w.open_ns("ListBucketResult", S3_XMLNS);
+        w.element("Name", bucket);
+        w.element("Prefix", &prefix);
+        if let Some(d) = &delimiter {
+            w.element("Delimiter", d);
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let mut w = XmlWriter::new();
-            w.declaration();
-            w.open_ns("ListBucketResult", S3_XMLNS);
-            w.element("Name", bucket);
-            w.element("Prefix", &prefix);
-            w.element("MaxKeys", &max_keys.to_string());
-            w.element("KeyCount", "0");
-            w.element("IsTruncated", "false");
-            w.close("ListBucketResult");
-            xml_response(StatusCode::OK, w.finish())
+        w.element("MaxKeys", &max_keys.to_string());
+        if let Some(et) = &encoding_type {
+            w.element("EncodingType", et);
         }
-        Err(e) => io_to_s3_error(&e),
+        w.element("KeyCount", &key_count.to_string());
+        w.element("IsTruncated", if truncated { "true" } else { "false" });
+        if let Some(ct) = &continuation_token {
+            w.element("ContinuationToken", ct);
+        }
+        if let Some(nm) = next_marker {
+            w.element("NextContinuationToken", &snapshot.token(nm));
+        }
+        if !start_after.is_empty() {
+            w.element("StartAfter", &start_after);
+        }
+
+        for entry in shown {
+            let super::listing::ListEntry::Object(obj) = entry else {
+                continue;
+            };
+            w.open("Contents");
+            w.element("Key", &obj.key);
+            w.element("LastModified", &xml::epoch_to_iso8601(obj.last_modified));
+            w.element("ETag", &format!("\"{}\"", obj.etag));
+            w.element("Size", &obj.size.to_string());
+            w.element("StorageClass", "STANDARD");
+            if fetch_owner {
+                w.open("Owner");
+                w.element("ID", "spiceio");
+                w.element("DisplayName", "spiceio");
+                w.close("Owner");
+            }
+            w.close("Contents");
+        }
+    } else {
+        // ListObjectsV1
+        w.open_ns("ListBucketResult", S3_XMLNS);
+        w.element("Name", bucket);
+        w.element("Prefix", &prefix);
+        if !marker.is_empty() {
+            w.element("Marker", &marker);
+        }
+        if let Some(d) = &delimiter {
+            w.element("Delimiter", d);
+        }
+        w.element("MaxKeys", &max_keys.to_string());
+        if let Some(et) = &encoding_type {
+            w.element("EncodingType", et);
+        }
+        w.element("IsTruncated", if truncated { "true" } else { "false" });
+        if let Some(nm) = next_marker {
+            w.element("NextMarker", nm);
+        }
+
+        for entry in shown {
+            let super::listing::ListEntry::Object(obj) = entry else {
+                continue;
+            };
+            w.open("Contents");
+            w.element("Key", &obj.key);
+            w.element("LastModified", &xml::epoch_to_iso8601(obj.last_modified));
+            w.element("ETag", &format!("\"{}\"", obj.etag));
+            w.element("Size", &obj.size.to_string());
+            w.open("Owner");
+            w.element("ID", "spiceio");
+            w.element("DisplayName", "spiceio");
+            w.close("Owner");
+            w.element("StorageClass", "STANDARD");
+            w.close("Contents");
+        }
     }
+
+    for entry in shown {
+        let super::listing::ListEntry::Prefix(cp) = entry else {
+            continue;
+        };
+        w.open("CommonPrefixes");
+        w.element("Prefix", cp);
+        w.close("CommonPrefixes");
+    }
+    w.close("ListBucketResult");
+    xml_response(StatusCode::OK, w.finish())
 }
 
 // ── GetObject (streaming, with Range + Conditional) ─────────────────────────
@@ -829,42 +827,9 @@ async fn try_backendless_get(
     key: &str,
 ) -> Option<Response<SpiceioBody>> {
     let cache = &state.object_cache;
-    // A range read has to seek inside the object, which only the backend can
-    // do. It still has to go through the pending check below first: returning
-    // early here would send a range read of a just-acknowledged object to a NAS
-    // that does not have it yet, and answer 404 for an object the client was
-    // told it had written.
-    let is_range = hdrs.contains_key("range");
-
-    // ── Acknowledged-but-unwritten key ──────────────────────────────
-    // Write-back returned 200 for this object before the NAS had it, so the
-    // cache is its only authority right now. Revalidating would stat the
-    // *previous* version, or nothing at all, and answer a client with a body
-    // it has already been told was replaced.
-    let hit = if state.writeback.pending_meta(key).await.is_some() {
-        match cache.lookup_pending(key).await {
-            Some(hit) if !is_range => hit,
-            // A range read, or a body evicted from both tiers — neither is ours
-            // to answer. Wait for the flush (without a permit, since waiting is
-            // not backend work) and let the caller take the normal path against
-            // a backend that now has the object.
-            _ => {
-                state.writeback.flush_key(key, PENDING_FLUSH_TIMEOUT).await;
-                return None;
-            }
-        }
-    } else if is_range {
-        return None;
-    }
-    // ── Immutable-key fast path ─────────────────────────────────────
-    //
-    // Sound only because `immutable` asserts the key determines the content:
-    // in a content-addressed store like sccache the key *is* a hash of these
-    // bytes, so nothing can put different content under it and a revalidation
-    // has nothing to discover. What it gives up is noticing a backend-side
-    // delete — harmless for a cache, since the client asked for a content hash
-    // and receives exactly those bytes.
-    else if cache.immutable() {
+    let hit = if let Some(pending) = state.writeback.pending_object(key).await {
+        pending
+    } else if cache.immutable() {
         cache.lookup_key(key).await?
     } else {
         return None;
@@ -881,6 +846,31 @@ async fn try_backendless_get(
     ) {
         return Some(resp);
     }
+    if let Some(range) = get_header(hdrs, "range").and_then(parse_range) {
+        let size = hit.body.len() as u64;
+        let Some((start, end)) = range.resolve(size) else {
+            return Some(error_response(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "InvalidRange",
+                "The requested range is not satisfiable",
+            ));
+        };
+        return Some(
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("Content-Type", guess_content_type(key))
+                .header("Content-Length", (end - start + 1).to_string())
+                .header("Content-Range", format!("bytes {start}-{end}/{size}"))
+                .header("ETag", &etag)
+                .header("Last-Modified", xml::epoch_to_http_date(hit.last_modified))
+                .header("Accept-Ranges", "bytes")
+                .header("x-spiceio-cache", "HIT")
+                .body(SpiceioBody::full(
+                    hit.body.slice(start as usize..=end as usize),
+                ))
+                .unwrap(),
+        );
+    }
     Some(cached_get_response(
         &guess_content_type(key),
         hit.last_modified,
@@ -893,6 +883,7 @@ async fn handle_get_object(
     hdrs: &http::HeaderMap,
     state: &AppState,
     key: &str,
+    permit: ClientSlot,
 ) -> Response<SpiceioBody> {
     let share = &state.share;
     let cache = &state.object_cache;
@@ -1046,6 +1037,7 @@ async fn handle_get_object(
         &if_unmodified_since,
         cache,
         false,
+        permit,
     )
     .await
 }
@@ -1064,6 +1056,7 @@ async fn stream_get_object(
     if_unmodified_since: &Option<String>,
     cache: &Arc<ObjectCache>,
     conditionals_done: bool,
+    permit: ClientSlot,
 ) -> Response<SpiceioBody> {
     let meta = &handle.meta;
     let etag = format!("\"{}\"", meta.etag);
@@ -1101,7 +1094,8 @@ async fn stream_get_object(
     let cache_etag = meta.etag.clone();
     let cache_last_modified = meta.last_modified;
     let cache_key = key.to_string();
-    let may_fill_cache = no_range && file_size > 0 && file_size <= cache.max_object_bytes();
+    let fill = no_range.then(|| cache.reserve_fill(file_size)).flatten();
+    let may_fill_cache = fill.is_some();
     let cache_for_task = Arc::clone(cache);
 
     // Determine read range
@@ -1172,14 +1166,6 @@ async fn stream_get_object(
     let channel_cap = stream_channel_capacity(chunk_size);
     let (body, tx) = SpiceioBody::channel(channel_cap);
 
-    // Foreground demand for the whole stream, not just its headers. The
-    // request handler's own `ClientSlot` drops as soon as the response head is
-    // returned, but the task below goes on issuing pipelined SMB reads until
-    // EOF — the single largest thing a client can be waiting on. Without this
-    // the write-back flushers would see an idle backend mid-stream and start
-    // competing for the very connections feeding it.
-    let stream_activity = BackendActivity::new(&share.client_inflight());
-
     // Owned handles so the streaming task can transparently reconnect after a
     // mid-stream connection drop (see the resume loop below).
     let resume_share = share.clone();
@@ -1203,7 +1189,8 @@ async fn stream_get_object(
     tokio::spawn(async move {
         // Moved in, so it is released exactly when the stream ends — including
         // the error and client-hangup paths, which return early.
-        let _stream_activity = stream_activity;
+        let _permit = permit;
+        let _fill = fill;
         const MAX_GET_RESUMES: u32 = 16;
         const MAX_GET_REOPEN_TRIES: u32 = 12;
         let mut handle = handle;
@@ -1273,7 +1260,12 @@ async fn stream_get_object(
                 c
             } else {
                 let remaining = stream_end - offset;
-                match handle.read_pipeline(offset, chunk_size, remaining).await {
+                let read = tokio::select! {
+                    biased;
+                    _ = tx.closed() => { cache_ok = false; break 'outer; }
+                    read = handle.read_pipeline(offset, chunk_size, remaining) => read,
+                };
+                match read {
                     Ok(c) => c,
                     Err(e) if crate::smb::ops::is_reset(&e) && resumes < MAX_GET_RESUMES => {
                         resumes += 1;
@@ -1341,6 +1333,11 @@ async fn stream_get_object(
             let drain = async {
                 let mut local_offset = offset;
                 for chunk in chunks {
+                    let take = chunk.len().min((stream_end - local_offset) as usize);
+                    if take == 0 {
+                        break;
+                    }
+                    let chunk = chunk.slice(..take);
                     if let Some(ref mut buf) = cache_buf {
                         buf.extend_from_slice(&chunk);
                     }
@@ -1367,7 +1364,11 @@ async fn stream_get_object(
                 }
             };
 
-            let (drain_res, pref_res) = tokio::join!(drain, prefetch);
+            let (drain_res, pref_res) = tokio::select! {
+                biased;
+                _ = tx.closed() => { cache_ok = false; break 'outer; }
+                result = async { tokio::join!(drain, prefetch) } => result,
+            };
             match drain_res {
                 Ok(new_off) => {
                     offset = new_off;
@@ -1468,6 +1469,15 @@ async fn handle_put_object(
     state: &AppState,
     key: &str,
 ) -> Response<SpiceioBody> {
+    let Ok(_mutation) = state.writeback.begin_mutation(key).await else {
+        return service_unavailable("A previous write is still in progress; please retry.");
+    };
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
+
     let share = &state.share;
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
@@ -1485,21 +1495,23 @@ async fn handle_put_object(
                 "At least one of the preconditions you specified did not hold.",
             );
         }
-        // Check existence first
-        if share.head_object(key).await.is_ok() {
-            return error_response(
-                StatusCode::PRECONDITION_FAILED,
-                "PreconditionFailed",
-                "At least one of the preconditions you specified did not hold.",
-            );
+        match share.head_object(key).await {
+            Ok(_) => {
+                return error_response(
+                    StatusCode::PRECONDITION_FAILED,
+                    "PreconditionFailed",
+                    "At least one of the preconditions you specified did not hold.",
+                );
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return io_to_s3_error(&e),
         }
     }
 
     // ── Write-back: acknowledge from memory, reach the NAS later ────
     //
-    // The whole body has to be in hand for this: the cache answers every read
-    // of this key until the flush lands, so a body it cannot hold is a body
-    // nobody could serve. Within that bound the backend round trip is pure
+    // The whole body has to be in hand for this: the queue serves the pending
+    // generation directly until the flush lands. Within that bound the backend round trip is pure
     // latency for the client — see `writeback` for what the 200 promises.
     if state.writeback.enabled()
         && let Some(cl) = content_length
@@ -1507,7 +1519,7 @@ async fn handle_put_object(
     {
         let data = match collect_body(body, content_length).await {
             Ok(b) => b,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
         let now = crate::smb::ops::now_epoch_secs();
         // Provisional metadata, in the backend's own etag format: the NAS
@@ -1528,11 +1540,11 @@ async fn handle_put_object(
         // Refused — the queue is at its ceiling or shutdown has begun. Write
         // through synchronously with the body already collected, which is the
         // backpressure a backlogged backend is supposed to apply to clients.
-        // Retiring any older pending body first is what keeps its flush from
-        // landing on top of this write.
-        state.writeback.cancel(key).await;
+        // The mutation guard keeps the predecessor paused until publication.
         return match share.put_object_atomic(key, &data).await {
             Ok(meta) => {
+                state.writeback.cancel(key).await;
+                state.object_cache.forget(key).await;
                 state
                     .object_cache
                     .store(key, &meta.etag, meta.last_modified, data);
@@ -1548,12 +1560,7 @@ async fn handle_put_object(
         };
     }
 
-    // Every path below writes straight to the NAS, so a queued write-back for
-    // this key has to be retired first — flushing it afterwards would restore
-    // the body this request is replacing. Waits out a flush already in flight.
-    state.writeback.cancel(key).await;
-
-    // ── Fast path: collect small bodies and use compound write ──────
+    // ── Buffered path: publish small bodies through the WAL ─────────
     let max_write = share.compound_max_write_size() as u64;
 
     if let Some(cl) = content_length
@@ -1563,10 +1570,12 @@ async fn handle_put_object(
         // size cap and the Content-Length check apply here too.
         let data = match collect_body(body, content_length).await {
             Ok(b) => b,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         };
-        match share.put_object(key, &data).await {
+        match share.put_object_atomic(key, &data).await {
             Ok(meta) => {
+                state.writeback.cancel(key).await;
+                state.object_cache.forget(key).await;
                 // Write through rather than invalidate. The one thing about a
                 // cache client's future that is not a guess is that it will
                 // read back what it just wrote — sccache PUTs an object and
@@ -1662,6 +1671,9 @@ async fn handle_put_object(
         Err(e) => return io_to_s3_write_error(&e),
     };
 
+    state.writeback.cancel(key).await;
+    state.object_cache.forget(key).await;
+
     // Same write-through as the compound path. The size check is what makes it
     // safe to trust the buffer: a short read or a mid-stream abort would leave
     // it disagreeing with what was actually published.
@@ -1749,9 +1761,14 @@ async fn handle_copy_object(
             "A pending write to the copy source has not reached the backend yet; please retry.",
         );
     }
-    // The destination is replaced wholesale, so a write-back queued for it must
-    // be retired before it can land on top of the copy.
-    state.writeback.cancel(dest_key).await;
+    let Ok(_mutation) = state.writeback.begin_mutation(dest_key).await else {
+        return service_unavailable("A previous write is still in progress; please retry.");
+    };
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
 
     // Conditional copy headers
     let if_match = get_header(hdrs, X_AMZ_COPY_SOURCE_IF_MATCH).map(String::from);
@@ -1802,6 +1819,7 @@ async fn handle_copy_object(
 
     match share.copy_object(&src_key, dest_key).await {
         Ok(meta) => {
+            state.writeback.cancel(dest_key).await;
             state.object_cache.forget(dest_key).await;
             let mut w = XmlWriter::new();
             w.declaration();
@@ -1820,19 +1838,25 @@ async fn handle_copy_object(
 // ── DeleteObject ────────────────────────────────────────────────────────────
 
 async fn handle_delete_object(state: &AppState, key: &str) -> Response<SpiceioBody> {
-    // Ordered before the delete: cancelling a queued write-back drops it, and
-    // waiting out an in-flight one keeps its backend write from landing after
-    // the object is gone.
-    state.writeback.cancel(key).await;
+    let Ok(_mutation) = state.writeback.begin_mutation(key).await else {
+        return service_unavailable("A previous write is still in progress; please retry.");
+    };
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
     match state.share.delete_object(key).await {
         // DeleteObject is idempotent: 204 for a successful delete and for a
         // missing object. Other errors (access denied, I/O) must surface so a
         // client never assumes a still-present object was deleted.
         Ok(()) => {
+            state.writeback.cancel(key).await;
             state.object_cache.forget(key).await;
             ok_no_content()
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            state.writeback.cancel(key).await;
             state.object_cache.forget(key).await;
             ok_no_content()
         }
@@ -1970,9 +1994,28 @@ async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<Spicei
             w.close("Error");
             continue;
         }
-        state.writeback.cancel(key).await;
+        let Ok(_mutation) = state.writeback.begin_mutation(key).await else {
+            w.open("Error");
+            w.element("Key", key);
+            w.element("Code", "ServiceUnavailable");
+            w.element(
+                "Message",
+                "A previous write is still in progress; please retry.",
+            );
+            w.close("Error");
+            continue;
+        };
+        let Ok(_permit) = acquire_smb_slot(state).await else {
+            w.open("Error");
+            w.element("Key", key);
+            w.element("Code", "ServiceUnavailable");
+            w.element("Message", "The SMB backend is at capacity; please retry.");
+            w.close("Error");
+            continue;
+        };
         match share.delete_object(key).await {
             Ok(()) => {
+                state.writeback.cancel(key).await;
                 state.object_cache.forget(key).await;
                 if !quiet {
                     w.open("Deleted");
@@ -1981,6 +2024,7 @@ async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<Spicei
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                state.writeback.cancel(key).await;
                 state.object_cache.forget(key).await;
                 if !quiet {
                     w.open("Deleted");
@@ -2013,6 +2057,12 @@ async fn handle_create_multipart_upload(
     state: &AppState,
     key: &str,
 ) -> Response<SpiceioBody> {
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
+
     let _content_type = get_header(hdrs, "content-type");
     let upload_id = state.multipart.create(key).await;
 
@@ -2040,6 +2090,22 @@ async fn handle_upload_part(
     upload_id: &str,
     part_number: u32,
 ) -> Response<SpiceioBody> {
+    let Some(lock) = state.multipart.operation_lock(upload_id).await else {
+        return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", "");
+    };
+    let Ok(_upload_guard) = tokio::time::timeout(PENDING_FLUSH_TIMEOUT, lock.read_owned()).await
+    else {
+        return service_unavailable(
+            "Another operation on this upload is still in progress; please retry.",
+        );
+    };
+
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
+
     if part_number == 0 || part_number > 10000 {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -2065,7 +2131,7 @@ async fn handle_upload_part(
 
     let body = match collect_body(req_body, declared_len).await {
         Ok(b) => b,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // Hashing a multi-hundred-MB part is CPU-bound; run it on the blocking pool
     // so it doesn't tie up an async worker (which would starve other requests on
@@ -2088,7 +2154,7 @@ async fn handle_upload_part(
             }
         }
     };
-    let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
+    let temp_path = state.multipart.new_part_path(upload_id, part_number);
 
     if let Err(e) = state.share.write_temp(&temp_path, &body).await {
         return io_to_s3_write_error(&e);
@@ -2098,7 +2164,7 @@ async fn handle_upload_part(
     // uploading; `put_part` returns None then. Returning 200 anyway would
     // acknowledge a part that no completion can ever reference — surface
     // NoSuchUpload (per S3) and remove the orphaned temp file.
-    if state
+    match state
         .multipart
         .put_part(
             upload_id,
@@ -2108,14 +2174,17 @@ async fn handle_upload_part(
             temp_path.clone(),
         )
         .await
-        .is_none()
     {
-        state.share.delete_temp(&temp_path).await;
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "The specified upload does not exist.",
-        );
+        Some(Some(previous)) => state.share.delete_temp(&previous.temp_path).await,
+        Some(None) => {}
+        None => {
+            state.share.delete_temp(&temp_path).await;
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "The specified upload does not exist.",
+            );
+        }
     }
 
     Response::builder()
@@ -2139,7 +2208,7 @@ async fn finish_part_copy(
     // The upload may have been completed/aborted/reaped while the source was
     // being copied; acknowledging a part no completion can reference would be
     // a lie, so surface NoSuchUpload and drop the orphaned temp.
-    if state
+    match state
         .multipart
         .put_part(
             upload_id,
@@ -2149,14 +2218,17 @@ async fn finish_part_copy(
             temp_path.to_string(),
         )
         .await
-        .is_none()
     {
-        state.share.delete_temp(temp_path).await;
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "The specified upload does not exist.",
-        );
+        Some(Some(previous)) => state.share.delete_temp(&previous.temp_path).await,
+        Some(None) => {}
+        None => {
+            state.share.delete_temp(temp_path).await;
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "The specified upload does not exist.",
+            );
+        }
     }
 
     let mut w = XmlWriter::new();
@@ -2183,6 +2255,16 @@ async fn handle_upload_part_copy(
     upload_id: &str,
     part_number: u32,
 ) -> Response<SpiceioBody> {
+    let Some(lock) = state.multipart.operation_lock(upload_id).await else {
+        return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", "");
+    };
+    let Ok(_upload_guard) = tokio::time::timeout(PENDING_FLUSH_TIMEOUT, lock.read_owned()).await
+    else {
+        return service_unavailable(
+            "Another operation on this upload is still in progress; please retry.",
+        );
+    };
+
     if part_number == 0 || part_number > 10000 {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -2262,6 +2344,11 @@ async fn handle_upload_part_copy(
     // the whole source object into memory and only reject it afterward — a
     // client could omit the range to force buffering an arbitrarily large
     // object and OOM the proxy.
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
     let src_meta = match state.share.head_object(&src_key).await {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -2297,7 +2384,7 @@ async fn handle_upload_part_copy(
         );
     }
 
-    let temp_path = MultipartStore::temp_part_path(upload_id, part_number);
+    let temp_path = state.multipart.new_part_path(upload_id, part_number);
 
     // Server-side copy first: the NAS copies the range into the part file
     // itself, so nothing crosses this proxy. This is the dominant cost of
@@ -2305,8 +2392,8 @@ async fn handle_upload_part_copy(
     //
     // The part's ETag is then derived from its size and timestamp rather than
     // a content hash, because the content never passes through us. Both forms
-    // are opaque — the completion identifies parts by number, and integrity is
-    // enforced by the per-part size check in `assemble_parts` — but the ETag
+    // are opaque — completion validates both number and ETag, while the upload
+    // lock protects the immutable part paths through assembly — but the ETag
     // for a given part does depend on which path produced it.
     match state
         .share
@@ -2397,6 +2484,16 @@ async fn handle_complete_multipart_upload(
     key: &str,
     upload_id: &str,
 ) -> Response<SpiceioBody> {
+    let Some(lock) = state.multipart.operation_lock(upload_id).await else {
+        return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", "");
+    };
+    let Ok(_upload_guard) = tokio::time::timeout(PENDING_FLUSH_TIMEOUT, lock.write_owned()).await
+    else {
+        return service_unavailable(
+            "Another operation on this upload is still in progress; please retry.",
+        );
+    };
+
     let upload = match state.multipart.get(upload_id).await {
         Some(u) => u,
         None => {
@@ -2421,12 +2518,32 @@ async fn handle_complete_multipart_upload(
 
     // Parse the completion XML to get ordered parts
     let body_str = String::from_utf8_lossy(&body_bytes);
-    let part_numbers: Vec<u32> = xml::extract_sections(&body_str, "<Part>", "</Part>")
-        .iter()
-        .filter_map(|section| {
-            xml::extract_element(section, "PartNumber").and_then(|s| s.parse().ok())
-        })
-        .collect();
+    let sections = xml::extract_sections(&body_str, "<Part>", "</Part>");
+    let mut part_numbers = Vec::with_capacity(sections.len());
+    for section in sections {
+        let number =
+            xml::extract_element(section, "PartNumber").and_then(|s| s.trim().parse::<u32>().ok());
+        let etag = xml::extract_element(section, "ETag").map(xml::xml_decode);
+        let (Some(number), Some(etag)) = (number, etag) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidPart",
+                "Each part requires a PartNumber and ETag",
+            );
+        };
+        if !upload
+            .parts
+            .get(&number)
+            .is_some_and(|part| etag.trim().trim_matches('"') == part.etag.trim_matches('"'))
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidPart",
+                "A submitted part or ETag does not match the uploaded part",
+            );
+        }
+        part_numbers.push(number);
+    }
 
     // S3 rejects a completion naming zero parts; assembling it would quietly
     // produce an empty object.
@@ -2476,12 +2593,20 @@ async fn handle_complete_multipart_upload(
         .map(|p| (p.temp_path.as_str(), p.size))
         .collect();
 
-    state.writeback.cancel(key).await;
+    let Ok(_mutation) = state.writeback.begin_mutation(key).await else {
+        return service_unavailable("A previous write is still in progress; please retry.");
+    };
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
     let meta = match state.share.assemble_parts(key, &parts).await {
         Ok(m) => m,
         Err(e) => return io_to_s3_write_error(&e),
     };
 
+    state.writeback.cancel(key).await;
     state.object_cache.forget(key).await;
 
     // Only now remove the upload from the store
@@ -2512,9 +2637,33 @@ async fn handle_complete_multipart_upload(
 
 async fn handle_abort_multipart_upload(
     state: &AppState,
-    _key: &str,
+    key: &str,
     upload_id: &str,
 ) -> Response<SpiceioBody> {
+    let Some(lock) = state.multipart.operation_lock(upload_id).await else {
+        return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", "");
+    };
+    let Ok(_upload_guard) = tokio::time::timeout(PENDING_FLUSH_TIMEOUT, lock.write_owned()).await
+    else {
+        return service_unavailable(
+            "Another operation on this upload is still in progress; please retry.",
+        );
+    };
+
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
+
+    if !state
+        .multipart
+        .get(upload_id)
+        .await
+        .is_some_and(|u| u.key == key)
+    {
+        return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", "");
+    }
     let upload = match state.multipart.abort(upload_id).await {
         Some(u) => u,
         None => return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", ""),
@@ -3007,16 +3156,16 @@ const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
 async fn collect_body(
     mut body: Incoming,
     declared_len: Option<u64>,
-) -> Result<Bytes, Response<SpiceioBody>> {
+) -> Result<Bytes, Box<Response<SpiceioBody>>> {
     if let Some(declared) = declared_len
         && declared > MAX_BUFFERED_BODY as u64
     {
         // Knowable before a byte is read — no reason to buffer 256 MiB first.
-        return Err(error_response(
+        return Err(Box::new(error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "EntityTooLarge",
             "Request body exceeds the maximum buffered size",
-        ));
+        )));
     }
     // Size the buffer from the declared length so a large part does not walk
     // up through ~20 reallocations. Bounded, so a lying Content-Length cannot
@@ -3028,11 +3177,11 @@ async fn collect_body(
             Ok(f) => {
                 if let Ok(data) = f.into_data() {
                     if buf.len().saturating_add(data.len()) > MAX_BUFFERED_BODY {
-                        return Err(error_response(
+                        return Err(Box::new(error_response(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             "EntityTooLarge",
                             "Request body exceeds the maximum buffered size",
-                        ));
+                        )));
                     }
                     buf.extend_from_slice(&data);
                 }
@@ -3043,11 +3192,11 @@ async fn collect_body(
                 // multi-delete) silently proceed on a truncated request and
                 // return success. Surface it as an incomplete-body error.
                 crate::serr!("[spiceio] body collect error: {e}");
-                return Err(error_response(
+                return Err(Box::new(error_response(
                     StatusCode::BAD_REQUEST,
                     "IncompleteBody",
                     "The request body could not be read completely.",
-                ));
+                )));
             }
         }
     }
@@ -3058,11 +3207,11 @@ async fn collect_body(
             "[spiceio] request body was {} bytes, Content-Length said {declared}",
             buf.len()
         );
-        return Err(error_response(
+        return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "IncompleteBody",
             "The request body did not match the declared Content-Length.",
-        ));
+        )));
     }
     Ok(Bytes::from(buf))
 }
@@ -3419,5 +3568,403 @@ mod tests {
         // A chunk bigger than the entire budget still yields a 1-slot
         // channel, never 0 — the producer can always make progress.
         assert_eq!(stream_channel_capacity(16 * 1024 * 1024), 1);
+    }
+}
+
+#[cfg(test)]
+mod regression_router {
+    use super::*;
+    use crate::test_support::{error_reply, read_frame, state};
+
+    #[tokio::test]
+    async fn regression_listing_new_prefix_must_include_acknowledged_pending_key() {
+        let (state, mut server) = state().await;
+        assert!(
+            state
+                .writeback
+                .enqueue("new/key", "e", 1, Bytes::from_static(b"x"))
+                .await
+        );
+        let backend = tokio::spawn(async move {
+            let r = read_frame(&mut server).await;
+            error_reply(&mut server, &r, 0xC000003A).await;
+        });
+        let response = handle_list_objects(&state, "list-type=2&prefix=new%2F").await;
+        backend.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        println!("listing returned: {xml}");
+        assert!(
+            xml.contains("<Key>new/key</Key>"),
+            "successful PUT is missing from new-prefix listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_completion_must_reject_mismatched_part_etag_before_touching_backend() {
+        let (state, mut server) = state().await;
+        let id = state.multipart.create("dest").await;
+        state
+            .multipart
+            .put_part(&id, 1, 4, "actual-part-etag".into(), "part".into())
+            .await
+            .unwrap();
+        let backend = tokio::spawn(async move {
+            let r = read_frame(&mut server).await;
+            error_reply(&mut server, &r, 0xC0000022).await;
+        });
+        let payload=Bytes::from_static(b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>wrong-part-etag</ETag></Part></CompleteMultipartUpload>");
+        let response = handle_complete_multipart_upload(payload, &state, "dest", &id).await;
+        backend.abort();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        println!("mismatched ETag status={status}, body={:?}", body);
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "invalid part ETag reached SMB instead of being rejected"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("InvalidPart"));
+    }
+
+    #[tokio::test]
+    async fn regression_failed_copy_must_preserve_prior_acknowledged_destination() {
+        let (state, mut server) = state().await;
+        assert!(
+            state
+                .writeback
+                .enqueue("dest", "old", 1, Bytes::from_static(b"old"))
+                .await
+        );
+        let backend = tokio::spawn(async move {
+            let r = read_frame(&mut server).await;
+            error_reply(&mut server, &r, 0xC0000034).await;
+        });
+        let mut headers = http::HeaderMap::new();
+        headers.insert(X_AMZ_COPY_SOURCE, "/audit/missing".parse().unwrap());
+        let response = handle_copy_object(&headers, &state, "dest").await;
+        backend.await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        println!(
+            "pending destination after failed copy: {:?}",
+            state.writeback.pending_meta("dest").await
+        );
+        assert!(
+            state.writeback.pending_meta("dest").await.is_some(),
+            "failed copy erased previously acknowledged destination"
+        );
+    }
+}
+
+#[cfg(test)]
+mod regression_streaming {
+    use super::*;
+    use crate::smb::protocol::{Header, build_request};
+    use crate::test_support::{error_reply, read_frame, state};
+    use bytes::BufMut;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn regression_range_body_must_stop_at_requested_end() {
+        let (state, mut s) = state().await;
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut s).await;
+            let b = &request[64..];
+            let len = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+            let offset = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+            assert_eq!((offset, len), (1, 2));
+            let data = &b"abcdefgh"[offset..(offset + len).min(8)];
+            let mut h = Header::decode(&request).unwrap();
+            h.flags = 1;
+            let response = build_request(&h, |b| {
+                b.put_u16_le(17);
+                b.put_u8(80);
+                b.put_u8(0);
+                b.put_u32_le(data.len() as u32);
+                b.put_u32_le(0);
+                b.put_u32_le(0);
+                b.extend_from_slice(data);
+            });
+            s.write_all(&response).await.unwrap();
+            let close = read_frame(&mut s).await;
+            error_reply(&mut s, &close, 0).await;
+        });
+        let response = stream_get_object(
+            state.share.test_file("key", 8),
+            &state.share,
+            "key",
+            Some("bytes=1-2"),
+            &None,
+            &None,
+            &None,
+            &None,
+            &state.object_cache,
+            false,
+            acquire_smb_slot(&state).await.unwrap(),
+        )
+        .await;
+        assert_eq!(response.headers()["content-length"], "2");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        backend.await.unwrap();
+        println!("Content-Length=2, actual body={:?}", body);
+        assert_eq!(
+            body.as_ref(),
+            b"bc",
+            "range emits bytes beyond requested end"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_streaming_gets_must_keep_admission_until_body_finishes() {
+        let (state, _server) = state().await;
+        let limit = state.smb_slots.available_permits();
+        let mut bodies = Vec::new();
+        for _ in 0..limit {
+            let permit = acquire_smb_slot(&state).await.unwrap();
+            let response = stream_get_object(
+                state.share.test_file("key", 8 * 1024 * 1024),
+                &state.share,
+                "key",
+                None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &state.object_cache,
+                false,
+                permit,
+            )
+            .await;
+            bodies.push(response.into_body());
+        }
+        assert_eq!(state.smb_slots.available_permits(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), acquire_smb_slot(&state))
+                .await
+                .is_err()
+        );
+        drop(bodies);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.smb_slots.available_permits() != limit {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnects must release streaming admission");
+        assert_eq!(state.client_inflight.load(AtomicOrdering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod regression_pagination {
+    use super::*;
+    use crate::smb::protocol::{Command, Header, build_request};
+    use crate::test_support::{read_frame, state};
+    use bytes::BufMut;
+    use tokio::io::AsyncWriteExt;
+    #[tokio::test]
+    async fn regression_pagination_must_not_repeat_entire_backend_listing() {
+        let (state, mut s) = state().await;
+        let backend = tokio::spawn(async move {
+            let mut entries = Vec::new();
+            for i in 0..100 {
+                let name: Vec<u8> = format!("key-{i:03}")
+                    .encode_utf16()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect();
+                let size = (104 + name.len()).div_ceil(8) * 8;
+                let mut e = vec![0; size];
+                let next = if i == 99 { 0 } else { size as u32 };
+                e[0..4].copy_from_slice(&next.to_le_bytes());
+                e[40..48].copy_from_slice(&1u64.to_le_bytes());
+                e[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                e[104..104 + name.len()].copy_from_slice(&name);
+                entries.extend(e);
+            }
+            let mut listed = 0;
+            for _ in 0..4 {
+                let request = read_frame(&mut s).await;
+                let mut h = Header::decode(&request).unwrap();
+                h.flags = 1;
+                h.next_command = 0;
+                let body = if h.command == Command::Create as u16 {
+                    let mut b = vec![0; 88];
+                    b[0..2].copy_from_slice(&89u16.to_le_bytes());
+                    b[64..80].copy_from_slice(&[1; 16]);
+                    b
+                } else if h.command == Command::QueryDirectory as u16 {
+                    if request[67] & 1 != 0 {
+                        listed += 100;
+                        let mut b = bytes::BytesMut::new();
+                        b.put_u16_le(9);
+                        b.put_u16_le(72);
+                        b.put_u32_le(entries.len() as u32);
+                        b.extend_from_slice(&entries);
+                        b.to_vec()
+                    } else {
+                        h.status = 0x80000006;
+                        vec![0; 8]
+                    }
+                } else {
+                    vec![0; 60]
+                };
+                s.write_all(&build_request(&h, |b| b.extend_from_slice(&body)))
+                    .await
+                    .unwrap();
+            }
+            listed
+        });
+        for query in [
+            "list-type=2&max-keys=1",
+            "list-type=2&max-keys=1&continuation-token=key-000",
+        ] {
+            let response = handle_list_objects(&state, query).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let b = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&b).contains("<KeyCount>1</KeyCount>"));
+        }
+        let read_entries = backend.await.unwrap();
+        println!(
+            "2 one-key pages over 100 objects fetched {read_entries} backend directory entries"
+        );
+        assert!(
+            read_entries <= 100,
+            "each continuation page restarts a full tree walk before filtering the marker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod replacement_regressions {
+    use super::*;
+    use crate::test_support::{TempDir, error_reply, read_frame, state};
+
+    #[tokio::test]
+    async fn pending_get_and_range_ignore_an_old_spill_body_after_eviction() {
+        let (mut state, _server) = state().await;
+        let dir = TempDir::new("pending-http");
+        let spill =
+            Arc::new(super::super::spill::Spill::open(&dir.0, "test".into(), 1024, 1024).unwrap());
+        spill.put("key", "old", 1, b"old!", false).unwrap();
+        state.object_cache = Arc::new(ObjectCache::new(false, 4, 4, 1).with_spill(spill));
+        state
+            .writeback
+            .enqueue("key", "new", 2, Bytes::from_static(b"new!"))
+            .await;
+        state
+            .object_cache
+            .insert("key", "new", 2, Bytes::from_static(b"new!"));
+        state
+            .object_cache
+            .insert("other", "x", 3, Bytes::from_static(b"xxxx"));
+        let mut headers = http::HeaderMap::new();
+        let response = try_backendless_get(&headers, &state, "key").await.unwrap();
+        assert_eq!(response.headers()["etag"], "\"new\"");
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"new!"
+        );
+        headers.insert("range", "bytes=1-2".parse().unwrap());
+        let response = try_backendless_get(&headers, &state, "key").await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"ew"
+        );
+        headers.insert(IF_NONE_MATCH, "\"new\"".parse().unwrap());
+        assert_eq!(
+            try_backendless_get(&headers, &state, "key")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_retires_pending_bytes_only_after_backend_success() {
+        for (status, preserved) in [(0xC0000022, true), (0xC0000034, false)] {
+            let (state, mut server) = state().await;
+            state
+                .writeback
+                .enqueue("key", "old", 1, Bytes::from_static(b"old"))
+                .await;
+            let backend = tokio::spawn(async move {
+                let request = read_frame(&mut server).await;
+                error_reply(&mut server, &request, status).await;
+            });
+            let response = handle_delete_object(&state, "key").await;
+            backend.await.unwrap();
+            assert_eq!(
+                state.writeback.pending_object("key").await.is_some(),
+                preserved
+            );
+            assert_eq!(
+                response.status(),
+                if preserved {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::NO_CONTENT
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_waits_for_part_publication_before_checking_etags() {
+        let (state, _server) = state().await;
+        let state = Arc::new(state);
+        let id = state.multipart.create("key").await;
+        state
+            .multipart
+            .put_part(&id, 1, 4, "old".into(), "old-path".into())
+            .await
+            .unwrap();
+        let upload = state
+            .multipart
+            .operation_lock(&id)
+            .await
+            .unwrap()
+            .read_owned()
+            .await;
+        let complete = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                handle_complete_multipart_upload(Bytes::from_static(
+                b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>old</ETag></Part></CompleteMultipartUpload>"),
+                &state, "key", &id).await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!complete.is_finished());
+        state
+            .multipart
+            .put_part(&id, 1, 4, "new".into(), "new-path".into())
+            .await
+            .unwrap();
+        drop(upload);
+        let response = tokio::time::timeout(Duration::from_secs(1), complete)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .contains("InvalidPart")
+        );
     }
 }

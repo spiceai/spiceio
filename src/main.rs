@@ -272,6 +272,7 @@ async fn connect_share(
         bucket: bucket_name,
         region,
         multipart: MultipartStore::new(),
+        listings: Default::default(),
         smb_slots,
         object_cache,
         writeback,
@@ -586,6 +587,19 @@ async fn main() {
                                 dirty.len()
                             );
                             for d in dirty {
+                                let Ok(_mutation) = state.writeback.begin_mutation(&d.key).await
+                                else {
+                                    continue;
+                                };
+                                if state.writeback.pending_meta(&d.key).await.is_some()
+                                    || state.object_cache.spill_owns_dirty(&d.key)
+                                {
+                                    continue;
+                                }
+                                let Some(entry) = state.object_cache.spill_load_dirty(&d).await
+                                else {
+                                    continue;
+                                };
                                 // Re-enqueue when write-back is on; otherwise
                                 // write straight through. Either way the spill
                                 // entry is promoted (or left dirty to retry) by
@@ -594,24 +608,28 @@ async fn main() {
                                     .writeback
                                     .enqueue(
                                         &d.key,
-                                        &d.entry.etag,
-                                        d.entry.last_modified,
-                                        d.entry.body.clone(),
+                                        &entry.etag,
+                                        entry.last_modified,
+                                        entry.body.clone(),
                                     )
                                     .await;
                                 if queued {
                                     continue;
                                 }
-                                match state.share.put_object_atomic(&d.key, &d.entry.body).await {
+                                let Ok(_permit) = state.smb_slots.clone().acquire_owned().await
+                                else {
+                                    break;
+                                };
+                                match state.share.put_object_atomic(&d.key, &entry.body).await {
                                     Ok(meta) => {
                                         state
                                             .object_cache
                                             .spill_promote(
                                                 &d.key,
-                                                d.entry.body_sha,
+                                                entry.body_sha,
                                                 &meta.etag,
                                                 meta.last_modified,
-                                                &d.entry.body,
+                                                &entry.body,
                                             )
                                             .await;
                                     }

@@ -175,10 +175,13 @@ turns it off and restores a synchronous backend write per PUT.
 
 What is guaranteed:
 
-- **Reads see it.** GET and HEAD on a key with a pending write are served from
-  the cache without revalidating — a stat would report the previous version.
-- **Deletes order correctly.** DELETE cancels a queued write and waits out one
-  in flight, so a flush cannot resurrect a deleted object.
+- **Reads see it.** GET, range GET, and HEAD read the pending generation directly,
+  even if its memory-cache entry was evicted.
+- **Replacements preserve acknowledged data.** PUT, COPY, multipart completion,
+  and DELETE pause a pending predecessor until the backend operation succeeds.
+  Failed or cancelled replacements leave it queued for recovery and flushing.
+  Synchronous writes, including small objects, use a WAL temp and atomic rename;
+  this costs extra SMB round trips compared with overwriting a small file in place.
 - **Listings include it.** ListObjects overlays this instance's pending keys.
 - **Copies work.** CopyObject and UploadPartCopy flush the source first, since
   the NAS performs the copy itself and has to be able to open the source.
@@ -216,6 +219,42 @@ What is not:
   `SPICEIO_WRITE_BACK=0` exists for anything that is a system of record.
 - **Peer instances and other S3 clients do not see the object until it
   flushes**, except through the shared spill on the same machine.
+
+GET producers retain their admission permit until streaming ends. Cache-fill
+buffers share an additional budget equal to `SPICEIO_OBJECT_CACHE_BYTES`, so
+concurrent streams cannot each allocate an unrestricted fill buffer. Recovery
+scans dirty-entry metadata first, skips owned writes, and loads one body at a
+time before applying queue backpressure.
+
+Paginated listings reuse sorted snapshots, bounded to 64 MiB and 64 snapshots.
+Snapshots expire after five idle minutes. A new first-page request walks the
+backend afresh; an expired, evicted, or oversized snapshot is rebuilt and
+pagination resumes after the continuation's last key. Pending writes are included
+even when their prefix directory has not reached the NAS yet.
+
+### Cleaning the remote sccache store
+
+sccache 0.17 has no `clean` subcommand. The repository's `scripts/sccache`
+helper provides it for a spiceio endpoint, using S3 listing and batch deletion:
+
+```sh
+export SCCACHE_ENDPOINT=http://127.0.0.1:8333
+export SCCACHE_BUCKET=ai_platform_dev
+export SCCACHE_S3_KEY_PREFIX=sccache
+./scripts/sccache clean --older-than-days 10 --dry-run
+make test-sccache-clean
+```
+
+`make test-sccache-clean` runs the helper against the configured live instance
+and **deletes objects strictly older than ten days** under that cache directory
+prefix. It verifies that a fresh test object survives and that no objects older
+than the cleanup's fixed cutoff remain, then removes the test object. Age uses
+S3 `LastModified`, not last access. Empty prefixes are rejected. The helper
+walks individual directories and limits concurrent delete batches to four
+(`--concurrency` accepts 1–16). It requires Python 3 and does not restart the
+sccache server. The regular live sccache suite runs this check within its own
+test prefix; `make test-clean-unit` exercises age boundaries, pagination,
+prefix isolation, dry runs, and partial deletion errors without a NAS.
 
 ## Supported S3 operations
 

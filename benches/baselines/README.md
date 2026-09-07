@@ -3,6 +3,11 @@
 Reference runs for `make bench-sccache` and `make bench-sccache-build`. Compare
 a change against these numbers before claiming it helped.
 
+The [2026-09-07 correctness and retention comparison](20260907-correctness-retention/README.md)
+adds all functional suites and 1,272 measurements from three alternating
+before/after repetitions. It records zero request errors after the fixes and
+a 32.6% sustained mixed-throughput regression at concurrency 32.
+
 | | |
 | --- | --- |
 | current baseline | **2026-08-09**, v0.7.0 + write-back scheduling fixes |

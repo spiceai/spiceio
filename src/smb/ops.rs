@@ -1,11 +1,12 @@
 //! High-level SMB file operations used by the S3 layer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
+use tokio::sync::RwLock;
 
 use super::client::SmbClient;
 use super::pool::SmbPool;
@@ -42,6 +43,11 @@ pub struct ShareSession {
     /// directory per object — dominant cost for many small files under one
     /// prefix. Shared across clones of the session (one set per process).
     ensured_dirs: Arc<Mutex<HashSet<String>>>,
+    /// Readers may open concurrently, but not while a verified WAL replaces
+    /// their path. Some SMB servers expose a brief missing-name interval during
+    /// replacement. Only the open/stat is guarded; existing streams can drain
+    /// while publication waits for their backend handles to close.
+    publications: Arc<Mutex<HashMap<String, Weak<RwLock<()>>>>>,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -74,7 +80,21 @@ impl ShareSession {
             pool,
             cleanup_grace_ft: cleanup_grace_secs.saturating_mul(FILETIME_TICKS_PER_SEC),
             ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
+            publications: Arc::default(),
         })
+    }
+
+    fn publication(&self, smb_path: &str) -> Arc<RwLock<()>> {
+        let mut paths = self.publications.lock().unwrap_or_else(|e| e.into_inner());
+        if paths.len() >= 1024 {
+            paths.retain(|_, lock| lock.strong_count() > 0);
+        }
+        if let Some(lock) = paths.get(smb_path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(RwLock::new(()));
+        paths.insert(smb_path.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Reconnect any poisoned pool connections. Run periodically by a
@@ -141,6 +161,7 @@ impl ShareSession {
         max_read: u32,
     ) -> io::Result<(ObjectMeta, Bytes)> {
         let smb_path = to_smb_path(key);
+        let _publication = self.publication(&smb_path).read_owned().await;
         let (cr, data) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -163,6 +184,7 @@ impl ShareSession {
     /// Open a file for streaming reads. Returns a handle pinned to one connection.
     pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
         let smb_path = to_smb_path(key);
+        let _publication = self.publication(&smb_path).read_owned().await;
         // Resilient open: under heavy concurrent load on a degraded NAS the
         // create can hit a transient reset; retry on a fresh connection so the
         // initial open of a streaming GET isn't lost (the client may not retry).
@@ -448,20 +470,15 @@ impl ShareSession {
 
     /// Put object with no window in which the client's key holds a partial body.
     ///
-    /// Small bodies go out as one compound Create+Write+Close. Anything larger
-    /// goes through the WAL — write a temp, verify its length, rename — the
-    /// same path streaming PutObject uses, and the reason a failed write leaves
-    /// any existing object untouched instead of replacing it with a truncated
-    /// one (see `WalWriter::commit`).
+    /// Every body goes through the WAL: write a temp, verify its length, then
+    /// rename. A compound OverwriteIf+Write+Close is not atomic: CREATE can
+    /// truncate the previous object even when WRITE subsequently fails.
     ///
     /// This is what background writes must use. `put_object`'s large-file
     /// branch overwrites in place and deletes the destination if the write
     /// fails, which is defensible while a client is still waiting on the
     /// result and is not once the client has already been told it succeeded.
     pub async fn put_object_atomic(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
-        if data.len() <= self.pool.compound_max_write_size as usize {
-            return self.put_object(key, data).await;
-        }
         let mut wal = self.open_wal_write(key).await?;
         if let Err(e) = wal.write(data).await {
             wal.abort().await;
@@ -604,6 +621,7 @@ impl ShareSession {
     /// become a 503 that aborts the client's compile unit.
     pub async fn head_object(&self, key: &str) -> io::Result<ObjectMeta> {
         let smb_path = to_smb_path(key);
+        let _publication = self.publication(&smb_path).read_owned().await;
         let (cr, _) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -1449,6 +1467,7 @@ impl ShareSession {
     /// Head a file by raw SMB path (no S3 key conversion) — for callers that
     /// already hold an internal path, such as a multipart part temp file.
     pub async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
+        let _publication = self.publication(smb_path).read_owned().await;
         // Resilient stat: retry the one-shot compound probe on a transient reset
         // (fresh connection each attempt) so a HEAD — and the post-rename
         // metadata read in WAL commit — survives a degraded NAS. A genuine
@@ -2449,6 +2468,10 @@ impl WalWriter {
             )));
         }
 
+        // Keep opens/stats out of the server's replacement interval, including
+        // the final close. Existing streaming handles remain free to drain.
+        let _publication = share.publication(&self.final_path).write_owned().await;
+
         // The temp is verified — publish it. The rename retries on a transient
         // reset by reconnecting and re-opening the temp file (which still
         // exists until the rename completes), so a single PUT is not lost at
@@ -2471,7 +2494,17 @@ impl WalWriter {
                     // in between is not discovered until this rename. That is
                     // the second place a stale `ensured_dirs` entry surfaces.
                     let missing_path = e.kind() == io::ErrorKind::NotFound;
-                    if !share.retry_write_setup(&e, &[&self.final_path], attempt) {
+                    // MS-FSA FileRenameInformation permits ACCESS_DENIED when
+                    // the replacement target has an open stream. Retry this
+                    // operation within the existing budget, retaining the
+                    // original permission error if it never clears.
+                    let target_in_use = e.kind() == io::ErrorKind::PermissionDenied;
+                    let retry = if target_in_use {
+                        attempt < MAX_RESET_RETRIES
+                    } else {
+                        share.retry_write_setup(&e, &[&self.final_path], attempt)
+                    };
+                    if !retry {
                         break Err(e);
                     }
                     if missing_path {
@@ -2483,8 +2516,13 @@ impl WalWriter {
                             break Err(re);
                         }
                     }
-                    if is_busy(&e) {
+                    if is_busy(&e) || target_in_use {
                         busy_backoff(attempt).await;
+                        attempt += 1;
+                        // The connection and temp handle are still healthy.
+                        // Closing/reopening would add I/O without releasing the
+                        // destination's conflicting reader.
+                        continue;
                     }
                     attempt += 1;
                     // Reconnect and re-open the temp to retry. If the temp is
@@ -2656,6 +2694,39 @@ pub(crate) fn guess_content_type(key: &str) -> String {
         _ => "application/octet-stream",
     }
     .into()
+}
+
+#[cfg(test)]
+impl ShareSession {
+    pub(crate) fn test_from_pool(pool: Arc<SmbPool>) -> Self {
+        Self {
+            pool,
+            cleanup_grace_ft: 0,
+            ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
+            publications: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ShareSession {
+    pub(crate) fn test_file(&self, key: &str, size: u64) -> FileHandle {
+        let (client, tree_id) = self.pick();
+        FileHandle {
+            client,
+            pool: self.pool.clone(),
+            tree_id,
+            file_id: [1; 16],
+            meta: ObjectMeta {
+                size,
+                last_modified: 1,
+                etag: "e".into(),
+                content_type: guess_content_type(key),
+            },
+            file_size: size,
+            max_chunk: 65536,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3135,5 +3206,259 @@ mod tests {
         // Timestamp part should be a large number (nanoseconds)
         let ts: u128 = parts[0].parse().expect("timestamp should be numeric");
         assert!(ts > 1_000_000_000_000_000_000, "timestamp looks too small");
+    }
+}
+
+#[cfg(test)]
+mod regression_pipeline {
+    use super::*;
+    use crate::test_support::{pair, read_frame};
+    use bytes::BufMut;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn regression_short_pipelined_write_must_not_leave_unwritten_hole() {
+        let (c, mut s) = pair().await;
+        let pool = SmbPool::test_from_client(c.clone());
+        let expected: Vec<u8> = (0..131072).map(|i| (i % 251 + 1) as u8).collect();
+        let backend = tokio::spawn(async move {
+            let mut file = vec![0u8; 131072];
+            for round in 0..2 {
+                let count = 2;
+                let mut responses = Vec::new();
+                for i in 0..count {
+                    let request = read_frame(&mut s).await;
+                    let b = &request[64..];
+                    let data_offset = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
+                    let length = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+                    let written = if round == 0 && i == 0 {
+                        length / 2
+                    } else {
+                        length
+                    };
+                    println!(
+                        "SMB WRITE offset={offset}, requested={length}, acknowledged={written}"
+                    );
+                    file[offset..offset + written]
+                        .copy_from_slice(&request[data_offset..data_offset + written]);
+                    let mut h = Header::decode(&request).unwrap();
+                    h.flags = 1;
+                    responses.push(build_request(&h, |b| {
+                        b.put_u16_le(17);
+                        b.put_u16_le(0);
+                        b.put_u32_le(written as u32);
+                        b.put_u32_le(0);
+                        b.put_u32_le(0);
+                    }));
+                }
+                for r in responses.into_iter().rev() {
+                    s.write_all(&r).await.unwrap();
+                }
+            }
+            file
+        });
+        let mut wal = WalWriter {
+            client: c,
+            pool,
+            tree_id: 1,
+            file_id: [1; 16],
+            wal_path: "temp".into(),
+            final_path: "dest".into(),
+            buf: expected.clone(),
+            flush_cap: 131072,
+            offset: 0,
+            total_size: 131072,
+        };
+        wal.flush().await.unwrap();
+        let actual = backend.await.unwrap();
+        println!(
+            "WAL reports {} bytes flushed; backend size={}; unwritten zero bytes={}",
+            wal.offset,
+            actual.len(),
+            actual.iter().filter(|v| **v == 0).count()
+        );
+        assert!(
+            actual == expected,
+            "short count in earlier pipeline slot left a hole despite successful flush and correct file length"
+        );
+    }
+}
+
+#[cfg(test)]
+mod regression_publication {
+    use super::*;
+    use crate::test_support::{error_reply, pair, read_frame};
+    use bytes::{BufMut, BytesMut};
+    use std::future::Future;
+    use std::task::Poll;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    async fn stat_reply(server: &mut TcpStream, request: &[u8]) {
+        let mut create = Header::decode(request).unwrap();
+        assert_eq!(create.command, Command::Create as u16);
+        let mut close = Header::decode(&request[create.next_command as usize..]).unwrap();
+        let mut body = [0u8; 88];
+        body[..2].copy_from_slice(&89u16.to_le_bytes());
+        body[48..56].copy_from_slice(&4u64.to_le_bytes());
+        body[64..80].fill(1);
+        create.flags = 1;
+        create.status = 0;
+        create.next_command = 152;
+        close.flags = 1;
+        close.status = 0;
+        close.next_command = 0;
+        let mut response = BytesMut::new();
+        response.put_u32(152 + 64 + 60);
+        create.encode(&mut response);
+        response.extend_from_slice(&body);
+        close.encode(&mut response);
+        response.extend_from_slice(&[0; 60]);
+        server.write_all(&response).await.unwrap();
+    }
+
+    fn verified_wal(client: Arc<SmbClient>, pool: Arc<SmbPool>) -> WalWriter {
+        WalWriter {
+            client,
+            pool,
+            tree_id: 1,
+            file_id: [1; 16],
+            wal_path: "temp".into(),
+            final_path: "dest".into(),
+            buf: Vec::new(),
+            flush_cap: 65536,
+            offset: 4,
+            total_size: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_publication_retries_a_destination_reader_without_reopening_the_temp() {
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let share = ShareSession::test_from_pool(pool.clone());
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            stat_reply(&mut server, &request).await;
+            let rename = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&rename).unwrap().command,
+                Command::SetInfo as u16
+            );
+            error_reply(&mut server, &rename, 0xC0000022).await;
+            let retry = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&retry).unwrap().command,
+                Command::SetInfo as u16,
+                "a busy destination must not discard or reopen the verified temp"
+            );
+            error_reply(&mut server, &retry, 0).await;
+            let close = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&close).unwrap().command,
+                Command::Close as u16
+            );
+            error_reply(&mut server, &close, 0).await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            verified_wal(client, pool).commit(&share),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.size, 4);
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_publication_keeps_a_persistent_permission_failure_bounded() {
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let share = ShareSession::test_from_pool(pool.clone());
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            stat_reply(&mut server, &request).await;
+            for _ in 0..=MAX_RESET_RETRIES {
+                let rename = read_frame(&mut server).await;
+                assert_eq!(
+                    Header::decode(&rename).unwrap().command,
+                    Command::SetInfo as u16
+                );
+                error_reply(&mut server, &rename, 0xC0000022).await;
+            }
+            let close = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&close).unwrap().command,
+                Command::Close as u16
+            );
+            error_reply(&mut server, &close, 0).await;
+            let discard = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&discard).unwrap().command,
+                Command::Create as u16
+            );
+            error_reply(&mut server, &discard, 0xC0000034).await;
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(4),
+            verified_wal(client, pool).commit(&share),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_waits_until_publication_finishes_before_opening_the_name() {
+        let (client, mut server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client.clone()));
+        let publication = share.publication("dest").write_owned().await;
+        let head = share.head_object("dest");
+        tokio::pin!(head);
+        std::future::poll_fn(|cx| {
+            assert!(head.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            client.inflight(),
+            0,
+            "the missing-name interval must not reach SMB"
+        );
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            stat_reply(&mut server, &request).await;
+        });
+        drop(publication);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), head)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            4
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_missing_name_is_not_retried() {
+        let (client, mut server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            error_reply(&mut server, &request, 0xC0000034).await;
+        });
+        let error = tokio::time::timeout(Duration::from_secs(1), share.head_object("absent"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        backend.await.unwrap();
     }
 }

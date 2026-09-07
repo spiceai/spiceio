@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Maintenance helper for sccache objects stored through spiceio.
+
+This is a repository utility, separate from the upstream sccache compiler wrapper.
+"""
+
+import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import base64
+import datetime as dt
+import hashlib
+import http.client
+import json
+import os
+import sys
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+NS = "http://s3.amazonaws.com/doc/2006-03-01/"
+ET.register_namespace("", NS)
+
+
+def timestamp(value):
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("S3 returned a timestamp without a timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+class S3:
+    def __init__(self, endpoint, bucket):
+        url = urllib.parse.urlsplit(endpoint)
+        if (url.scheme not in ("http", "https") or not url.hostname
+                or url.username or url.password or url.query or url.fragment
+                or url.path not in ("", "/")):
+            raise ValueError("endpoint must be an HTTP(S) origin")
+        if not bucket or "/" in bucket or bucket in (".", ".."):
+            raise ValueError("a single bucket name is required")
+        connection = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+        self.endpoint, self.bucket = endpoint, bucket
+        self.connection = connection(url.hostname, url.port, timeout=180)
+        self.root = "/" + urllib.parse.quote(bucket, safe="")
+
+    def request(self, method, key="", query=None, body=None):
+        path = self.root + ("/" + urllib.parse.quote(key, safe="/") if key else "")
+        if query:
+            path += "?" + urllib.parse.urlencode(query)
+        headers = {}
+        if body is not None:
+            headers["Content-Type"] = "application/xml" if method == "POST" else "application/octet-stream"
+            headers["Content-MD5"] = base64.b64encode(hashlib.md5(body, usedforsecurity=False).digest()).decode()
+        for attempt in range(3):
+            try:
+                self.connection.request(method, path, body=body, headers=headers)
+                response = self.connection.getresponse()
+                data = response.read()
+            except (OSError, http.client.HTTPException):
+                self.connection.close()
+                if method != "GET" or attempt == 2:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            if 200 <= response.status < 300:
+                return data
+            if method == "GET" and response.status in (500, 502, 503, 504) and attempt < 2:
+                self.connection.close()
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"{method} failed with HTTP {response.status}: {data[:512]!r}")
+        raise RuntimeError("S3 request exhausted retries")
+
+    def pages(self, prefix):
+        # Walk one directory at a time. This also works efficiently against
+        # older spiceio versions that restart a recursive walk on every page.
+        directories = [prefix]
+        visited = set()
+        while directories:
+            directory = directories.pop()
+            if directory in visited:
+                continue
+            visited.add(directory)
+            token = None
+            seen = set()
+            while True:
+                query = {"list-type": "2", "prefix": directory, "delimiter": "/", "max-keys": "1000"}
+                if token is not None:
+                    query["continuation-token"] = token
+                root = ET.fromstring(self.request("GET", query=query))
+                if root.tag != f"{{{NS}}}ListBucketResult":
+                    raise RuntimeError("S3 did not return a listing")
+                objects = []
+                for obj in root.findall(f"{{{NS}}}Contents"):
+                    key = obj.findtext(f"{{{NS}}}Key")
+                    if not key or not key.startswith(directory):
+                        raise RuntimeError("listing returned a key outside the requested cache prefix")
+                    objects.append({
+                        "key": key,
+                        "modified": timestamp(obj.findtext(f"{{{NS}}}LastModified", "")),
+                        "size": int(obj.findtext(f"{{{NS}}}Size", "0")),
+                    })
+                for common in root.findall(f"{{{NS}}}CommonPrefixes"):
+                    child = common.findtext(f"{{{NS}}}Prefix", "")
+                    if not child.startswith(directory) or len(child) <= len(directory) or not child.endswith("/"):
+                        raise RuntimeError("listing returned an invalid child prefix")
+                    directories.append(child)
+                truncated = root.findtext(f"{{{NS}}}IsTruncated")
+                if truncated not in ("true", "false"):
+                    raise RuntimeError("listing omitted a valid IsTruncated value")
+                next_token = root.findtext(f"{{{NS}}}NextContinuationToken")
+                if truncated == "true" and (not next_token or next_token in seen):
+                    raise RuntimeError("listing did not advance its continuation token")
+                # Capture the cursor before deleting anything from this page.
+                yield objects
+                if truncated == "false":
+                    break
+                seen.add(next_token)
+                token = next_token
+
+    def delete(self, keys):
+        if not keys:
+            return
+        if len(keys) > 1000:
+            raise ValueError("S3 batch delete is limited to 1000 objects")
+        pending = list(keys)
+        transient = {"InternalError", "ServiceUnavailable", "SlowDown", "RequestTimeout"}
+        for attempt in range(3):
+            root = ET.Element(f"{{{NS}}}Delete")
+            for key in pending:
+                ET.SubElement(ET.SubElement(root, f"{{{NS}}}Object"), f"{{{NS}}}Key").text = key
+            response = ET.fromstring(self.request("POST", query={"delete": ""}, body=ET.tostring(root)))
+            errors = response.findall(f"{{{NS}}}Error")
+            failed = [e.findtext(f"{{{NS}}}Key") for e in errors]
+            deleted = [e.findtext(f"{{{NS}}}Key") for e in response.findall(f"{{{NS}}}Deleted")]
+            acknowledged = failed + deleted
+            if any(key is None for key in acknowledged) or sorted(acknowledged) != sorted(pending):
+                raise RuntimeError("S3 did not acknowledge every requested deletion")
+            if not errors:
+                return
+            codes = [e.findtext(f"{{{NS}}}Code", "Unknown") for e in errors]
+            if attempt == 2 or any(code not in transient for code in codes):
+                detail = errors[0].findtext(f"{{{NS}}}Message", "")[:180]
+                raise RuntimeError(f"S3 rejected {len(errors)} object deletion(s): {', '.join(codes)} {detail}")
+            # Retry only failures: successful keys are already retired. The
+            # original cutoff and key selection stay fixed through retries.
+            pending = failed
+            time.sleep(0.2 * (attempt + 1))
+
+    def delete_batch(self, keys):
+        # A separate connection per in-flight batch; HTTPConnection is not
+        # thread-safe. The executor bounds both sockets and outstanding keys.
+        client = S3(self.endpoint, self.bucket)
+        try:
+            client.delete(keys)
+            return len(keys)
+        finally:
+            client.close()
+
+    def close(self):
+        self.connection.close()
+
+
+def cache_prefix(value):
+    prefix = value.rstrip("/")
+    if not prefix or any(part in ("", ".", "..") for part in prefix.split("/")) or "\\" in prefix:
+        raise ValueError("a nonempty cache directory prefix is required")
+    return prefix + "/"
+
+
+def clean(client, prefix, days, dry_run=False, now=None, progress=None, concurrency=4):
+    if days < 1:
+        raise ValueError("older-than-days must be at least 1")
+    if not 1 <= concurrency <= 16:
+        raise ValueError("concurrency must be between 1 and 16")
+    prefix = cache_prefix(prefix)
+    cutoff = (now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(days=days)
+    summary = {"cutoff": cutoff.isoformat(), "prefix": prefix, "pages": 0,
+               "examined": 0, "eligible": 0, "eligible_bytes": 0, "deleted": 0, "kept": 0}
+    pending = deque()
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        for objects in client.pages(prefix):
+            old = [obj for obj in objects if obj["modified"] < cutoff]
+            summary["pages"] += 1
+            summary["examined"] += len(objects)
+            summary["eligible"] += len(old)
+            summary["eligible_bytes"] += sum(obj["size"] for obj in old)
+            summary["kept"] += len(objects) - len(old)
+            if not dry_run and old:
+                pending.append(executor.submit(client.delete_batch, [obj["key"] for obj in old]))
+                if len(pending) >= concurrency:
+                    summary["deleted"] += pending.popleft().result()
+            if progress:
+                progress(summary)
+        while pending:
+            summary["deleted"] += pending.popleft().result()
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("clean", help="remove remote cache objects older than the retention period")
+    command.add_argument("--endpoint", default=os.getenv("SCCACHE_ENDPOINT", "http://127.0.0.1:8333"))
+    command.add_argument("--bucket", default=os.getenv("SCCACHE_BUCKET"))
+    command.add_argument("--prefix", default=os.getenv("SCCACHE_S3_KEY_PREFIX", "sccache"))
+    command.add_argument("--older-than-days", type=int, default=10)
+    command.add_argument("--dry-run", action="store_true")
+    command.add_argument("--concurrency", type=int, default=4)
+    args = parser.parse_args()
+    client = None
+    try:
+        client = S3(args.endpoint, args.bucket)
+        result = clean(client, args.prefix, args.older_than_days, args.dry_run,
+                       progress=lambda s: print(f"[clean] page {s['pages']}: {s['examined']} examined, "
+                                                f"{s['eligible']} older than cutoff, {s['deleted']} deleted", file=sys.stderr),
+                       concurrency=args.concurrency)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (OSError, ValueError, RuntimeError, ET.ParseError, http.client.HTTPException) as error:
+        print(f"sccache clean: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if client:
+            client.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
