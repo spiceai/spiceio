@@ -1,0 +1,576 @@
+{
+  "identities": {
+    "trunk-1g": {
+      "binary_sha256": "d242a7585bde3d077c8ab5913f2e018d0a81b501246c61ea26567d81da2c6382",
+      "queue_bytes": 1073741824,
+      "application_commit": "2ad4a874ff4813f8190117bc645af0dbb90b708c"
+    },
+    "published-1g": {
+      "binary_sha256": "55dd3859a48303889ceffaa98dcd21e3f2097580252b90f75280e515ada916fa",
+      "queue_bytes": 1073741824,
+      "application_commit": "b6d2eec0d8dae6774f74bd0d7a5b0323e5c3b557"
+    },
+    "optimized-1g": {
+      "binary_sha256": "9bb6e8c1685c0f8875885df09fafa377cab1655eaa04472b662a57d4b6c386f2",
+      "queue_bytes": 1073741824,
+      "application_commit": "a43725d8f70a1adecfb0b59b4e8d9b6beed768da"
+    },
+    "optimized-2g": {
+      "binary_sha256": "9bb6e8c1685c0f8875885df09fafa377cab1655eaa04472b662a57d4b6c386f2",
+      "queue_bytes": 2147483648,
+      "application_commit": "a43725d8f70a1adecfb0b59b4e8d9b6beed768da"
+    },
+    "loadgen": {
+      "binary_sha256": "697399885308b26b3155631d14c417f4bf7d22d9a0571840959d10f9f395dd33",
+      "source_commit": "92fca523"
+    }
+  },
+  "host": {
+    "model": "Mac15,8",
+    "logical_cpus": 16,
+    "memory_gib": 128,
+    "os": "macOS 26.6.2"
+  },
+  "method": {
+    "repetitions": 3,
+    "order": "Rotate configuration order each repetition",
+    "pool_connections": 32,
+    "fd_soft_limit": 8192,
+    "etag_validation": true,
+    "immutable_objects": false,
+    "synchronous": {
+      "concurrency": [
+        8,
+        32
+      ],
+      "objects": 512,
+      "ops_per_worker": 24,
+      "mode": "cached"
+    },
+    "sustained": {
+      "concurrency": [
+        8,
+        32
+      ],
+      "objects": 4096,
+      "working_set_bytes": 2451865600,
+      "ops_per_worker": 512,
+      "mode": "writeback"
+    },
+    "phases": [
+      "put",
+      "get",
+      "head-hit",
+      "head-miss",
+      "mixed"
+    ],
+    "mixed": {
+      "get_hit": 0.7,
+      "get_miss": 0.2,
+      "put": 0.1
+    },
+    "default_queue_bytes": 1073741824,
+    "experimental_queue_bytes": 2147483648,
+    "interpretation": "Median difference below the larger observed min-max spread is inconclusive; not a significance test"
+  },
+  "validation": {
+    "rust_tests": 376,
+    "python_tests": 6,
+    "criterion_smoke_cases": 54,
+    "make_ci_exit_code": 0,
+    "all_targets_exit_code": 0,
+    "release_build_exit_code": 0,
+    "live_retention_exit_code": 0,
+    "live_suites": [
+      "sccache",
+      "extended",
+      "write-back",
+      "concurrent stress"
+    ]
+  },
+  "coverage": {
+    "runs": 21,
+    "measurements": 210,
+    "requests": 1286400,
+    "request_errors": 0,
+    "by_configuration": {
+      "trunk-1g": {
+        "requests": 326400,
+        "errors": 0
+      },
+      "published-1g": {
+        "requests": 326400,
+        "errors": 0
+      },
+      "optimized-1g": {
+        "requests": 326400,
+        "errors": 0
+      },
+      "optimized-2g": {
+        "requests": 307200,
+        "errors": 0
+      }
+    }
+  },
+  "runs": [
+    {
+      "name": "synchronous-r1-trunk-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "trunk-1g",
+      "rep": 1,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:39:01.716334+00:00",
+      "exit_code": 0,
+      "seconds": 22.448,
+      "max_proxy_rss_kib": 1000560,
+      "max_load_1m": 4.71484375,
+      "initial_audit_error": "dict() got multiple values for keyword argument 'concurrency'",
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r1-published-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "published-1g",
+      "rep": 1,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:40:04.870740+00:00",
+      "exit_code": 0,
+      "seconds": 22.446,
+      "max_proxy_rss_kib": 962128,
+      "max_load_1m": 4.47265625,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r1-optimized-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "optimized-1g",
+      "rep": 1,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:40:27.332347+00:00",
+      "exit_code": 0,
+      "seconds": 22.464,
+      "max_proxy_rss_kib": 867984,
+      "max_load_1m": 4.2744140625,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r2-published-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "published-1g",
+      "rep": 2,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:40:49.820513+00:00",
+      "exit_code": 0,
+      "seconds": 24.548,
+      "max_proxy_rss_kib": 849056,
+      "max_load_1m": 3.689453125,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r2-optimized-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "optimized-1g",
+      "rep": 2,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:41:14.378690+00:00",
+      "exit_code": 0,
+      "seconds": 22.482,
+      "max_proxy_rss_kib": 876592,
+      "max_load_1m": 3.6416015625,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r2-trunk-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "trunk-1g",
+      "rep": 2,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:41:36.871585+00:00",
+      "exit_code": 0,
+      "seconds": 22.483,
+      "max_proxy_rss_kib": 1000256,
+      "max_load_1m": 3.7841796875,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r3-optimized-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "optimized-1g",
+      "rep": 3,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:41:59.382981+00:00",
+      "exit_code": 0,
+      "seconds": 24.588,
+      "max_proxy_rss_kib": 883568,
+      "max_load_1m": 4.87060546875,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r3-trunk-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "trunk-1g",
+      "rep": 3,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:42:23.987320+00:00",
+      "exit_code": 0,
+      "seconds": 22.463,
+      "max_proxy_rss_kib": 835968,
+      "max_load_1m": 4.84326171875,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "synchronous-r3-published-1g",
+      "family": "synchronous",
+      "mode": "cached",
+      "arm": "published-1g",
+      "rep": 3,
+      "objects": 512,
+      "ops_per_worker": 24,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:42:46.471131+00:00",
+      "exit_code": 0,
+      "seconds": 24.545,
+      "max_proxy_rss_kib": 889168,
+      "max_load_1m": 3.8994140625,
+      "request_errors": 0,
+      "writeback_stats": []
+    },
+    {
+      "name": "sustained-r1-trunk-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "trunk-1g",
+      "rep": 1,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:43:11.044844+00:00",
+      "exit_code": 0,
+      "seconds": 132.774,
+      "max_proxy_rss_kib": 3281648,
+      "max_load_1m": 5.83056640625,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18775,
+          "flushed": 5238,
+          "coalesced": 13537,
+          "fallbacks": 3752,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r1-published-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "published-1g",
+      "rep": 1,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:45:23.830042+00:00",
+      "exit_code": 0,
+      "seconds": 134.786,
+      "max_proxy_rss_kib": 3289760,
+      "max_load_1m": 6.279296875,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18625,
+          "flushed": 4403,
+          "coalesced": 14222,
+          "fallbacks": 3902,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r1-optimized-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "optimized-1g",
+      "rep": 1,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:47:38.639844+00:00",
+      "exit_code": 0,
+      "seconds": 132.751,
+      "max_proxy_rss_kib": 3307088,
+      "max_load_1m": 5.27490234375,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18480,
+          "flushed": 4662,
+          "coalesced": 13818,
+          "fallbacks": 4047,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r1-optimized-2g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "optimized-2g",
+      "rep": 1,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 2147483648,
+      "started_at": "2026-09-07T22:49:51.401508+00:00",
+      "exit_code": 0,
+      "seconds": 71.485,
+      "max_proxy_rss_kib": 3422352,
+      "max_load_1m": 4.48681640625,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 21725,
+          "flushed": 4203,
+          "coalesced": 17522,
+          "fallbacks": 802,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r2-published-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "published-1g",
+      "rep": 2,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:51:02.899759+00:00",
+      "exit_code": 0,
+      "seconds": 134.73,
+      "max_proxy_rss_kib": 3231520,
+      "max_load_1m": 4.73291015625,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18348,
+          "flushed": 4399,
+          "coalesced": 13949,
+          "fallbacks": 4179,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r2-optimized-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "optimized-1g",
+      "rep": 2,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:53:17.642975+00:00",
+      "exit_code": 0,
+      "seconds": 132.724,
+      "max_proxy_rss_kib": 3202608,
+      "max_load_1m": 4.09765625,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18688,
+          "flushed": 4711,
+          "coalesced": 13977,
+          "fallbacks": 3839,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r2-optimized-2g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "optimized-2g",
+      "rep": 2,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 2147483648,
+      "started_at": "2026-09-07T22:55:30.377142+00:00",
+      "exit_code": 0,
+      "seconds": 71.531,
+      "max_proxy_rss_kib": 3672016,
+      "max_load_1m": 5.29052734375,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 21766,
+          "flushed": 4088,
+          "coalesced": 17678,
+          "fallbacks": 761,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r2-trunk-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "trunk-1g",
+      "rep": 2,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:56:41.924037+00:00",
+      "exit_code": 0,
+      "seconds": 132.882,
+      "max_proxy_rss_kib": 3370160,
+      "max_load_1m": 5.814453125,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18649,
+          "flushed": 5198,
+          "coalesced": 13451,
+          "fallbacks": 3878,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r3-optimized-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "optimized-1g",
+      "rep": 3,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T22:58:54.835798+00:00",
+      "exit_code": 0,
+      "seconds": 130.79,
+      "max_proxy_rss_kib": 3313488,
+      "max_load_1m": 5.447265625,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18557,
+          "flushed": 4694,
+          "coalesced": 13863,
+          "fallbacks": 3970,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r3-optimized-2g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "optimized-2g",
+      "rep": 3,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 2147483648,
+      "started_at": "2026-09-07T23:01:05.648141+00:00",
+      "exit_code": 0,
+      "seconds": 67.417,
+      "max_proxy_rss_kib": 3636704,
+      "max_load_1m": 5.05029296875,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 21780,
+          "flushed": 3981,
+          "coalesced": 17799,
+          "fallbacks": 747,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r3-trunk-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "trunk-1g",
+      "rep": 3,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T23:02:13.093686+00:00",
+      "exit_code": 0,
+      "seconds": 128.635,
+      "max_proxy_rss_kib": 3237088,
+      "max_load_1m": 4.15087890625,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18836,
+          "flushed": 5451,
+          "coalesced": 13385,
+          "fallbacks": 3691,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "sustained-r3-published-1g",
+      "family": "sustained",
+      "mode": "writeback",
+      "arm": "published-1g",
+      "rep": 3,
+      "objects": 4096,
+      "ops_per_worker": 512,
+      "queue_bytes": 1073741824,
+      "started_at": "2026-09-07T23:04:21.745674+00:00",
+      "exit_code": 0,
+      "seconds": 130.823,
+      "max_proxy_rss_kib": 3301472,
+      "max_load_1m": 6.5654296875,
+      "request_errors": 0,
+      "writeback_stats": [
+        {
+          "accepted": 18481,
+          "flushed": 4341,
+          "coalesced": 14140,
+          "fallbacks": 4046,
+          "retries": 0
+        }
+      ]
+    }
+  ],
+  "cleanup": {
+    "prefixes_verified_empty": 21,
+    "residual_objects_deleted": 0,
+    "installed_service_changed": false
+  }
+}
