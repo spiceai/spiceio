@@ -1717,10 +1717,7 @@ impl SmbClient {
                 resp_hdr.status,
                 new_path
             );
-            return Err(io::Error::other(format!(
-                "rename failed: status=0x{:08X} -> {}",
-                resp_hdr.status, new_path
-            )));
+            return Err(smb_status_to_io_error(resp_hdr.status, new_path));
         }
         Ok(())
     }
