@@ -26,6 +26,7 @@ pub enum Command {
     Ioctl = 0x000B,
     Echo = 0x000D,
     QueryDirectory = 0x000E,
+    QueryInfo = 0x0010,
     SetInfo = 0x0011,
 }
 
@@ -958,6 +959,78 @@ pub fn decode_close_response(body: &[u8]) -> Option<CloseResponse> {
         last_write_time,
         file_size,
     })
+}
+
+/// Query FileNetworkOpenInformation on an existing handle (MS-SMB2 2.2.37).
+/// Unlike CLOSE post-query attributes, this request requires the server to
+/// return the file's size and timestamps without releasing the writer's lock.
+pub fn encode_query_file_metadata(buf: &mut BytesMut, file_id: &[u8; 16]) {
+    buf.put_u16_le(41);
+    buf.put_u8(1); // SMB2_0_INFO_FILE
+    buf.put_u8(34); // FileNetworkOpenInformation
+    buf.put_u32_le(56); // OutputBufferLength
+    buf.put_u16_le(0); // InputBufferOffset
+    buf.put_u16_le(0); // Reserved
+    buf.put_u32_le(0); // InputBufferLength
+    buf.put_u32_le(0); // AdditionalInformation
+    buf.put_u32_le(0); // Flags
+    buf.put_slice(file_id);
+}
+
+/// Decode QUERY_INFO's bounded output buffer and FileNetworkOpenInformation
+/// (MS-SMB2 2.2.38, MS-FSCC 2.4.34). Never fabricate metadata for a short reply.
+pub fn decode_query_file_metadata(body: &[u8]) -> Option<CloseResponse> {
+    if body.len() < 8 || u16::from_le_bytes(body[..2].try_into().ok()?) != 9 {
+        return None;
+    }
+    let offset = u16::from_le_bytes(body[2..4].try_into().ok()?) as usize;
+    let len = u32::from_le_bytes(body[4..8].try_into().ok()?) as usize;
+    let start = offset.checked_sub(SMB2_HEADER_SIZE)?;
+    if start < 8 || len < 56 {
+        return None;
+    }
+    let data = body.get(start..start.checked_add(len)?)?;
+    let size = i64::from_le_bytes(data[40..48].try_into().ok()?);
+    Some(CloseResponse {
+        last_write_time: u64::from_le_bytes(data[16..24].try_into().ok()?),
+        file_size: u64::try_from(size).ok()?,
+    })
+}
+
+#[cfg(test)]
+mod query_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn query_metadata_rejects_invalid_output_ranges_and_negative_sizes() {
+        let mut body = vec![0; 64];
+        body[..2].copy_from_slice(&9u16.to_le_bytes());
+        body[2..4].copy_from_slice(&72u16.to_le_bytes());
+        body[4..8].copy_from_slice(&56u32.to_le_bytes());
+        body[24..32].copy_from_slice(&123u64.to_le_bytes());
+        body[48..56].copy_from_slice(&456u64.to_le_bytes());
+        let meta = decode_query_file_metadata(&body).unwrap();
+        assert_eq!(meta.last_write_time, 123);
+        assert_eq!(meta.file_size, 456);
+        for n in 0..body.len() {
+            assert!(decode_query_file_metadata(&body[..n]).is_none());
+        }
+        for (offset, len) in [
+            (0, 56),
+            (64, 56),
+            (71, 56),
+            (73, 56),
+            (72, 55),
+            (72, u32::MAX),
+        ] {
+            let mut invalid = body.clone();
+            invalid[2..4].copy_from_slice(&(offset as u16).to_le_bytes());
+            invalid[4..8].copy_from_slice(&len.to_le_bytes());
+            assert!(decode_query_file_metadata(&invalid).is_none());
+        }
+        body[48..56].copy_from_slice(&(-1i64).to_le_bytes());
+        assert!(decode_query_file_metadata(&body).is_none());
+    }
 }
 
 // ── Frame helpers ───────────────────────────────────────────────────────────

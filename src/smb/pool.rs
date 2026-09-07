@@ -790,6 +790,10 @@ impl SmbPool {
 
 #[cfg(test)]
 impl SmbPool {
+    pub(crate) fn test_enable_copychunk(&self) {
+        self.copychunk_ok.store(true, Ordering::Relaxed);
+    }
+
     pub(crate) fn test_from_client(client: Arc<SmbClient>) -> Arc<Self> {
         Arc::new(Self {
             slots: RwLock::new(vec![Slot { client, tree_id: 1 }]),

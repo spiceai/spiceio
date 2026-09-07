@@ -2162,6 +2162,108 @@ impl SmbClient {
         }))
     }
 
+    /// Create a private WAL temp, write a small body, and query its metadata in
+    /// one related compound. The write handle remains open, denying other
+    /// writers/deleters until the caller verifies and publishes the temp.
+    /// A server without this information class returns no metadata; the caller
+    /// must stat the temp before publication instead.
+    pub(crate) async fn create_write_query(
+        &self,
+        tree_id: u32,
+        path: &str,
+        data: &[u8],
+    ) -> io::Result<(CreateResponse, Option<CloseResponse>)> {
+        if data.len() > self.compound_max_write_size as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "atomic compound body exceeds negotiated write limit",
+            ));
+        }
+        let base = self.alloc_ids(3);
+        let mut h1 = Header::new(Command::Create, base);
+        h1.session_id = self.session_id;
+        h1.tree_id = tree_id;
+        let mut b1 = BytesMut::with_capacity(128);
+        encode_create_request(
+            &mut b1,
+            path,
+            DesiredAccess::GenericWrite as u32
+                | DesiredAccess::ReadAttributes as u32
+                | DesiredAccess::Delete as u32,
+            ShareAccess::Read as u32,
+            CreateDisposition::OverwriteIf as u32,
+            CreateOptions::NonDirectoryFile as u32,
+        );
+        let mut h2 = Header::new(Command::Write, base + 1);
+        h2.session_id = self.session_id;
+        h2.tree_id = tree_id;
+        h2.flags |= SMB2_FLAGS_RELATED;
+        let mut b2 = BytesMut::with_capacity(48 + data.len());
+        encode_write_request(&mut b2, &SENTINEL_FILE_ID, 0, data);
+        let mut h3 = Header::new(Command::QueryInfo, base + 2);
+        h3.session_id = self.session_id;
+        h3.tree_id = tree_id;
+        h3.flags |= SMB2_FLAGS_RELATED;
+        let mut b3 = BytesMut::with_capacity(40);
+        encode_query_file_metadata(&mut b3, &SENTINEL_FILE_ID);
+
+        let resp = self
+            .send_compound(vec![(h1, b1), (h2, b2), (h3, b3)])
+            .await?;
+        let Some((header, body)) = resp.first() else {
+            return Err(compound_too_short(path, &resp, 3));
+        };
+        if NtStatus::from_u32(header.status).is_error() {
+            return Err(smb_status_to_io_error(header.status, path));
+        }
+        let Some(file) = decode_create_response(body) else {
+            // CREATE may have opened a handle we cannot identify. Releasing
+            // the session is the only way to release that writer's lock.
+            self.poison().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid create response",
+            ));
+        };
+        let verified = (|| {
+            if resp.len() < 3 {
+                return Err(compound_too_short(path, &resp, 3));
+            }
+            if NtStatus::from_u32(resp[1].0.status).is_error() {
+                return Err(smb_status_to_io_error(resp[1].0.status, path));
+            }
+            let written = decode_write_response(&resp[1].1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid write response")
+            })?;
+            if written as usize != data.len() {
+                return Err(io::Error::other(format!(
+                    "compound write short: {written} of {} bytes for {path}",
+                    data.len()
+                )));
+            }
+            // INVALID_INFO_CLASS / INVALID_DEVICE_REQUEST / NOT_SUPPORTED.
+            // These need the existing path-stat fallback, never guessed sizes.
+            if matches!(resp[2].0.status, 0xC000_0003 | 0xC000_0010 | 0xC000_00BB) {
+                return Ok(None);
+            }
+            if resp[2].0.status != 0 {
+                return Err(smb_status_to_io_error(resp[2].0.status, path));
+            }
+            decode_query_file_metadata(&resp[2].1)
+                .map(Some)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid file metadata response")
+                })
+        })();
+        match verified {
+            Ok(meta) => Ok((file, meta)),
+            Err(error) => {
+                let _ = self.close(tree_id, &file.file_id).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Compound batch of Create+Close pairs for directory creation (1 round trip).
     /// Each pair forms a related chain; different pairs are unrelated.
     pub async fn ensure_dirs(&self, tree_id: u32, dirs: &[String]) -> io::Result<()> {
