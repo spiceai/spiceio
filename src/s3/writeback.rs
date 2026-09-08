@@ -42,10 +42,9 @@
 //! the NAS's disagree, and every operation that could observe the difference
 //! consults [`WriteBack`] first:
 //!
-//! * **GET / HEAD** on a pending key are served from the cache without
-//!   revalidating — a stat would report the *old* object, or none at all.
-//! * **DELETE** cancels a queued write and waits out an in-flight one, so the
-//!   flusher cannot resurrect the object after the delete lands.
+//! * **GET / HEAD** read the pending generation directly, including ranges.
+//! * **DELETE / replacements** pause the key before acquiring admission and
+//!   retire the pending predecessor only after the backend mutation succeeds.
 //! * **LIST** overlays pending keys, which are not on the NAS to be walked.
 //! * **CopyObject / UploadPartCopy** flush the source first: the server-side
 //!   copy reads it on the NAS, where it may not exist yet.
@@ -55,12 +54,12 @@
 //! completion rather than racing it.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, Semaphore};
 
 use super::object_cache::ObjectCache;
 use crate::smb::ops::ShareSession;
@@ -222,9 +221,31 @@ struct Inner {
     closed: bool,
 }
 
+#[derive(Default)]
+struct KeyMutation {
+    lock: Arc<Mutex<()>>,
+    paused: AtomicBool,
+}
+
+/// Keeps an acknowledged predecessor queued until a foreground replacement
+/// commits. Dropping a failed/cancelled mutation resumes its background flush.
+pub struct MutationGuard<'a> {
+    owner: &'a WriteBack,
+    key: Arc<KeyMutation>,
+    _lock: OwnedMutexGuard<()>,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        self.key.paused.store(false, Ordering::Release);
+        self.owner.work.notify_waiters();
+    }
+}
+
 /// Queue of writes acknowledged to the client but not yet on the backend.
 pub struct WriteBack {
     inner: Mutex<Inner>,
+    mutations: std::sync::Mutex<HashMap<String, Weak<KeyMutation>>>,
     /// Wakes an idle flusher when work arrives.
     work: Notify,
     /// Pulsed after every flush attempt, for callers waiting on a key.
@@ -247,6 +268,7 @@ pub struct WriteBack {
 impl WriteBack {
     pub fn new(enabled: bool, max_bytes: u64) -> Self {
         Self {
+            mutations: std::sync::Mutex::new(HashMap::new()),
             inner: Mutex::new(Inner {
                 pending: HashMap::new(),
                 queue: VecDeque::new(),
@@ -289,6 +311,80 @@ impl WriteBack {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Serialize foreground mutations and wait out a claimed flush, without
+    /// holding an SMB admission permit. Pending bytes remain readable and
+    /// recoverable until the caller cancels them after a successful commit.
+    pub async fn begin_mutation(
+        &self,
+        key: &str,
+    ) -> Result<MutationGuard<'_>, tokio::time::error::Elapsed> {
+        let state = {
+            let mut keys = self.mutations.lock().unwrap_or_else(|e| e.into_inner());
+            if keys.len() >= 1024 {
+                keys.retain(|_, v| v.strong_count() > 0);
+            }
+            match keys.get(key).and_then(Weak::upgrade) {
+                Some(state) => state,
+                None => {
+                    let state = Arc::new(KeyMutation::default());
+                    keys.insert(key.to_owned(), Arc::downgrade(&state));
+                    state
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let lock = state.lock.clone().lock_owned().await;
+            state.paused.store(true, Ordering::Release);
+            let guard = MutationGuard {
+                owner: self,
+                key: state,
+                _lock: lock,
+            };
+            loop {
+                let waiter = self.progress.notified();
+                tokio::pin!(waiter);
+                waiter.as_mut().enable();
+                if !self
+                    .inner
+                    .lock()
+                    .await
+                    .pending
+                    .get(key)
+                    .is_some_and(|p| p.flushing)
+                {
+                    return guard;
+                }
+                waiter.await;
+            }
+        })
+        .await
+    }
+
+    fn mutation_paused(&self, key: &str) -> bool {
+        self.mutations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .and_then(Weak::upgrade)
+            .is_some_and(|state| state.paused.load(Ordering::Acquire))
+    }
+
+    /// Atomic snapshot of the pending generation, including its body. A cache
+    /// entry with the same key may describe an older, already flushed version.
+    pub async fn pending_object(&self, key: &str) -> Option<super::object_cache::CachedObject> {
+        if !self.enabled {
+            return None;
+        }
+        let g = self.inner.lock().await;
+        g.pending
+            .get(key)
+            .map(|p| super::object_cache::CachedObject {
+                body: p.body.clone(),
+                etag: p.etag.clone(),
+                last_modified: p.last_modified,
+            })
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -396,10 +492,9 @@ impl WriteBack {
 
     /// Drop a queued write and wait out an in-flight one.
     ///
-    /// Called before a DELETE (and before anything else that replaces the
-    /// object wholesale). Waiting matters: cancelling a flush already in
-    /// progress would let the backend write land *after* the delete and
-    /// resurrect the object.
+    /// Foreground callers hold a `MutationGuard` and cancel only after the
+    /// replacement/delete succeeds. The guard has already waited out any
+    /// claimed flush, so it cannot resurrect the predecessor afterward.
     pub async fn cancel(&self, key: &str) {
         if !self.enabled {
             return;
@@ -602,7 +697,12 @@ impl WriteBack {
     /// Claim the next key to flush, or `None` if the queue is empty.
     async fn claim(&self) -> Option<Claim> {
         let mut g = self.inner.lock().await;
-        while let Some(key) = g.queue.pop_front() {
+        for _ in 0..g.queue.len() {
+            let key = g.queue.pop_front()?;
+            if self.mutation_paused(&key) {
+                g.queue.push_back(key);
+                continue;
+            }
             // Cancelled between queueing and now (a DELETE), or superseded and
             // re-queued elsewhere — either way there is nothing to do.
             let Some(p) = g.pending.get_mut(&key) else {
@@ -744,6 +844,7 @@ impl WriteBack {
         for (i, key) in g.queue.iter().enumerate() {
             if let Some(p) = g.pending.get(key)
                 && !p.flushing
+                && !self.mutation_paused(key)
                 && p.sha.is_none()
                 && p.body.len() as u64 <= max_object
             {
@@ -837,9 +938,13 @@ impl WriteBack {
                 tokio::time::sleep(backoff).await;
                 continue;
             }
+            // Acquire before claiming a key. A foreground mutation may wait
+            // for a claim, so its owner must already have backend capacity.
+            let permit = slots.clone().acquire_owned().await.ok();
             match self.claim().await {
                 Some(c) => {
-                    let ok = self.flush_one(&share, &cache, &slots, &c).await;
+                    let ok = self.flush_one(&share, &cache, &c).await;
+                    drop(permit);
                     self.complete(&c.key, c.seq, ok).await;
                     if !ok {
                         self.retries.fetch_add(1, Ordering::Relaxed);
@@ -849,6 +954,7 @@ impl WriteBack {
                     }
                 }
                 None => {
+                    drop(permit);
                     {
                         let g = self.inner.lock().await;
                         if g.closed && g.pending.is_empty() {
@@ -862,13 +968,7 @@ impl WriteBack {
     }
 
     /// Journal to the spill, write to the backend, then promote.
-    async fn flush_one(
-        &self,
-        share: &ShareSession,
-        cache: &ObjectCache,
-        slots: &Arc<Semaphore>,
-        c: &Claim,
-    ) -> bool {
+    async fn flush_one(&self, share: &ShareSession, cache: &ObjectCache, c: &Claim) -> bool {
         // Journal first: from here on a crash is recoverable, because a dirty
         // entry is never evicted and is replayed by whoever finds it. Skipped
         // when `journal_one` already wrote this exact body while standing down
@@ -883,22 +983,9 @@ impl WriteBack {
             }
         };
 
-        // Through the same admission semaphore live requests use. A background
-        // flush that skipped it would be invisible to admission control and
-        // could bury the pool under work no client is waiting for.
-        //
-        // The only way this errors is a closed semaphore, which happens when
-        // the pool is being torn down. Proceeding unmetered is then the right
-        // call rather than the dangerous one: there are no client requests left
-        // to protect a share of the pool for, and the alternative is abandoning
-        // a write the client was already told had succeeded. `.ok()` rather
-        // than a discard so the fallible acquire is visible at the call site.
-        let permit = slots.clone().acquire_owned().await.ok();
-
         // Atomic: the client already has its 200, so a failed flush must not
         // replace a good object with a truncated one.
         let put = share.put_object_atomic(&c.key, &c.body).await;
-        drop(permit);
         let meta = match put {
             Ok(m) => m,
             Err(e) => {
@@ -1344,5 +1431,68 @@ mod tests {
     async fn drain_returns_immediately_when_empty() {
         let w = wb();
         assert_eq!(w.drain(Duration::from_secs(30)).await, 0);
+    }
+}
+
+#[cfg(test)]
+mod regression_writeback {
+    use super::*;
+
+    #[tokio::test]
+    async fn regression_delete_wait_must_not_deadlock_flusher_on_admission() {
+        let (state, _server) = crate::test_support::state().await;
+        let wb = Arc::clone(&state.writeback);
+        wb.enqueue("key", "e", 1, Bytes::from_static(b"x")).await;
+        let slots = Arc::clone(&state.smb_slots);
+        let permits = slots
+            .clone()
+            .acquire_many_owned(slots.available_permits() as u32)
+            .await
+            .unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let flusher = tokio::spawn({
+            let wb = Arc::clone(&wb);
+            async move {
+                started.send(()).unwrap();
+                wb.flush_loop(
+                    state.share,
+                    state.object_cache,
+                    state.smb_slots,
+                    state.client_inflight,
+                )
+                .await;
+            }
+        });
+        ready.await.unwrap();
+        // A flusher blocked on admission must not own the key. The foreground
+        // mutation can pause it without waiting for a permit it already holds.
+        let mutation = tokio::time::timeout(Duration::from_millis(100), wb.begin_mutation("key"))
+            .await
+            .expect("admission wait must precede the background claim")
+            .unwrap();
+        assert!(wb.claim().await.is_none());
+        assert!(wb.pending_object("key").await.is_some());
+        drop(mutation); // A failed replacement leaves the predecessor queued.
+        assert!(wb.claim().await.is_some());
+        flusher.abort();
+        assert!(flusher.await.unwrap_err().is_cancelled());
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_mutation_resumes_its_predecessor() {
+        let wb = WriteBack::new(true, 1024);
+        wb.enqueue("key", "e", 1, Bytes::from_static(b"old")).await;
+        let guard = wb.begin_mutation("key").await.unwrap();
+        assert!(wb.claim().await.is_none());
+        assert!(wb.claim_for_journal(1024).await.is_none());
+        let next = wb.begin_mutation("key");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), next)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert_eq!(wb.claim().await.unwrap().body, Bytes::from_static(b"old"));
     }
 }

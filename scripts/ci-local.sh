@@ -109,6 +109,7 @@ if [[ "$LIVE_ONLY" -eq 0 ]]; then
     step "unit tests (cargo test --locked --features loadgen)"
     # --features loadgen also runs spiceio-loadgen's status-classifier tests.
     cargo test --locked --features loadgen
+    make test-clean-unit
 
     # ── 3. Debug binaries (live scripts expect ./target/debug/spiceio, and
     #      test-sccache.sh's load burst expects ./target/debug/spiceio-loadgen)

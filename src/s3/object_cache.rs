@@ -112,6 +112,7 @@ pub struct CachedObject {
 /// GET body cache: process memory over an optional shared disk tier.
 pub struct ObjectCache {
     inner: Mutex<Inner>,
+    fill_bytes: Arc<AtomicU64>,
     /// When true, `get_by_key` may return a body without etag match (caller
     /// must still have decided that is safe for the deployment).
     immutable: bool,
@@ -127,6 +128,18 @@ pub struct ObjectCache {
     hits: AtomicU64,
     misses: AtomicU64,
     hit_bytes: AtomicU64,
+}
+
+/// Aggregate reservation for bodies being assembled before cache insertion.
+pub struct CacheFill {
+    bytes: Arc<AtomicU64>,
+    size: u64,
+}
+
+impl Drop for CacheFill {
+    fn drop(&mut self) {
+        self.bytes.fetch_sub(self.size, Ordering::Relaxed);
+    }
 }
 
 struct Inner {
@@ -184,6 +197,7 @@ impl ObjectCache {
         // insert() would immediately reject.
         let max_object_bytes = max_object_bytes.max(1).min(max_bytes);
         Self {
+            fill_bytes: Arc::new(AtomicU64::new(0)),
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
                 lru: BTreeMap::new(),
@@ -218,6 +232,24 @@ impl ObjectCache {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MAX_ENTRIES);
         Self::new(immutable, max_bytes, max_object_bytes, max_entries)
+    }
+
+    /// Cache fills share one additional memory budget, regardless of the
+    /// number of streams. A refused reservation simply skips populating L1.
+    pub fn reserve_fill(&self, size: u64) -> Option<CacheFill> {
+        if size == 0 || size > self.max_object_bytes {
+            return None;
+        }
+        self.fill_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(size)
+                    .filter(|&total| total <= self.max_bytes)
+            })
+            .ok()?;
+        Some(CacheFill {
+            bytes: Arc::clone(&self.fill_bytes),
+            size,
+        })
     }
 
     pub fn immutable(&self) -> bool {
@@ -261,11 +293,11 @@ impl ObjectCache {
         let spill = self.spill.as_ref()?;
         let entry = read_spill(spill, key).await?;
         if entry.etag != etag {
-            // On disk but superseded on the backend. Drop it now rather than
-            // re-reading and re-rejecting it on every future request.
+            // A dirty entry can be newer than the backend: it is a recovery
+            // journal, and revalidation must never delete it.
             let spill = Arc::clone(spill);
             let key_owned = key.to_string();
-            let _ = tokio::task::spawn_blocking(move || spill.remove(&key_owned)).await;
+            let _ = tokio::task::spawn_blocking(move || spill.drop_clean(&key_owned)).await;
             return None;
         }
         self.promote(key, &entry);
@@ -466,6 +498,12 @@ impl ObjectCache {
         }
     }
 
+    pub fn spill_owns_dirty(&self, key: &str) -> bool {
+        self.spill
+            .as_ref()
+            .is_some_and(|spill| spill.owns_dirty(key))
+    }
+
     /// Read one entry off the shared tier by key, whatever its state.
     pub async fn spill_read(&self, key: &str) -> Option<super::spill::SpillEntry> {
         let spill = self.spill.as_ref()?;
@@ -482,6 +520,19 @@ impl ObjectCache {
         tokio::task::spawn_blocking(move || spill.scan_dirty(min_age))
             .await
             .unwrap_or_default()
+    }
+
+    /// Load at most one recovery body, after excluding entries owned by live
+    /// work. The recovery loop drops it before reading the next descriptor.
+    pub async fn spill_load_dirty(
+        &self,
+        descriptor: &DirtyEntry,
+    ) -> Option<super::spill::SpillEntry> {
+        let spill = Arc::clone(self.spill.as_ref()?);
+        let descriptor = descriptor.clone();
+        tokio::task::spawn_blocking(move || spill.load_dirty(&descriptor))
+            .await
+            .ok()?
     }
 
     /// Enforce the shared tier's budget.

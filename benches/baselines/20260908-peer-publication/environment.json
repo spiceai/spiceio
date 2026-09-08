@@ -1,0 +1,158 @@
+{
+  "application_before": "a4473f65593554754416aa00327c0f1eb49f6f39",
+  "application_after": "6573bfc",
+  "identities": {
+    "before": {
+      "binary_sha256": "9bb6e8c1685c0f8875885df09fafa377cab1655eaa04472b662a57d4b6c386f2",
+      "queue_bytes": 1073741824,
+      "application_commit": "a4473f6"
+    },
+    "after": {
+      "binary_sha256": "18a93b2706763377bef0352b6a55270e9ae1c610c9171b56aad8b7650e06cd57",
+      "queue_bytes": 1073741824,
+      "application_commit": "6573bfc"
+    },
+    "loadgen": {
+      "binary_sha256": "fa17d9015ac3fd7576ca9c77b4bda0d84fdb1500a69534e8fc39f697bdfc77b7",
+      "source_commit": "a4473f6"
+    }
+  },
+  "host_model": "Mac15,8",
+  "logical_cpus": 16,
+  "memory_gib": 128,
+  "os": "macOS 26.6.2",
+  "rust": "1.98.0",
+  "smb_connections": 32,
+  "writeback_bytes": 1073741824,
+  "objects": 512,
+  "operations_per_worker": 24,
+  "concurrency": [
+    1,
+    8,
+    32,
+    64,
+    128,
+    256
+  ],
+  "order": [
+    "before",
+    "after",
+    "after",
+    "before",
+    "before",
+    "after"
+  ],
+  "access_log_requests": 752652,
+  "measured_requests": 451584,
+  "errors": 0,
+  "runs": [
+    {
+      "name": "leaf-misses-r1-before",
+      "arm": "before",
+      "rep": 1,
+      "started_at": "2026-09-08T00:13:54.751429+00:00",
+      "seconds": 57.218,
+      "max_load_1m": 6.07763671875,
+      "max_proxy_rss_kib": 872240,
+      "writeback_stats": [
+        {
+          "accepted": 13797,
+          "flushed": 2537,
+          "coalesced": 11260,
+          "fallbacks": 0,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "leaf-misses-r1-after",
+      "arm": "after",
+      "rep": 1,
+      "started_at": "2026-09-08T00:14:51.978747+00:00",
+      "seconds": 69.53,
+      "max_load_1m": 5.36328125,
+      "max_proxy_rss_kib": 913136,
+      "writeback_stats": [
+        {
+          "accepted": 13797,
+          "flushed": 2452,
+          "coalesced": 11345,
+          "fallbacks": 0,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "leaf-misses-r2-after",
+      "arm": "after",
+      "rep": 2,
+      "started_at": "2026-09-08T00:16:01.518080+00:00",
+      "seconds": 65.397,
+      "max_load_1m": 5.07958984375,
+      "max_proxy_rss_kib": 792448,
+      "writeback_stats": [
+        {
+          "accepted": 13797,
+          "flushed": 2429,
+          "coalesced": 11368,
+          "fallbacks": 0,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "leaf-misses-r2-before",
+      "arm": "before",
+      "rep": 2,
+      "started_at": "2026-09-08T00:17:06.902289+00:00",
+      "seconds": 63.401,
+      "max_load_1m": 6.81689453125,
+      "max_proxy_rss_kib": 1240432,
+      "writeback_stats": [
+        {
+          "accepted": 13797,
+          "flushed": 2507,
+          "coalesced": 11290,
+          "fallbacks": 0,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "leaf-misses-r3-before",
+      "arm": "before",
+      "rep": 3,
+      "started_at": "2026-09-08T00:18:10.306836+00:00",
+      "seconds": 59.34,
+      "max_load_1m": 6.47314453125,
+      "max_proxy_rss_kib": 1107904,
+      "writeback_stats": [
+        {
+          "accepted": 13797,
+          "flushed": 2416,
+          "coalesced": 11381,
+          "fallbacks": 0,
+          "retries": 0
+        }
+      ]
+    },
+    {
+      "name": "leaf-misses-r3-after",
+      "arm": "after",
+      "rep": 3,
+      "started_at": "2026-09-08T00:19:09.656233+00:00",
+      "seconds": 69.515,
+      "max_load_1m": 6.0966796875,
+      "max_proxy_rss_kib": 828096,
+      "writeback_stats": [
+        {
+          "accepted": 13797,
+          "flushed": 2561,
+          "coalesced": 11236,
+          "fallbacks": 0,
+          "retries": 0
+        }
+      ]
+    }
+  ]
+}

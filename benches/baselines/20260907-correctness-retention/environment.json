@@ -1,0 +1,219 @@
+{
+  "identities": {
+    "before": {
+      "commit": "2ad4a874ff4813f8190117bc645af0dbb90b708c",
+      "binary_sha256": "d242a7585bde3d077c8ab5913f2e018d0a81b501246c61ea26567d81da2c6382"
+    },
+    "after": {
+      "commit": "b6d2eec0d8dae6774f74bd0d7a5b0323e5c3b557",
+      "binary_sha256": "55dd3859a48303889ceffaa98dcd21e3f2097580252b90f75280e515ada916fa"
+    }
+  },
+  "environment": {
+    "os": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "cpu_model": "Mac15,8",
+    "logical_cpus": 16,
+    "memory_bytes": 137438953472,
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "sccache": "sccache 0.17.0",
+    "spiceai_commit": "8aecb8657ecb52c55cf1c5e6fb434f2c68faacb2",
+    "spiceai_toolchain": "1.96.1",
+    "power": "AC, fully charged at preflight",
+    "preflight_nas_connect_ms": 2.0,
+    "benchmark_repetitions": 3,
+    "benchmark_order": "before, after, before, after, before, after within each family",
+    "synthetic_passes": [
+      "cached",
+      "nocache",
+      "writeback",
+      "nospill"
+    ],
+    "synthetic_concurrency": [
+      1,
+      8,
+      32,
+      64,
+      128,
+      256
+    ],
+    "synthetic_objects": 512,
+    "synthetic_ops_per_worker": 24,
+    "sustained_objects": 4096,
+    "sustained_ops_per_worker": 512,
+    "sustained_concurrency": [
+      8,
+      32
+    ],
+    "sustained_passes": [
+      "writeback"
+    ],
+    "build_fixture": "same before-revision source directory for both proxy versions",
+    "build_jobs": 16,
+    "build_arms": [
+      "nocache",
+      "local",
+      "spiceio"
+    ],
+    "native_mount_baseline": "Requested. Try existing native credentials, then configured SMB password through a private PTY with echo disabled; no password in argv or global credential changes.",
+    "notes": [
+      "This is a fresh full matrix after the first validation exposed transient missing-name reads during WAL replacement and rename failures caused by open destination handles.",
+      "Earlier runs, including descriptor-limit setup failures, benchmark request failures and diagnostic traces, remain in target/validation-2026-09-07/.",
+      "The candidate fix passed four regression tests and Clippy, and a 98,304-request mixed live diagnostic with zero request errors; four transient rename denials were recovered internally.",
+      "Both revisions use RLIMIT_NOFILE=8192. Measurements run sequentially, alternating before/after three times per family.",
+      "The host and NAS are shared. Any observed foreign Rust build activity is recorded in contention.jsonl.",
+      "The nocache mode leaves disk spill configured while disabling memory caching; mode names follow the existing scripts.",
+      "Application sources are frozen at the recorded commits; only harness paths, ports, the pinned Spice.ai fixture and native authentication are adapted equally.",
+      "The installed local service on port 8333 is not restarted or replaced.",
+      "Live retention uses a private prefix for each revision; the original global cache cleanup was completed earlier."
+    ],
+    "benchmark_nofile_soft_limit": 8192,
+    "spiceai_fixture": "Detached checkout of the recorded Spice.ai commit, shared across both proxy revisions",
+    "observed_host_contention": {
+      "window_utc": "approximately 2026-09-07 19:38\u201319:43",
+      "affected_stage": "criterion-r2-before (S3 cases)",
+      "observed_one_minute_load": 237.28,
+      "logical_cpus": 16,
+      "observed_processes": "many unrelated WebKit processes; none stopped by this task",
+      "handling": "retain all repetitions and report ranges; performance attribution is limited"
+    },
+    "additional_host_contention": {
+      "window_utc": "approximately 2026-09-07 20:50\u201320:56",
+      "affected_stage": "synthetic-r3-before (nocache concurrency 256 and writeback modes)",
+      "observed_one_minute_load": 155.6,
+      "handling": "all raw results retained; compare medians and observed spreads with shared-host caveat"
+    }
+  },
+  "coverage": {
+    "criterion": {
+      "cases": 54,
+      "expected_samples": 324,
+      "recorded_samples": 324,
+      "missing": [],
+      "duplicate": []
+    },
+    "synthetic": {
+      "cases": 120,
+      "expected_samples": 720,
+      "recorded_samples": 720,
+      "missing": [],
+      "duplicate": []
+    },
+    "sustained-writeback": {
+      "cases": 10,
+      "expected_samples": 60,
+      "recorded_samples": 60,
+      "missing": [],
+      "duplicate": []
+    },
+    "build": {
+      "cases": 5,
+      "expected_samples": 30,
+      "recorded_samples": 30,
+      "missing": [],
+      "duplicate": []
+    },
+    "live_throughput": {
+      "cases": 19,
+      "expected_samples": 114,
+      "recorded_samples": 114,
+      "missing": [],
+      "duplicate": []
+    },
+    "native_smb": {
+      "cases": 4,
+      "expected_samples": 24,
+      "recorded_samples": 24,
+      "missing": [],
+      "duplicate": []
+    }
+  },
+  "nonzero_exits": [
+    {
+      "name": "before-ci",
+      "exit_code": 2
+    },
+    {
+      "name": "live-throughput-r1-before",
+      "exit_code": 1
+    },
+    {
+      "name": "live-throughput-r1-after",
+      "exit_code": 1
+    }
+  ],
+  "optional_native_mount_skips": [],
+  "writeback_pressure": [
+    {
+      "stage": "sustained-writeback-r1-before",
+      "arm": "before",
+      "rep": 1,
+      "acknowledged": 18963,
+      "flushed": 5488,
+      "coalesced": 13475,
+      "queue_full_fallbacks": 3564,
+      "flush_retries": 0
+    },
+    {
+      "stage": "sustained-writeback-r1-after",
+      "arm": "after",
+      "rep": 1,
+      "acknowledged": 18562,
+      "flushed": 4351,
+      "coalesced": 14211,
+      "queue_full_fallbacks": 3965,
+      "flush_retries": 0
+    },
+    {
+      "stage": "sustained-writeback-r2-before",
+      "arm": "before",
+      "rep": 2,
+      "acknowledged": 18759,
+      "flushed": 5108,
+      "coalesced": 13651,
+      "queue_full_fallbacks": 3768,
+      "flush_retries": 0
+    },
+    {
+      "stage": "sustained-writeback-r2-after",
+      "arm": "after",
+      "rep": 2,
+      "acknowledged": 18383,
+      "flushed": 4233,
+      "coalesced": 14150,
+      "queue_full_fallbacks": 4144,
+      "flush_retries": 0
+    },
+    {
+      "stage": "sustained-writeback-r3-before",
+      "arm": "before",
+      "rep": 3,
+      "acknowledged": 18737,
+      "flushed": 4787,
+      "coalesced": 13950,
+      "queue_full_fallbacks": 3790,
+      "flush_retries": 0
+    },
+    {
+      "stage": "sustained-writeback-r3-after",
+      "arm": "after",
+      "rep": 3,
+      "acknowledged": 18474,
+      "flushed": 4239,
+      "coalesced": 14235,
+      "queue_full_fallbacks": 4053,
+      "flush_retries": 0
+    }
+  ],
+  "cleanup_recoveries": [
+    {
+      "name": "live-throughput-r1-before-cleanup-recovery",
+      "exit_code": 0,
+      "seconds": 0.0
+    },
+    {
+      "name": "live-throughput-r1-after-cleanup-recovery",
+      "exit_code": 0,
+      "seconds": 1.18
+    }
+  ]
+}

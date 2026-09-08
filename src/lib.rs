@@ -26,3 +26,6 @@ pub mod crypto;
 pub mod http;
 pub mod s3;
 pub mod smb;
+
+#[cfg(test)]
+pub(crate) mod test_support;

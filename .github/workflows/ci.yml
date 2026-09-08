@@ -61,7 +61,7 @@ jobs:
       - name: Run unit tests
         # --features loadgen also runs spiceio-loadgen's own tests, which
         # cover the per-operation status classifier the load burst relies on.
-        run: cargo test --locked --features loadgen
+        run: make test-unit
 
       - name: Prepare crash-log directory
         # spiceio writes a crash report (panic or fatal signal) to its

@@ -1,4 +1,4 @@
-.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback ci clean all \
+.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback test-sccache-clean test-clean-unit ci clean all \
 	loadgen bench-sccache bench-sccache-build bench-sccache-all
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
@@ -30,11 +30,19 @@ doc:
 lint: fmt-check check clippy doc
 
 # Unit tests only (no SMB).
-test-unit:
+test-unit: test-clean-unit
 	# --features loadgen so spiceio-loadgen's own tests run: they cover the
 	# per-operation status classifier that decides whether the load burst can
 	# see a failed write, and would silently not compile without it.
 	cargo test --locked --features loadgen
+
+test-clean-unit:
+	python3 scripts/test-sccache-clean-unit.py
+
+# Destructive retention test against an already-running instance. Requires
+# SCCACHE_BUCKET; SCCACHE_ENDPOINT and SCCACHE_S3_KEY_PREFIX select the cache.
+test-sccache-clean:
+	./scripts/test-sccache-clean.py
 
 # CI sccache integration (requires SPICEIO_SMB_USER/PASS). This is the gate
 # that custom curl benches do NOT replace.

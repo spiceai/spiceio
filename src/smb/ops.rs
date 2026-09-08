@@ -1,13 +1,14 @@
 //! High-level SMB file operations used by the S3 layer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
+use tokio::sync::RwLock;
 
-use super::client::SmbClient;
+use super::client::{SmbClient, is_missing_name};
 use super::pool::SmbPool;
 use super::protocol::*;
 
@@ -15,6 +16,26 @@ use super::protocol::*;
 /// giving up — enough halving steps (4 MiB → 64 KiB) plus headroom, while still
 /// terminating well within a client's request timeout if the server is down.
 const MAX_RESET_RETRIES: u32 = 16;
+
+/// A peer process does not share our publication locks. Recheck a missing
+/// leaf once to absorb its rename/close interval. The extra SMB round trip
+/// gives the peer time to close its writer; a fixed sleep here penalizes every
+/// genuine cache miss. Missing leaves cost at most one extra open, not the
+/// much longer reset/busy ladder. Successful opens and missing parents pay nothing.
+#[derive(Default)]
+struct PublicationRetry {
+    retried: bool,
+}
+
+impl PublicationRetry {
+    fn retry(&mut self, error: &io::Error) -> bool {
+        if self.retried || !is_missing_name(error) {
+            return false;
+        }
+        self.retried = true;
+        true
+    }
+}
 
 /// Cap on the process-lifetime directory existence cache. Hot prefixes
 /// (sccache, multi-file uploads under one tree) fit comfortably; past the cap
@@ -42,6 +63,13 @@ pub struct ShareSession {
     /// directory per object — dominant cost for many small files under one
     /// prefix. Shared across clones of the session (one set per process).
     ensured_dirs: Arc<Mutex<HashSet<String>>>,
+    /// Readers may open concurrently, but not while a verified WAL replaces
+    /// their path. Some SMB servers expose a brief missing-name interval during
+    /// replacement. Only the open/stat is guarded; existing streams can drain
+    /// while publication waits for their backend handles to close. Peer
+    /// processes have independent locks; `PublicationRetry` covers their
+    /// transient missing-name responses.
+    publications: Arc<Mutex<HashMap<String, Weak<RwLock<()>>>>>,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -74,7 +102,21 @@ impl ShareSession {
             pool,
             cleanup_grace_ft: cleanup_grace_secs.saturating_mul(FILETIME_TICKS_PER_SEC),
             ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
+            publications: Arc::default(),
         })
+    }
+
+    fn publication(&self, smb_path: &str) -> Arc<RwLock<()>> {
+        let mut paths = self.publications.lock().unwrap_or_else(|e| e.into_inner());
+        if paths.len() >= 1024 {
+            paths.retain(|_, lock| lock.strong_count() > 0);
+        }
+        if let Some(lock) = paths.get(smb_path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(RwLock::new(()));
+        paths.insert(smb_path.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Reconnect any poisoned pool connections. Run periodically by a
@@ -141,6 +183,7 @@ impl ShareSession {
         max_read: u32,
     ) -> io::Result<(ObjectMeta, Bytes)> {
         let smb_path = to_smb_path(key);
+        let _publication = self.publication(&smb_path).read_owned().await;
         let (cr, data) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -163,10 +206,11 @@ impl ShareSession {
     /// Open a file for streaming reads. Returns a handle pinned to one connection.
     pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
         let smb_path = to_smb_path(key);
+        let _publication = self.publication(&smb_path).read_owned().await;
         // Resilient open: under heavy concurrent load on a degraded NAS the
         // create can hit a transient reset; retry on a fresh connection so the
         // initial open of a streaming GET isn't lost (the client may not retry).
-        // A genuine NotFound is not a reset and returns immediately.
+        // Missing leaf names have a separate, single publication retry.
         let (client, tree_id, file) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -448,11 +492,10 @@ impl ShareSession {
 
     /// Put object with no window in which the client's key holds a partial body.
     ///
-    /// Small bodies go out as one compound Create+Write+Close. Anything larger
-    /// goes through the WAL — write a temp, verify its length, rename — the
-    /// same path streaming PutObject uses, and the reason a failed write leaves
-    /// any existing object untouched instead of replacing it with a truncated
-    /// one (see `WalWriter::commit`).
+    /// Every body goes through the WAL: write a temp, verify its length, then
+    /// rename. Small bodies batch CREATE+WRITE+QUERY_INFO on the private temp
+    /// into one round trip; verification still precedes rename. OverwriteIf
+    /// on the final key is never safe: CREATE truncates before WRITE succeeds.
     ///
     /// This is what background writes must use. `put_object`'s large-file
     /// branch overwrites in place and deletes the destination if the write
@@ -460,7 +503,8 @@ impl ShareSession {
     /// result and is not once the client has already been told it succeeded.
     pub async fn put_object_atomic(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
         if data.len() <= self.pool.compound_max_write_size as usize {
-            return self.put_object(key, data).await;
+            let (wal, meta) = self.open_wal_write_initial(key, Some(data)).await?;
+            return wal.commit_with_meta(self, meta).await;
         }
         let mut wal = self.open_wal_write(key).await?;
         if let Err(e) = wal.write(data).await {
@@ -604,6 +648,7 @@ impl ShareSession {
     /// become a 503 that aborts the client's compile unit.
     pub async fn head_object(&self, key: &str) -> io::Result<ObjectMeta> {
         let smb_path = to_smb_path(key);
+        let _publication = self.publication(&smb_path).read_owned().await;
         let (cr, _) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -825,9 +870,10 @@ impl ShareSession {
 
     /// Run a one-shot read open/stat with bounded retry on transient errors —
     /// connection resets and `ResourceBusy` (SMB sharing violations) — each
-    /// attempt on a freshly-picked live connection. A non-retryable error (e.g. a
-    /// genuine NotFound) returns immediately; a reset backs off the adaptive read
-    /// size and a busy error backs off before retrying. The op receives the picked
+    /// attempt on a freshly-picked live connection. A missing leaf name has one
+    /// separate retry for publication by a peer process; other NotFound cases
+    /// return immediately. A reset backs off the adaptive read size and a busy
+    /// error backs off before retrying. The op receives the picked
     /// connection and returns whatever the caller needs (typically the picked
     /// `(client, tree_id)` plus the result).
     async fn retry_read_open<T, F, Fut>(&self, mut op: F) -> io::Result<T>
@@ -836,11 +882,15 @@ impl ShareSession {
         Fut: Future<Output = io::Result<T>>,
     {
         let mut attempt = 0u32;
+        let mut publication = PublicationRetry::default();
         loop {
             let (client, tree_id) = self.pick_live().await;
             match op(client, tree_id).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    if publication.retry(&e) {
+                        continue;
+                    }
                     if is_reset(&e) {
                         self.pool.note_read_reset();
                     } else if is_busy(&e) {
@@ -996,16 +1046,7 @@ impl ShareSession {
         if !self.pool.copychunk_supported() {
             return Ok(None);
         }
-        let src = client
-            .create(
-                tree_id,
-                src_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
+        let src = self.open_copy_source_on(client, tree_id, src_path).await?;
 
         let out = async {
             if let Some(expected) = expect_src_size
@@ -1213,16 +1254,7 @@ impl ShareSession {
         expected_size: Option<u64>,
     ) -> io::Result<()> {
         let (mut client, mut tree_id) = self.pick_live().await;
-        let cr = client
-            .create(
-                tree_id,
-                src_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await?;
+        let cr = self.open_copy_source_on(&client, tree_id, src_path).await?;
         let mut file_id = cr.file_id;
         let file_size = cr.file_size;
 
@@ -1291,17 +1323,7 @@ impl ShareSession {
                     attempt += 1;
                     let _ = client.close(tree_id, &file_id).await;
                     let (c, t) = self.pick_live().await;
-                    match c
-                        .create(
-                            t,
-                            src_path,
-                            DesiredAccess::GenericRead as u32,
-                            ShareAccess::All as u32,
-                            CreateDisposition::Open as u32,
-                            CreateOptions::NonDirectoryFile as u32,
-                        )
-                        .await
-                    {
+                    match self.open_copy_source_on(&c, t, src_path).await {
                         // Refuse to splice if the part changed underneath us
                         // (size differs) — we must not assemble bytes from a
                         // different version of the file.
@@ -1325,6 +1347,36 @@ impl ShareSession {
 
         let _ = client.close(tree_id, &file_id).await;
         read_result
+    }
+
+    /// Protect every copy source open, including streaming reconnects, from a
+    /// WAL replacement's missing-name interval. Release the guard as soon as
+    /// the handle exists: copies must drain while publication waits for them,
+    /// and a copy may itself publish back to the source key.
+    async fn open_copy_source_on(
+        &self,
+        client: &SmbClient,
+        tree_id: u32,
+        smb_path: &str,
+    ) -> io::Result<CreateResponse> {
+        let _publication = self.publication(smb_path).read_owned().await;
+        let mut publication = PublicationRetry::default();
+        loop {
+            let result = client
+                .create(
+                    tree_id,
+                    smb_path,
+                    DesiredAccess::GenericRead as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32,
+                )
+                .await;
+            match result {
+                Err(e) if publication.retry(&e) => continue,
+                result => return result,
+            }
+        }
     }
 
     /// Delete a temp file (best effort).
@@ -1373,6 +1425,16 @@ impl ShareSession {
     /// memory and flushed to a temp file under `.spiceio-wal/` via pipelined
     /// SMB writes. Call `commit()` to atomically rename to the final path.
     pub async fn open_wal_write(&self, key: &str) -> io::Result<WalWriter> {
+        self.open_wal_write_initial(key, None)
+            .await
+            .map(|(wal, _)| wal)
+    }
+
+    async fn open_wal_write_initial(
+        &self,
+        key: &str,
+        initial: Option<&[u8]>,
+    ) -> io::Result<(WalWriter, Option<ObjectMeta>)> {
         let final_path = to_smb_path(key);
         let wal_path = wal_temp_path();
 
@@ -1383,13 +1445,25 @@ impl ShareSession {
         // not lost before its first byte (the client may not retry). Bounded by
         // MAX_RESET_RETRIES; each reset also backs off the adaptive write size.
         let mut attempt = 0u32;
-        let (client, tree_id, file_id) = loop {
+        let (client, tree_id, file_id, meta) = loop {
             let (client, tree_id) = self.pick_live().await;
-            let setup: io::Result<[u8; 16]> = async {
+            let setup: io::Result<([u8; 16], Option<ObjectMeta>)> = async {
                 self.ensure_parent_dirs_on(&client, tree_id, &final_path)
                     .await?;
                 self.ensure_parent_dirs_on(&client, tree_id, &wal_path)
                     .await?;
+                if let Some(data) = initial {
+                    let (file, meta) = client.create_write_query(tree_id, &wal_path, data).await?;
+                    return Ok((
+                        file.file_id,
+                        meta.map(|m| ObjectMeta {
+                            size: m.file_size,
+                            last_modified: filetime_to_epoch_secs(m.last_write_time),
+                            etag: etag_for(m.file_size, m.last_write_time),
+                            content_type: String::new(),
+                        }),
+                    ));
+                }
                 // Share read but *not* delete: while this handle is open no
                 // other process can unlink the temp, so a peer instance's
                 // startup cleanup gets a sharing violation instead of deleting
@@ -1406,16 +1480,19 @@ impl ShareSession {
                         CreateOptions::NonDirectoryFile as u32,
                     )
                     .await?;
-                Ok(file.file_id)
+                Ok((file.file_id, None))
             }
             .await;
             match setup {
-                Ok(file_id) => break (client, tree_id, file_id),
+                Ok((file_id, meta)) => break (client, tree_id, file_id, meta),
                 Err(e) => {
                     if is_reset(&e) {
                         self.pool.note_write_reset();
                     }
                     if !self.retry_write_setup(&e, &[&final_path, &wal_path], attempt) {
+                        if initial.is_some() {
+                            self.delete_temp(&wal_path).await;
+                        }
                         return Err(e);
                     }
                     if is_busy(&e) {
@@ -1432,27 +1509,36 @@ impl ShareSession {
         // degraded.
         let chunk_size = self.pool.write_chunk_size() as usize;
         let flush_cap = (self.pool.write_inflight() as usize).max(chunk_size);
-        Ok(WalWriter {
-            client,
-            pool: Arc::clone(&self.pool),
-            tree_id,
-            file_id,
-            wal_path,
-            final_path,
-            buf: Vec::with_capacity(flush_cap),
-            flush_cap,
-            offset: 0,
-            total_size: 0,
-        })
+        let initial_size = initial.map_or(0, |data| data.len() as u64);
+        Ok((
+            WalWriter {
+                client,
+                pool: Arc::clone(&self.pool),
+                tree_id,
+                file_id,
+                wal_path,
+                final_path,
+                buf: if initial.is_some() {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(flush_cap)
+                },
+                flush_cap,
+                offset: initial_size,
+                total_size: initial_size,
+            },
+            meta,
+        ))
     }
 
     /// Head a file by raw SMB path (no S3 key conversion) — for callers that
     /// already hold an internal path, such as a multipart part temp file.
     pub async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
+        let _publication = self.publication(smb_path).read_owned().await;
         // Resilient stat: retry the one-shot compound probe on a transient reset
-        // (fresh connection each attempt) so a HEAD — and the post-rename
-        // metadata read in WAL commit — survives a degraded NAS. A genuine
-        // NotFound is not a reset and returns immediately.
+        // (fresh connection each attempt) so a HEAD — and the pre-publication
+        // metadata read in WAL commit — survives a degraded NAS. Missing leaf
+        // names also get the single, bounded peer-publication retry.
         let smb_path = smb_path.to_string();
         let (cr, _) = self
             .retry_read_open(|client, tree_id| {
@@ -2401,7 +2487,15 @@ impl WalWriter {
 
     /// Flush remaining data, verify the temp, then rename it to the final path.
     /// Returns the object's metadata.
-    pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
+    pub async fn commit(self, share: &ShareSession) -> io::Result<ObjectMeta> {
+        self.commit_with_meta(share, None).await
+    }
+
+    async fn commit_with_meta(
+        mut self,
+        share: &ShareSession,
+        verified_meta: Option<ObjectMeta>,
+    ) -> io::Result<ObjectMeta> {
         // Flush all buffered data (windowed retry inside flush). On
         // unrecoverable failure, close the handle and best-effort delete the
         // temp — the caller cannot abort() after commit takes self. The delete
@@ -2422,13 +2516,18 @@ impl WalWriter {
         // writer and not a rollback. Failing here leaves any existing object
         // at `final_path` untouched.
         //
-        // Stat by path rather than trusting the close response's post-query
-        // attributes, which a server may decline to fill in. Attribute-only
+        // Small complete bodies carry metadata queried on the still-open
+        // writer in the CREATE+WRITE+QUERY_INFO compound. Otherwise stat by
+        // path, never trusting optional CLOSE post-query attributes. Attribute-only
         // opens bypass share-mode checks, so our own write handle does not
         // conflict. `last_write_time` is preserved across the rename, so this
         // stat also supplies the metadata returned to the client — no second
         // round trip after publishing.
-        let meta = match share.head_object_smb(&self.wal_path).await {
+        let metadata = match verified_meta {
+            Some(meta) => Ok(meta),
+            None => share.head_object_smb(&self.wal_path).await,
+        };
+        let meta = match metadata {
             Ok(m) => m,
             Err(e) => {
                 self.discard_temp().await;
@@ -2448,6 +2547,10 @@ impl WalWriter {
                 self.final_path, self.total_size, meta.size
             )));
         }
+
+        // Keep opens/stats out of the server's replacement interval, including
+        // the final close. Existing streaming handles remain free to drain.
+        let _publication = share.publication(&self.final_path).write_owned().await;
 
         // The temp is verified — publish it. The rename retries on a transient
         // reset by reconnecting and re-opening the temp file (which still
@@ -2471,7 +2574,17 @@ impl WalWriter {
                     // in between is not discovered until this rename. That is
                     // the second place a stale `ensured_dirs` entry surfaces.
                     let missing_path = e.kind() == io::ErrorKind::NotFound;
-                    if !share.retry_write_setup(&e, &[&self.final_path], attempt) {
+                    // MS-FSA FileRenameInformation permits ACCESS_DENIED when
+                    // the replacement target has an open stream. Retry this
+                    // operation within the existing budget, retaining the
+                    // original permission error if it never clears.
+                    let target_in_use = e.kind() == io::ErrorKind::PermissionDenied;
+                    let retry = if target_in_use {
+                        attempt < MAX_RESET_RETRIES
+                    } else {
+                        share.retry_write_setup(&e, &[&self.final_path], attempt)
+                    };
+                    if !retry {
                         break Err(e);
                     }
                     if missing_path {
@@ -2483,8 +2596,13 @@ impl WalWriter {
                             break Err(re);
                         }
                     }
-                    if is_busy(&e) {
+                    if is_busy(&e) || target_in_use {
                         busy_backoff(attempt).await;
+                        attempt += 1;
+                        // The connection and temp handle are still healthy.
+                        // Closing/reopening would add I/O without releasing the
+                        // destination's conflicting reader.
+                        continue;
                     }
                     attempt += 1;
                     // Reconnect and re-open the temp to retry. If the temp is
@@ -2656,6 +2774,39 @@ pub(crate) fn guess_content_type(key: &str) -> String {
         _ => "application/octet-stream",
     }
     .into()
+}
+
+#[cfg(test)]
+impl ShareSession {
+    pub(crate) fn test_from_pool(pool: Arc<SmbPool>) -> Self {
+        Self {
+            pool,
+            cleanup_grace_ft: 0,
+            ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
+            publications: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ShareSession {
+    pub(crate) fn test_file(&self, key: &str, size: u64) -> FileHandle {
+        let (client, tree_id) = self.pick();
+        FileHandle {
+            client,
+            pool: self.pool.clone(),
+            tree_id,
+            file_id: [1; 16],
+            meta: ObjectMeta {
+                size,
+                last_modified: 1,
+                etag: "e".into(),
+                content_type: guess_content_type(key),
+            },
+            file_size: size,
+            max_chunk: 65536,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3135,5 +3286,613 @@ mod tests {
         // Timestamp part should be a large number (nanoseconds)
         let ts: u128 = parts[0].parse().expect("timestamp should be numeric");
         assert!(ts > 1_000_000_000_000_000_000, "timestamp looks too small");
+    }
+}
+
+#[cfg(test)]
+mod regression_pipeline {
+    use super::*;
+    use crate::test_support::{pair, read_frame};
+    use bytes::BufMut;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn regression_short_pipelined_write_must_not_leave_unwritten_hole() {
+        let (c, mut s) = pair().await;
+        let pool = SmbPool::test_from_client(c.clone());
+        let expected: Vec<u8> = (0..131072).map(|i| (i % 251 + 1) as u8).collect();
+        let backend = tokio::spawn(async move {
+            let mut file = vec![0u8; 131072];
+            for round in 0..2 {
+                let count = 2;
+                let mut responses = Vec::new();
+                for i in 0..count {
+                    let request = read_frame(&mut s).await;
+                    let b = &request[64..];
+                    let data_offset = u16::from_le_bytes(b[2..4].try_into().unwrap()) as usize;
+                    let length = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                    let offset = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+                    let written = if round == 0 && i == 0 {
+                        length / 2
+                    } else {
+                        length
+                    };
+                    println!(
+                        "SMB WRITE offset={offset}, requested={length}, acknowledged={written}"
+                    );
+                    file[offset..offset + written]
+                        .copy_from_slice(&request[data_offset..data_offset + written]);
+                    let mut h = Header::decode(&request).unwrap();
+                    h.flags = 1;
+                    responses.push(build_request(&h, |b| {
+                        b.put_u16_le(17);
+                        b.put_u16_le(0);
+                        b.put_u32_le(written as u32);
+                        b.put_u32_le(0);
+                        b.put_u32_le(0);
+                    }));
+                }
+                for r in responses.into_iter().rev() {
+                    s.write_all(&r).await.unwrap();
+                }
+            }
+            file
+        });
+        let mut wal = WalWriter {
+            client: c,
+            pool,
+            tree_id: 1,
+            file_id: [1; 16],
+            wal_path: "temp".into(),
+            final_path: "dest".into(),
+            buf: expected.clone(),
+            flush_cap: 131072,
+            offset: 0,
+            total_size: 131072,
+        };
+        wal.flush().await.unwrap();
+        let actual = backend.await.unwrap();
+        println!(
+            "WAL reports {} bytes flushed; backend size={}; unwritten zero bytes={}",
+            wal.offset,
+            actual.len(),
+            actual.iter().filter(|v| **v == 0).count()
+        );
+        assert!(
+            actual == expected,
+            "short count in earlier pipeline slot left a hole despite successful flush and correct file length"
+        );
+    }
+}
+
+#[cfg(test)]
+mod regression_publication {
+    use super::*;
+    use crate::test_support::{error_reply, pair, read_frame};
+    use bytes::{BufMut, BytesMut};
+    use std::future::Future;
+    use std::task::Poll;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    async fn stat_reply(server: &mut TcpStream, request: &[u8]) {
+        let mut create = Header::decode(request).unwrap();
+        assert_eq!(create.command, Command::Create as u16);
+        let mut close = Header::decode(&request[create.next_command as usize..]).unwrap();
+        let mut body = [0u8; 88];
+        body[..2].copy_from_slice(&89u16.to_le_bytes());
+        body[48..56].copy_from_slice(&4u64.to_le_bytes());
+        body[64..80].fill(1);
+        create.flags = 1;
+        create.status = 0;
+        create.next_command = 152;
+        close.flags = 1;
+        close.status = 0;
+        close.next_command = 0;
+        let mut response = BytesMut::new();
+        response.put_u32(152 + 64 + 60);
+        create.encode(&mut response);
+        response.extend_from_slice(&body);
+        close.encode(&mut response);
+        response.extend_from_slice(&[0; 60]);
+        server.write_all(&response).await.unwrap();
+    }
+
+    fn verified_wal(client: Arc<SmbClient>, pool: Arc<SmbPool>) -> WalWriter {
+        WalWriter {
+            client,
+            pool,
+            tree_id: 1,
+            file_id: [1; 16],
+            wal_path: "temp".into(),
+            final_path: "dest".into(),
+            buf: Vec::new(),
+            flush_cap: 65536,
+            offset: 4,
+            total_size: 4,
+        }
+    }
+
+    fn create_body(size: u64) -> Vec<u8> {
+        let mut body = vec![0; 88];
+        body[..2].copy_from_slice(&89u16.to_le_bytes());
+        body[48..56].copy_from_slice(&size.to_le_bytes());
+        body[64..80].fill(1);
+        body
+    }
+
+    async fn compound_reply(server: &mut TcpStream, request: &[u8], replies: &[(u32, Vec<u8>)]) {
+        let mut packet = BytesMut::new();
+        let mut offset = 0;
+        for (index, (status, body)) in replies.iter().enumerate() {
+            let mut header = Header::decode(&request[offset..]).unwrap();
+            offset += header.next_command as usize;
+            let size = SMB2_HEADER_SIZE + body.len();
+            let padded = if index + 1 == replies.len() {
+                size
+            } else {
+                size.next_multiple_of(8)
+            };
+            header.flags = 1;
+            header.status = *status;
+            header.next_command = if index + 1 == replies.len() {
+                0
+            } else {
+                padded as u32
+            };
+            header.encode(&mut packet);
+            packet.extend_from_slice(body);
+            packet.resize(packet.len() + padded - size, 0);
+        }
+        server
+            .write_all(&(packet.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        server.write_all(&packet).await.unwrap();
+    }
+
+    async fn small_write_reply(server: &mut TcpStream, written: u32, size: u64, query_status: u32) {
+        let request = read_frame(server).await;
+        let parts = parse_compound_response(&Bytes::copy_from_slice(&request));
+        assert_eq!(
+            parts.iter().map(|(h, _)| h.command).collect::<Vec<_>>(),
+            [
+                Command::Create as u16,
+                Command::Write as u16,
+                Command::QueryInfo as u16
+            ]
+        );
+        let create = &parts[0].1;
+        let name_offset =
+            u16::from_le_bytes(create[44..46].try_into().unwrap()) as usize - SMB2_HEADER_SIZE;
+        let name_len = u16::from_le_bytes(create[46..48].try_into().unwrap()) as usize;
+        let name: Vec<u16> = create[name_offset..name_offset + name_len]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| u16::from_le_bytes(*v))
+            .collect();
+        assert!(
+            String::from_utf16(&name)
+                .unwrap()
+                .starts_with(".spiceio-wal\\"),
+            "the initial compound must never overwrite the final key"
+        );
+        let access = u32::from_le_bytes(create[24..28].try_into().unwrap());
+        assert_ne!(access & DesiredAccess::ReadAttributes as u32, 0);
+        let sharing = u32::from_le_bytes(create[32..36].try_into().unwrap());
+        assert_eq!(
+            sharing & ShareAccess::Delete as u32,
+            0,
+            "cleanup must not unlink the live temp"
+        );
+        let mut write = vec![0; 16];
+        write[..2].copy_from_slice(&17u16.to_le_bytes());
+        write[4..8].copy_from_slice(&written.to_le_bytes());
+        let mut query = vec![0; 64];
+        query[..2].copy_from_slice(&9u16.to_le_bytes());
+        query[2..4].copy_from_slice(&72u16.to_le_bytes());
+        query[4..8].copy_from_slice(&56u32.to_le_bytes());
+        query[48..56].copy_from_slice(&size.to_le_bytes());
+        compound_reply(
+            server,
+            &request,
+            &[(0, create_body(0)), (0, write), (query_status, query)],
+        )
+        .await;
+    }
+
+    fn small_write_share(client: Arc<SmbClient>) -> ShareSession {
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+        share
+            .ensured_dirs
+            .lock()
+            .unwrap()
+            .insert(WAL_DIR.to_owned());
+        share
+    }
+
+    async fn finish_publication(server: &mut TcpStream) {
+        let rename = read_frame(server).await;
+        assert_eq!(
+            Header::decode(&rename).unwrap().command,
+            Command::SetInfo as u16
+        );
+        error_reply(server, &rename, 0).await;
+        let close = read_frame(server).await;
+        assert_eq!(
+            Header::decode(&close).unwrap().command,
+            Command::Close as u16
+        );
+        error_reply(server, &close, 0).await;
+    }
+
+    #[tokio::test]
+    async fn small_atomic_write_verifies_before_publishing_in_three_round_trips() {
+        let (client, mut server) = pair().await;
+        let share = small_write_share(client);
+        let backend = tokio::spawn(async move {
+            small_write_reply(&mut server, 4, 4, 0).await;
+            finish_publication(&mut server).await;
+        });
+        assert_eq!(
+            share.put_object_atomic("dest", b"body").await.unwrap().size,
+            4
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_atomic_write_without_query_support_stats_before_publishing() {
+        let (client, mut server) = pair().await;
+        let share = small_write_share(client);
+        let backend = tokio::spawn(async move {
+            small_write_reply(&mut server, 4, 4, 0xC00000BB).await;
+            let stat = read_frame(&mut server).await;
+            stat_reply(&mut server, &stat).await;
+            finish_publication(&mut server).await;
+        });
+        assert_eq!(
+            share.put_object_atomic("dest", b"body").await.unwrap().size,
+            4
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_atomic_write_never_publishes_a_short_write_or_wrong_file_size() {
+        for (written, size) in [(3, 4), (4, 3), (4, 5)] {
+            let (client, mut server) = pair().await;
+            let share = small_write_share(client);
+            let backend = tokio::spawn(async move {
+                small_write_reply(&mut server, written, size, 0).await;
+                let close = read_frame(&mut server).await;
+                assert_eq!(
+                    Header::decode(&close).unwrap().command,
+                    Command::Close as u16,
+                    "a corrupt temp must be discarded before any rename"
+                );
+                error_reply(&mut server, &close, 0).await;
+                let delete = read_frame(&mut server).await;
+                assert_eq!(
+                    Header::decode(&delete).unwrap().command,
+                    Command::Create as u16
+                );
+                error_reply(&mut server, &delete, 0xC0000034).await;
+            });
+            assert!(share.put_object_atomic("dest", b"body").await.is_err());
+            backend.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn copychunk_source_waits_for_publication_and_releases_guard_after_open() {
+        let (client, mut server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client.clone()));
+        share.pool.test_enable_copychunk();
+        let publication = share.publication("source");
+        let writer = publication.clone().write_owned().await;
+        let copy = share.copychunk_from_path(
+            &client,
+            1,
+            CopySpec {
+                src_path: "source",
+                dst_file_id: &[2; 16],
+                src_start: 0,
+                dst_start: 0,
+                len: Some(0),
+                expect_src_size: None,
+            },
+        );
+        tokio::pin!(copy);
+        std::future::poll_fn(|cx| {
+            assert!(copy.as_mut().poll(cx).is_pending());
+            assert_eq!(
+                client.inflight(),
+                0,
+                "copy source CREATE bypassed publication"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let backend = tokio::spawn(async move {
+            let open = read_frame(&mut server).await;
+            compound_reply(&mut server, &open, &[(0, create_body(4))]).await;
+            let close = read_frame(&mut server).await;
+            let _next_writer = publication
+                .try_write()
+                .expect("copy held its read guard beyond the open");
+            error_reply(&mut server, &close, 0).await;
+        });
+        drop(writer);
+        assert_eq!(copy.await.unwrap(), Some(0));
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_copy_source_waits_for_publication() {
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let share = ShareSession::test_from_pool(pool.clone());
+        let writer = share.publication("source").write_owned().await;
+        let mut wal = verified_wal(client.clone(), pool);
+        let copy = share.stream_part_into_wal(&mut wal, "source", None);
+        tokio::pin!(copy);
+        std::future::poll_fn(|cx| {
+            assert!(copy.as_mut().poll(cx).is_pending());
+            assert_eq!(
+                client.inflight(),
+                0,
+                "streaming copy CREATE bypassed publication"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        let backend = tokio::spawn(async move {
+            let open = read_frame(&mut server).await;
+            compound_reply(&mut server, &open, &[(0, create_body(0))]).await;
+            let close = read_frame(&mut server).await;
+            error_reply(&mut server, &close, 0).await;
+        });
+        drop(writer);
+        copy.await.unwrap();
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_publication_retries_a_destination_reader_without_reopening_the_temp() {
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let share = ShareSession::test_from_pool(pool.clone());
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            stat_reply(&mut server, &request).await;
+            let rename = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&rename).unwrap().command,
+                Command::SetInfo as u16
+            );
+            error_reply(&mut server, &rename, 0xC0000022).await;
+            let retry = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&retry).unwrap().command,
+                Command::SetInfo as u16,
+                "a busy destination must not discard or reopen the verified temp"
+            );
+            error_reply(&mut server, &retry, 0).await;
+            let close = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&close).unwrap().command,
+                Command::Close as u16
+            );
+            error_reply(&mut server, &close, 0).await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            verified_wal(client, pool).commit(&share),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.size, 4);
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wal_publication_keeps_a_persistent_permission_failure_bounded() {
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let share = ShareSession::test_from_pool(pool.clone());
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            stat_reply(&mut server, &request).await;
+            for _ in 0..=MAX_RESET_RETRIES {
+                let rename = read_frame(&mut server).await;
+                assert_eq!(
+                    Header::decode(&rename).unwrap().command,
+                    Command::SetInfo as u16
+                );
+                error_reply(&mut server, &rename, 0xC0000022).await;
+            }
+            let close = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&close).unwrap().command,
+                Command::Close as u16
+            );
+            error_reply(&mut server, &close, 0).await;
+            let discard = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&discard).unwrap().command,
+                Command::Create as u16
+            );
+            error_reply(&mut server, &discard, 0xC0000034).await;
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(4),
+            verified_wal(client, pool).commit(&share),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_waits_until_publication_finishes_before_opening_the_name() {
+        let (client, mut server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client.clone()));
+        let publication = share.publication("dest").write_owned().await;
+        let head = share.head_object("dest");
+        tokio::pin!(head);
+        std::future::poll_fn(|cx| {
+            assert!(head.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            client.inflight(),
+            0,
+            "the missing-name interval must not reach SMB"
+        );
+        let backend = tokio::spawn(async move {
+            let request = read_frame(&mut server).await;
+            stat_reply(&mut server, &request).await;
+        });
+        drop(publication);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), head)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            4
+        );
+        backend.await.unwrap();
+    }
+
+    const READ_OPENS: [&str; 5] = ["head", "head-raw", "get", "stream", "copy"];
+
+    async fn read_leaf(share: &ShareSession, op: &str) -> io::Result<()> {
+        match op {
+            "head" => assert_eq!(share.head_object("dest").await?.size, 4),
+            "head-raw" => assert_eq!(share.head_object_smb("dest").await?.size, 4),
+            "get" => {
+                let (meta, body) = share.get_object_compound("dest", 4).await?;
+                assert_eq!(meta.size, 4);
+                assert_eq!(body.as_ref(), b"data");
+            }
+            "stream" => {
+                let file = share.open_read("dest").await?;
+                assert_eq!(file.file_size, 4);
+                file.close().await?;
+            }
+            "copy" => {
+                let (client, tree_id) = share.pick();
+                let file = share.open_copy_source_on(&client, tree_id, "dest").await?;
+                assert_eq!(file.file_size, 4);
+                client.close(tree_id, &file.file_id).await?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_read_open_recovers_a_peers_missing_name_interval() {
+        for op in READ_OPENS {
+            for status in [0xC0000034, 0xC000000F, 0xC0000056] {
+                let (client, mut server) = pair().await;
+                let pool = SmbPool::test_from_client(client);
+                let share = ShareSession::test_from_pool(Arc::clone(&pool));
+                // Model another process: its publication registry is independent.
+                let peer = ShareSession::test_from_pool(pool);
+                let peer_writer = peer.publication("dest").write_owned().await;
+                let backend = tokio::spawn(async move {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, status).await;
+                    drop(peer_writer);
+                    let request = read_frame(&mut server).await;
+                    match op {
+                        "head" | "head-raw" => stat_reply(&mut server, &request).await,
+                        "get" => {
+                            let mut read = vec![0u8; 20];
+                            read[..2].copy_from_slice(&17u16.to_le_bytes());
+                            read[2] = 80;
+                            read[4..8].copy_from_slice(&4u32.to_le_bytes());
+                            read[16..].copy_from_slice(b"data");
+                            compound_reply(
+                                &mut server,
+                                &request,
+                                &[(0, create_body(4)), (0, read), (0, vec![0; 60])],
+                            )
+                            .await;
+                        }
+                        _ => {
+                            compound_reply(&mut server, &request, &[(0, create_body(4))]).await;
+                            let close = read_frame(&mut server).await;
+                            assert_eq!(
+                                Header::decode(&close).unwrap().command,
+                                Command::Close as u16
+                            );
+                            error_reply(&mut server, &close, 0).await;
+                        }
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                backend.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_missing_leaf_is_rechecked_only_once() {
+        for op in READ_OPENS {
+            let (client, mut server) = pair().await;
+            let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+            let backend = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, 0xC0000034).await;
+                }
+            });
+            let error = tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            backend.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_paths_and_permissions_are_not_publication_retried() {
+        for op in READ_OPENS {
+            for status in [0xC000003A, 0xC0000033, 0xC00000BA, 0xC0000103, 0xC0000022] {
+                let (client, mut server) = pair().await;
+                let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+                let backend = tokio::spawn(async move {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, status).await;
+                });
+                let error = tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if status == 0xC0000022 {
+                        io::ErrorKind::PermissionDenied
+                    } else {
+                        io::ErrorKind::NotFound
+                    }
+                );
+                backend.await.unwrap();
+            }
+        }
     }
 }
