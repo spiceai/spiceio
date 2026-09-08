@@ -19,6 +19,7 @@ spiceio is an S3-compatible API proxy that translates S3 HTTP requests into SMB 
 make                           # fmt + full CI-local gate (see make ci)
 make ci                        # **required before PR green** — parity with .github/workflows/ci.yml
 make release                   # optimized release build
+make install                   # install release build + dSYM into ~/.local/bin (PREFIX=), restarting the launchd agent if one is loaded
 make lint                      # static only: fmt-check + check + clippy + rustdoc (NOT full CI)
 make test-unit                 # cargo test --locked (no SMB)
 make test                      # sccache integration only (requires SPICEIO_SMB_USER/PASS)
