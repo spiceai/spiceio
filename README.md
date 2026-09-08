@@ -284,7 +284,7 @@ ASLR slide; `make release` also emits `target/release/spiceio.dSYM` (and the
 release tarball bundles it), so raw addresses symbolize offline with:
 
 ```bash
-atos -o target/release/spiceio.dSYM/Contents/Resources/DWARF/spiceio \
+atos -o target/release/spiceio.dSYM \
      -l <image base from the report> <addresses...>
 ```
 
@@ -319,6 +319,7 @@ HTTP request
 make                   # fmt + full CI-local gate
 make ci                # parity with GitHub Actions (lint + unit + live SMB suites)
 make release           # optimized release build
+make install           # install the release build (+ dSYM) into ~/.local/bin
 make lint              # static only — not sufficient to claim CI will pass
 make test-unit         # cargo test (no SMB)
 make test              # sccache integration (requires SPICEIO_SMB_USER/PASS)
