@@ -18,21 +18,21 @@ use super::protocol::*;
 const MAX_RESET_RETRIES: u32 = 16;
 
 /// A peer process does not share our publication locks. Recheck a missing
-/// leaf once after a short pause to absorb its rename/close interval. A real
-/// missing leaf costs at most one extra open and this delay, not the much
-/// longer reset/busy ladder. Successful opens and missing parents pay nothing.
+/// leaf once to absorb its rename/close interval. The extra SMB round trip
+/// gives the peer time to close its writer; a fixed sleep here penalizes every
+/// genuine cache miss. Missing leaves cost at most one extra open, not the
+/// much longer reset/busy ladder. Successful opens and missing parents pay nothing.
 #[derive(Default)]
 struct PublicationRetry {
     retried: bool,
 }
 
 impl PublicationRetry {
-    async fn retry(&mut self, error: &io::Error) -> bool {
+    fn retry(&mut self, error: &io::Error) -> bool {
         if self.retried || !is_missing_name(error) {
             return false;
         }
         self.retried = true;
-        tokio::time::sleep(std::time::Duration::from_millis(4)).await;
         true
     }
 }
@@ -888,7 +888,7 @@ impl ShareSession {
             match op(client, tree_id).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    if publication.retry(&e).await {
+                    if publication.retry(&e) {
                         continue;
                     }
                     if is_reset(&e) {
@@ -1373,7 +1373,7 @@ impl ShareSession {
                 )
                 .await;
             match result {
-                Err(e) if publication.retry(&e).await => continue,
+                Err(e) if publication.retry(&e) => continue,
                 result => return result,
             }
         }
