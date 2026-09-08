@@ -3638,8 +3638,11 @@ mod regression_router {
                 .await
         );
         let backend = tokio::spawn(async move {
-            let r = read_frame(&mut server).await;
-            error_reply(&mut server, &r, 0xC0000034).await;
+            // The source remains absent after the bounded publication retry.
+            for _ in 0..2 {
+                let r = read_frame(&mut server).await;
+                error_reply(&mut server, &r, 0xC0000034).await;
+            }
         });
         let mut headers = http::HeaderMap::new();
         headers.insert(X_AMZ_COPY_SOURCE, "/audit/missing".parse().unwrap());

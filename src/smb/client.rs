@@ -2528,6 +2528,24 @@ fn update_preauth_hash(hash: &mut [u8; 64], message: &[u8]) {
     *hash = crypto::sha512(&input);
 }
 
+/// Preserve the missing leaf-name distinction without changing its public
+/// NotFound kind or message. A peer's WAL replacement can briefly produce this
+/// response; an invalid name, directory, or absent parent is a different case.
+#[derive(Debug)]
+struct MissingName(String);
+
+impl std::fmt::Display for MissingName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not found: {}", self.0)
+    }
+}
+
+impl std::error::Error for MissingName {}
+
+pub(super) fn is_missing_name(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|e| e.is::<MissingName>())
+}
+
 fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
     // Map raw status codes directly to avoid losing info through NtStatus enum.
     // We deliberately do NOT log for mapped statuses — many of these are
@@ -2538,14 +2556,16 @@ fn smb_status_to_io_error(status: u32, path: &str) -> io::Error {
     match status {
         0xC000_000F // STATUS_NO_SUCH_FILE
         | 0xC000_0034 // STATUS_OBJECT_NAME_NOT_FOUND
-        | 0xC000_003A // STATUS_OBJECT_PATH_NOT_FOUND
+        | 0xC000_0056 // STATUS_DELETE_PENDING
+        => io::Error::new(io::ErrorKind::NotFound, MissingName(path.to_owned())),
+
+        0xC000_003A // STATUS_OBJECT_PATH_NOT_FOUND
         | 0xC000_0033 // STATUS_OBJECT_NAME_INVALID
         // The S3 namespace has no directories: a key that resolves to an SMB
         // directory (GET dir-as-key), a path whose intermediate component is a
         // file, or a file mid-deletion is "no such key", not a 500.
         | 0xC000_00BA // STATUS_FILE_IS_A_DIRECTORY
         | 0xC000_0103 // STATUS_NOT_A_DIRECTORY
-        | 0xC000_0056 // STATUS_DELETE_PENDING
         => io::Error::new(io::ErrorKind::NotFound, format!("not found: {path}")),
 
         0xC000_0022 => io::Error::new( // STATUS_ACCESS_DENIED

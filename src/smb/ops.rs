@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use bytes::Bytes;
 use tokio::sync::RwLock;
 
-use super::client::SmbClient;
+use super::client::{SmbClient, is_missing_name};
 use super::pool::SmbPool;
 use super::protocol::*;
 
@@ -16,6 +16,26 @@ use super::protocol::*;
 /// giving up — enough halving steps (4 MiB → 64 KiB) plus headroom, while still
 /// terminating well within a client's request timeout if the server is down.
 const MAX_RESET_RETRIES: u32 = 16;
+
+/// A peer process does not share our publication locks. Recheck a missing
+/// leaf once after a short pause to absorb its rename/close interval. A real
+/// missing leaf costs at most one extra open and this delay, not the much
+/// longer reset/busy ladder. Successful opens and missing parents pay nothing.
+#[derive(Default)]
+struct PublicationRetry {
+    retried: bool,
+}
+
+impl PublicationRetry {
+    async fn retry(&mut self, error: &io::Error) -> bool {
+        if self.retried || !is_missing_name(error) {
+            return false;
+        }
+        self.retried = true;
+        tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        true
+    }
+}
 
 /// Cap on the process-lifetime directory existence cache. Hot prefixes
 /// (sccache, multi-file uploads under one tree) fit comfortably; past the cap
@@ -46,7 +66,9 @@ pub struct ShareSession {
     /// Readers may open concurrently, but not while a verified WAL replaces
     /// their path. Some SMB servers expose a brief missing-name interval during
     /// replacement. Only the open/stat is guarded; existing streams can drain
-    /// while publication waits for their backend handles to close.
+    /// while publication waits for their backend handles to close. Peer
+    /// processes have independent locks; `PublicationRetry` covers their
+    /// transient missing-name responses.
     publications: Arc<Mutex<HashMap<String, Weak<RwLock<()>>>>>,
 }
 
@@ -188,7 +210,7 @@ impl ShareSession {
         // Resilient open: under heavy concurrent load on a degraded NAS the
         // create can hit a transient reset; retry on a fresh connection so the
         // initial open of a streaming GET isn't lost (the client may not retry).
-        // A genuine NotFound is not a reset and returns immediately.
+        // Missing leaf names have a separate, single publication retry.
         let (client, tree_id, file) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -848,9 +870,10 @@ impl ShareSession {
 
     /// Run a one-shot read open/stat with bounded retry on transient errors —
     /// connection resets and `ResourceBusy` (SMB sharing violations) — each
-    /// attempt on a freshly-picked live connection. A non-retryable error (e.g. a
-    /// genuine NotFound) returns immediately; a reset backs off the adaptive read
-    /// size and a busy error backs off before retrying. The op receives the picked
+    /// attempt on a freshly-picked live connection. A missing leaf name has one
+    /// separate retry for publication by a peer process; other NotFound cases
+    /// return immediately. A reset backs off the adaptive read size and a busy
+    /// error backs off before retrying. The op receives the picked
     /// connection and returns whatever the caller needs (typically the picked
     /// `(client, tree_id)` plus the result).
     async fn retry_read_open<T, F, Fut>(&self, mut op: F) -> io::Result<T>
@@ -859,11 +882,15 @@ impl ShareSession {
         Fut: Future<Output = io::Result<T>>,
     {
         let mut attempt = 0u32;
+        let mut publication = PublicationRetry::default();
         loop {
             let (client, tree_id) = self.pick_live().await;
             match op(client, tree_id).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    if publication.retry(&e).await {
+                        continue;
+                    }
                     if is_reset(&e) {
                         self.pool.note_read_reset();
                     } else if is_busy(&e) {
@@ -1333,16 +1360,23 @@ impl ShareSession {
         smb_path: &str,
     ) -> io::Result<CreateResponse> {
         let _publication = self.publication(smb_path).read_owned().await;
-        client
-            .create(
-                tree_id,
-                smb_path,
-                DesiredAccess::GenericRead as u32,
-                ShareAccess::All as u32,
-                CreateDisposition::Open as u32,
-                CreateOptions::NonDirectoryFile as u32,
-            )
-            .await
+        let mut publication = PublicationRetry::default();
+        loop {
+            let result = client
+                .create(
+                    tree_id,
+                    smb_path,
+                    DesiredAccess::GenericRead as u32,
+                    ShareAccess::All as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32,
+                )
+                .await;
+            match result {
+                Err(e) if publication.retry(&e).await => continue,
+                result => return result,
+            }
+        }
     }
 
     /// Delete a temp file (best effort).
@@ -1502,9 +1536,9 @@ impl ShareSession {
     pub async fn head_object_smb(&self, smb_path: &str) -> io::Result<ObjectMeta> {
         let _publication = self.publication(smb_path).read_owned().await;
         // Resilient stat: retry the one-shot compound probe on a transient reset
-        // (fresh connection each attempt) so a HEAD — and the post-rename
-        // metadata read in WAL commit — survives a degraded NAS. A genuine
-        // NotFound is not a reset and returns immediately.
+        // (fresh connection each attempt) so a HEAD — and the pre-publication
+        // metadata read in WAL commit — survives a degraded NAS. Missing leaf
+        // names also get the single, bounded peer-publication retry.
         let smb_path = smb_path.to_string();
         let (cr, _) = self
             .retry_read_open(|client, tree_id| {
@@ -3738,19 +3772,127 @@ mod regression_publication {
         backend.await.unwrap();
     }
 
+    const READ_OPENS: [&str; 5] = ["head", "head-raw", "get", "stream", "copy"];
+
+    async fn read_leaf(share: &ShareSession, op: &str) -> io::Result<()> {
+        match op {
+            "head" => assert_eq!(share.head_object("dest").await?.size, 4),
+            "head-raw" => assert_eq!(share.head_object_smb("dest").await?.size, 4),
+            "get" => {
+                let (meta, body) = share.get_object_compound("dest", 4).await?;
+                assert_eq!(meta.size, 4);
+                assert_eq!(body.as_ref(), b"data");
+            }
+            "stream" => {
+                let file = share.open_read("dest").await?;
+                assert_eq!(file.file_size, 4);
+                file.close().await?;
+            }
+            "copy" => {
+                let (client, tree_id) = share.pick();
+                let file = share.open_copy_source_on(&client, tree_id, "dest").await?;
+                assert_eq!(file.file_size, 4);
+                client.close(tree_id, &file.file_id).await?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn a_genuinely_missing_name_is_not_retried() {
-        let (client, mut server) = pair().await;
-        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
-        let backend = tokio::spawn(async move {
-            let request = read_frame(&mut server).await;
-            error_reply(&mut server, &request, 0xC0000034).await;
-        });
-        let error = tokio::time::timeout(Duration::from_secs(1), share.head_object("absent"))
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        backend.await.unwrap();
+    async fn every_read_open_recovers_a_peers_missing_name_interval() {
+        for op in READ_OPENS {
+            for status in [0xC0000034, 0xC000000F, 0xC0000056] {
+                let (client, mut server) = pair().await;
+                let pool = SmbPool::test_from_client(client);
+                let share = ShareSession::test_from_pool(Arc::clone(&pool));
+                // Model another process: its publication registry is independent.
+                let peer = ShareSession::test_from_pool(pool);
+                let peer_writer = peer.publication("dest").write_owned().await;
+                let backend = tokio::spawn(async move {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, status).await;
+                    drop(peer_writer);
+                    let request = read_frame(&mut server).await;
+                    match op {
+                        "head" | "head-raw" => stat_reply(&mut server, &request).await,
+                        "get" => {
+                            let mut read = vec![0u8; 20];
+                            read[..2].copy_from_slice(&17u16.to_le_bytes());
+                            read[2] = 80;
+                            read[4..8].copy_from_slice(&4u32.to_le_bytes());
+                            read[16..].copy_from_slice(b"data");
+                            compound_reply(
+                                &mut server,
+                                &request,
+                                &[(0, create_body(4)), (0, read), (0, vec![0; 60])],
+                            )
+                            .await;
+                        }
+                        _ => {
+                            compound_reply(&mut server, &request, &[(0, create_body(4))]).await;
+                            let close = read_frame(&mut server).await;
+                            assert_eq!(
+                                Header::decode(&close).unwrap().command,
+                                Command::Close as u16
+                            );
+                            error_reply(&mut server, &close, 0).await;
+                        }
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                backend.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_missing_leaf_is_rechecked_only_once() {
+        for op in READ_OPENS {
+            let (client, mut server) = pair().await;
+            let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+            let backend = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, 0xC0000034).await;
+                }
+            });
+            let error = tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            backend.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_paths_and_permissions_are_not_publication_retried() {
+        for op in READ_OPENS {
+            for status in [0xC000003A, 0xC0000033, 0xC00000BA, 0xC0000103, 0xC0000022] {
+                let (client, mut server) = pair().await;
+                let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+                let backend = tokio::spawn(async move {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, status).await;
+                });
+                let error = tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if status == 0xC0000022 {
+                        io::ErrorKind::PermissionDenied
+                    } else {
+                        io::ErrorKind::NotFound
+                    }
+                );
+                backend.await.unwrap();
+            }
+        }
     }
 }

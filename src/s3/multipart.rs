@@ -119,15 +119,25 @@ impl MultipartStore {
     /// and reclaim temp files from uploads a client never completed/aborted.
     pub async fn reap_expired(&self, now_secs: u64, ttl_secs: u64) -> Vec<UploadState> {
         let mut uploads = self.uploads.write().await;
-        let expired: Vec<String> = uploads
+        let expired: Vec<_> = uploads
             .iter()
-            .filter(|(_, u)| {
-                now_secs.saturating_sub(u.initiated) > ttl_secs
-                    && u.operation_lock.try_write().is_ok()
+            .filter_map(|(id, u)| {
+                if now_secs.saturating_sub(u.initiated) <= ttl_secs {
+                    return None;
+                }
+                Arc::clone(&u.operation_lock)
+                    .try_write_owned()
+                    .ok()
+                    .map(|guard| (id.clone(), guard))
             })
-            .map(|(id, _)| id.clone())
             .collect();
-        expired.iter().filter_map(|id| uploads.remove(id)).collect()
+        // A request may already hold a clone of an upload's lock. Retain the
+        // exclusive guard through removal, so it either started before the
+        // reaper (and was skipped) or observes NoSuchUpload after taking it.
+        expired
+            .into_iter()
+            .filter_map(|(id, _guard)| uploads.remove(&id))
+            .collect()
     }
 
     /// List all active uploads, optionally filtered by key prefix.
@@ -214,6 +224,42 @@ mod tests {
         assert_eq!(reaped[0].key, "old");
         assert!(store.get(&old).await.is_none());
         assert!(store.get(&fresh).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reaper_skips_operations_then_invalidates_previously_cloned_locks() {
+        let store = MultipartStore::new();
+        let id = store.create("key").await;
+        store.uploads.write().await.get_mut(&id).unwrap().initiated = 1;
+        let lock = store.operation_lock(&id).await.unwrap();
+
+        let part = Arc::clone(&lock).read_owned().await;
+        assert!(store.reap_expired(1000, 60).await.is_empty());
+        assert!(
+            store
+                .put_part(&id, 1, 4, "etag".into(), "part".into())
+                .await
+                .is_some()
+        );
+        drop(part);
+
+        let completion = Arc::clone(&lock).write_owned().await;
+        assert!(store.reap_expired(1000, 60).await.is_empty());
+        drop(completion);
+
+        // A request cloned the lock before the reaper, but has not acquired
+        // it yet. Once the reaper wins, this request must see NoSuchUpload.
+        let reaped = store.reap_expired(1000, 60).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].parts.len(), 1);
+        let _late_part = lock.read_owned().await;
+        assert!(store.get(&id).await.is_none());
+        assert!(
+            store
+                .put_part(&id, 2, 4, "late".into(), "late-part".into())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

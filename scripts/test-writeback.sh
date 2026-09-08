@@ -613,6 +613,20 @@ stop PID2
 stop PID1
 rm -rf "$COPY_SPILL"
 
+# 10. A peer process can read during WAL replacement. Disable every cache so
+# GET/HEAD/range/copy source opens all observe the shared SMB namespace.
+echo ""
+echo " 10. Cross-process publication with uncached readers"
+start PID1 "$BIND" SPICEIO_WRITE_BACK=0 SPICEIO_SPILL_DIR=off SPICEIO_OBJECT_CACHE_BYTES=0
+start PID2 "$BIND2" SPICEIO_WRITE_BACK=0 SPICEIO_SPILL_DIR=off SPICEIO_OBJECT_CACHE_BYTES=0
+if python3 scripts/test-peer-publication.py "$ENDPOINT" "$ENDPOINT2" "$BUCKET" "${PREFIX}/peer"; then
+    ok "peer reads and copies see complete generations during replacement"
+else
+    bad "cross-process publication returned a missing or torn object"
+fi
+stop PID2
+stop PID1
+
 # ── Cleanup of test objects ────────────────────────────────────────────────
 start PID1 "$BIND" SPICEIO_WRITE_BACK=0 SPICEIO_SPILL_DIR=off
 for key in "${PREFIX}/small.bin" "${PREFIX}/large.bin" "$range_key" "$ow_key"; do
