@@ -27,6 +27,14 @@ jobs:
       # overwhelm the shared test NAS with full-core fan-out under concurrent
       # load (the runner default would scale with cores).
       SPICEIO_SMB_CONNECTIONS: "8"
+      # OTEL push is opt-in: empty vars leave the exporter off. Set repo
+      # vars SPICEIO_OTEL_ENDPOINT / SPICEIO_OTEL_REGION and secret
+      # SPICEIO_OTEL_API_KEY to push live-suite metrics to a Spice Cloud app.
+      SPICEIO_OTEL_ENDPOINT: ${{ vars.SPICEIO_OTEL_ENDPOINT }}
+      SPICEIO_OTEL_API_KEY: ${{ secrets.SPICEIO_OTEL_API_KEY }}
+      SPICEIO_OTEL_REGION: ${{ vars.SPICEIO_OTEL_REGION }}
+      SPICEIO_INSTANCE_ID: ci-${{ github.run_id }}
+      SPICEIO_MACHINE: ${{ runner.name }}
 
     steps:
       - name: Check out repository

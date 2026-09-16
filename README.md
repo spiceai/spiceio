@@ -131,14 +131,56 @@ All configuration is via environment variables:
 | `SPICEIO_CLEANUP_GRACE_SECS`  | no       | `900`               | Startup cleanup leaves temp files/uploads newer than this alone, so instances sharing a share don't delete each other's in-flight state. `0` sweeps everything |
 | `SPICEIO_LOG_FILE`            | no       | *(none)*            | Append logs to file (non-blocking) |
 | `SPICEIO_ACCESS_LOG`          | no       | *(none)*            | Per-request TSV metrics log for benchmarking: `t_ms method status req_bytes resp_bytes head_us total_us path` |
+| `SPICEIO_INSTANCE_ID`         | no       | random UUID v4      | Identity of this process. Logged at startup and sent as `service.instance.id` on every OTEL metric. Pin it to keep a stable series across restarts |
+| `SPICEIO_MACHINE`             | no       | kernel hostname     | `machine` dimension on every OTEL metric. Override when the hostname is not the name you want in dashboards |
+| `SPICEIO_OTEL_ENDPOINT`       | no       | *(none)*            | Push performance metrics over OTLP/gRPC to a Spice Cloud app. Accepts `org/app` (e.g. `spicehq/spiceio`), `https://spice.ai/org/app`, or a raw gRPC URL (`https://host:443`, `http://127.0.0.1:50051`) |
+| `SPICEIO_OTEL_API_KEY`        | no       | *(none)*            | Spice Cloud app API key (`x-api-key` metadata). Required for Cloud ingest |
+| `SPICEIO_OTEL_REGION`         | no       | `us-east-1`         | Cloud region used when `SPICEIO_OTEL_ENDPOINT` is an org/app pair; selects `{region}-prod-aws-flight.spiceai.io` |
+| `SPICEIO_OTEL_INTERVAL_SECS`  | no       | `15`                | How often metrics are pushed. Failed pushes are retried with the interval re-accumulated rather than dropped |
 | `SPICEIO_OBJECT_CACHE_BYTES`  | no       | `8589934592` (8 GiB) | Max total GET body cache size — up to this much resident memory. The most effective tuning knob |
 | `SPICEIO_OBJECT_CACHE_MAX_OBJECT` | no   | budget / 64 (128 MiB) | Max size of a single cached object; scales with the budget so one object cannot evict a large share of the cache |
 | `SPICEIO_OBJECT_CACHE_ENTRIES`| no       | `131072`            | Max body-cache entries (sized so bytes bind first) |
-| `SPICEIO_IMMUTABLE_OBJECTS`   | no       | off                 | When `1`/`true`, serve cached bodies by key with **no backend round trip**. For content-addressed stores (sccache) where the key is a hash of the content. Gives up noticing a backend-side delete |
+| `SPICEIO_IMMUTABLE_OBJECTS`   | no       | off                 | When `1`/`true`, serve cached bodies by key with **no backend round trip**. For content-addressed stores (sccache) where the key is a hash of the content. Gives up noticing a backend-side delete. Also turns on the existence index (fast 404s) unless `SPICEIO_EXISTENCE_INDEX` overrides |
+| `SPICEIO_EXISTENCE_INDEX`     | no       | follows immutable   | Lazy per-directory name set: one SMB list of a parent, then missing leaves 404 with no open. Default on when immutable objects are on. `0`/`false`/`off` disables; `1`/`true` enables even if immutable is off. Wrong for a mutable namespace that must notice a peer's PUT |
+| `SPICEIO_EXISTENCE_INDEX_TTL_SECS` | no | `0` (until PUT/DELETE) | Completeness TTL for a listed directory. `0` never expires; a peer PUT of a new hash 404s until then (acceptable for sccache) |
 | `SPICEIO_SPILL_DIR`           | no       | `/var/tmp/spiceio-cache` | Disk tier behind the memory cache, shared by every instance on the host. Created 0700, so sharing is between processes of the same user; point this at a group-shared directory for cross-user sharing. `off` (or empty) disables it |
 | `SPICEIO_SPILL_BYTES`         | no       | `68719476736` (64 GiB) | Disk budget for the whole spill directory, across all instances. Clamped so at least 10 GiB stays free, and to half the space above that |
 | `SPICEIO_WRITE_BACK`          | no       | **on**              | Acknowledge PutObject from memory and write to the NAS in the background. `0`/`false`/`off` disables. **Trades durability for latency** — see [Write-back](#write-back) |
 | `SPICEIO_WRITE_BACK_BYTES`    | no       | `1073741824` (1 GiB) | Ceiling on un-flushed bytes; past it PutObject writes through synchronously, applying backpressure |
+
+## OTEL metrics (Spice Cloud)
+
+spiceio **pushes** performance metrics over OTLP/gRPC to a Spice Cloud app — it
+does not expose a scrape endpoint. The Cloud app's Flight port is the
+`MetricsService` ingest Spice already runs; metric names must match dataset
+names in that app.
+
+Each process has an **instance id** (UUID v4, or `SPICEIO_INSTANCE_ID`) and
+labels every data point with **`machine`** (hostname, or `SPICEIO_MACHINE`)
+and `service.instance.id`, so two proxies or two hosts are distinguishable in
+the same app.
+
+```bash
+export SPICEIO_OTEL_ENDPOINT=spicehq/spiceio          # or https://spice.ai/spicehq/spiceio
+export SPICEIO_OTEL_API_KEY=<app api key>
+export SPICEIO_OTEL_REGION=us-west-2                  # this app's region
+# optional: SPICEIO_INSTANCE_ID=nas-1
+# optional: SPICEIO_MACHINE=build-host-3
+```
+
+Pushed metrics (delta sums/histograms over the interval, gauges as snapshots):
+
+| Metric | Type | Dimensions |
+| ------ | ---- | ---------- |
+| `spiceio_http_requests` | Sum | `method`, `status`, `machine`, `service.instance.id` |
+| `spiceio_http_request_bytes` / `spiceio_http_response_bytes` | Sum | `method`, `status`, `machine`, `service.instance.id` |
+| `spiceio_http_duration_us` / `spiceio_http_head_duration_us` | Histogram | `method`, `status`, `machine`, `service.instance.id` |
+| `spiceio_cache_hits` / `_misses` / `_hit_bytes` / `_bytes` / `_entries` | Gauge | `machine`, `service.instance.id` |
+| `spiceio_spill_*`, `spiceio_writeback_*`, `spiceio_smb_inflight`, `spiceio_uptime_seconds` | Gauge | `machine`, `service.instance.id` |
+| `spiceio_existence_absents` / `spiceio_existence_lists` | Gauge | `machine`, `service.instance.id` |
+
+A failed push is retried with the interval re-accumulated; a down Cloud app
+never stalls the proxy.
 
 ## Caching
 
@@ -149,6 +191,12 @@ Three tiers answer a GET, in order:
 | L1   | process memory | 8 GiB (`SPICEIO_OBJECT_CACHE_BYTES`) | no |
 | L2   | local disk (`SPICEIO_SPILL_DIR`) | 64 GiB (`SPICEIO_SPILL_BYTES`) | every instance on the machine |
 | —    | the NAS over SMB | — | — |
+
+A **directory existence index** (on with `SPICEIO_IMMUTABLE_OBJECTS`) sits
+beside the body cache: one SMB list of a parent directory, then missing leaves
+404 with no open. That is the sccache cold-build path (GET 404, then compile).
+A negative cache of past 404s cannot help — each compile unit is a unique hash
+seen once.
 
 L2 exists because the backend saturates at a fixed rate (~100 MiB/s measured)
 while local NVMe does not, and because a second spiceio instance should not

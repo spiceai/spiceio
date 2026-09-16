@@ -24,6 +24,8 @@ pub mod access_log;
 pub mod crash;
 pub mod crypto;
 pub mod http;
+pub mod instance;
+pub mod otel;
 pub mod s3;
 pub mod smb;
 

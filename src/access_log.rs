@@ -157,12 +157,13 @@ pub struct Pending {
     req_bytes: u64,
 }
 
-/// Snapshot an incoming request, or `None` when the access log is off.
+/// Snapshot an incoming request, or `None` when neither the access log nor
+/// the OTEL exporter is on.
 ///
 /// Takes the method, path and declared request length before `handle_request`
 /// consumes the request — none of it is recoverable from the response.
 pub fn begin<B>(req: &Request<B>) -> Option<Pending> {
-    if !ENABLED.load(Ordering::Relaxed) {
+    if !ENABLED.load(Ordering::Relaxed) && !crate::otel::enabled() {
         return None;
     }
     let req_bytes = req
@@ -183,8 +184,7 @@ pub fn begin<B>(req: &Request<B>) -> Option<Pending> {
 /// Attach the pending snapshot to the response body so the record is written
 /// when the body finishes (or is dropped), not when the head is produced.
 ///
-/// Returns the body unchanged — wrapped in a no-op `Metered` — when the access
-/// log is off.
+/// Returns the body wrapped in a no-op `Metered` when `pending` is `None`.
 pub fn finish<B>(pending: Option<Pending>, status: StatusCode, body: B) -> Metered<B> {
     let entry = pending.map(|p| {
         let head_us = p.start.elapsed().as_micros() as u64;
@@ -216,6 +216,17 @@ struct Entry {
 impl Entry {
     fn emit(self) {
         let total_us = self.start.elapsed().as_micros() as u64;
+        crate::otel::record_request(
+            &self.method,
+            self.status,
+            self.req_bytes,
+            self.resp_bytes,
+            self.head_us,
+            total_us,
+        );
+        if !ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
         send(Msg::Line(format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.t_ms,
@@ -230,8 +241,8 @@ impl Entry {
     }
 }
 
-/// Response body that counts the bytes it yields and writes one access-log line
-/// when the response completes.
+/// Response body that counts the bytes it yields and records the request
+/// (access log and/or OTEL) when the response completes.
 ///
 /// The line is emitted from `Drop` as well as from end-of-stream, so a transfer
 /// the client abandons mid-body is still recorded (with the bytes it actually

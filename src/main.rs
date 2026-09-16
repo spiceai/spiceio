@@ -12,7 +12,9 @@ use tokio::signal;
 use spiceio::access_log;
 use spiceio::crash;
 use spiceio::http;
+use spiceio::instance;
 use spiceio::log;
+use spiceio::otel;
 use spiceio::s3;
 use spiceio::serr;
 use spiceio::slog;
@@ -266,6 +268,19 @@ async fn connect_share(
         }
     }
 
+    let existence = Arc::new(s3::existence::ExistenceIndex::from_env(
+        object_cache.immutable(),
+    ));
+    if existence.enabled() {
+        slog!(
+            "[spiceio] existence index: on (lazy directory lists for fast 404s{})",
+            existence
+                .ttl()
+                .map(|t| format!(", TTL {}s", t.as_secs()))
+                .unwrap_or_default()
+        );
+    }
+
     Ok(Arc::new(AppState {
         client_inflight: share.client_inflight(),
         share,
@@ -276,6 +291,7 @@ async fn connect_share(
         smb_slots,
         object_cache,
         writeback,
+        existence,
     }))
 }
 
@@ -341,6 +357,11 @@ async fn main() {
     // opening the path "" would otherwise fail and exit at startup.
     let log_file = env::var("SPICEIO_LOG_FILE").ok().filter(|s| !s.is_empty());
     log::init(log_file.as_deref());
+    let instance_id = instance::init(
+        env::var("SPICEIO_INSTANCE_ID")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    );
     // Crash reporting (panic hook + fatal-signal handlers) — as early as
     // possible so every later failure leaves a report on stderr + log file.
     crash::install(log_file.as_deref());
@@ -356,7 +377,7 @@ async fn main() {
     }
 
     slog!(
-        "[spiceio] v{} starting (pid {})",
+        "[spiceio] v{} starting (pid {}, instance {instance_id})",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
@@ -411,6 +432,37 @@ async fn main() {
     // refused" during a slow NAS connect — they get a 503 SlowDown they can
     // retry instead of a hard TCP error that aborts server startup.
     let ready: Arc<OnceLock<Arc<AppState>>> = Arc::new(OnceLock::new());
+
+    if let Some(endpoint) = env::var("SPICEIO_OTEL_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let api_key = env::var("SPICEIO_OTEL_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if api_key.is_none() {
+            serr!(
+                "[spiceio] SPICEIO_OTEL_API_KEY is unset; Spice Cloud apps require it for OTEL ingest"
+            );
+        }
+        let region = env::var("SPICEIO_OTEL_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let interval_secs = parse_env_or("SPICEIO_OTEL_INTERVAL_SECS", 15u64).max(1);
+        let machine = env::var("SPICEIO_MACHINE").ok().filter(|s| !s.is_empty());
+        match otel::start(
+            otel::Config {
+                endpoint: endpoint.clone(),
+                api_key,
+                region,
+                interval: Duration::from_secs(interval_secs),
+                share: config.smb_share.clone(),
+                machine,
+            },
+            Arc::clone(&ready),
+        ) {
+            Ok(desc) => slog!("[spiceio] OTEL push: {endpoint} → {desc} every {interval_secs}s"),
+            Err(e) => serr!("[spiceio] OTEL exporter disabled: {e}"),
+        }
+    }
 
     slog!("[spiceio] accepting connections on http://{bind_addr} (connecting to SMB…)");
     slog!(
@@ -905,6 +957,7 @@ async fn main() {
 
     // Push the final log lines (including the shutdown notice) to disk before
     // the process exits and takes the writer thread with it.
+    otel::shutdown(Duration::from_secs(2)).await;
     access_log::flush(Duration::from_millis(500));
     log::flush(Duration::from_millis(500));
 }

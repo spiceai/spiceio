@@ -45,6 +45,7 @@ pub(crate) async fn state() -> (AppState, TcpStream) {
             listings: Default::default(),
             object_cache: Arc::new(ObjectCache::new(false, 1024, 1024, 64)),
             writeback: Arc::new(WriteBack::new(true, 1024)),
+            existence: Arc::new(crate::s3::existence::ExistenceIndex::disabled()),
         },
         s,
     )

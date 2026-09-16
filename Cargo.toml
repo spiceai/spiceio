@@ -26,13 +26,18 @@ loadgen = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-graceful"] }
 http-body = "1"
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
 percent-encoding = "2"
+# TLS for the OTLP/gRPC exporter. native-tls is Security.framework on macOS,
+# matching the "use OS APIs" rule; the `alpn` feature is required to negotiate
+# HTTP/2 with Spice Cloud apps.
+native-tls = { version = "0.2", features = ["alpn"] }
+tokio-native-tls = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -77,6 +77,40 @@ inputs:
       space above that. Set it lower on a runner whose disk the build needs.
     required: false
     default: ""
+  otel-endpoint:
+    description: >
+      SPICEIO_OTEL_ENDPOINT — push performance metrics over OTLP/gRPC to a
+      Spice Cloud app. Accepts org/app (e.g. spicehq/spiceio),
+      https://spice.ai/org/app, or a raw gRPC URL. Empty leaves the exporter
+      off. A down Cloud app never stalls the proxy.
+    required: false
+    default: ""
+  otel-api-key:
+    description: >
+      SPICEIO_OTEL_API_KEY — Spice Cloud app API key, sent as x-api-key
+      metadata. Required for Cloud ingest; unused when otel-endpoint is empty.
+    required: false
+    default: ""
+  otel-region:
+    description: >
+      SPICEIO_OTEL_REGION — Cloud region used when otel-endpoint is an org/app
+      pair (selects {region}-prod-aws-flight.spiceai.io). Empty uses spiceio's
+      default of us-east-1. spicehq/spiceio is us-west-2.
+    required: false
+    default: ""
+  instance-id:
+    description: >
+      SPICEIO_INSTANCE_ID — process identity sent as service.instance.id on
+      every metric and logged at startup. Empty generates a UUID v4. Pin it
+      (e.g. ci-$GITHUB_RUN_ID) so successive jobs are distinguishable.
+    required: false
+    default: ""
+  machine:
+    description: >
+      SPICEIO_MACHINE — machine dimension on every OTEL metric. Empty uses
+      the kernel hostname.
+    required: false
+    default: ""
   export-aws-endpoint:
     description: >
       When "true" or "1", also export AWS_ENDPOINT_URL to $GITHUB_ENV so later
@@ -156,6 +190,11 @@ runs:
         WRITE_BACK: ${{ inputs.write-back }}
         SPILL_DIR: ${{ inputs.spill-dir }}
         SPILL_BYTES: ${{ inputs.spill-bytes }}
+        OTEL_ENDPOINT: ${{ inputs.otel-endpoint }}
+        OTEL_API_KEY: ${{ inputs.otel-api-key }}
+        OTEL_REGION: ${{ inputs.otel-region }}
+        INSTANCE_ID: ${{ inputs.instance-id }}
+        MACHINE: ${{ inputs.machine }}
         EXPORT_AWS_ENDPOINT: ${{ inputs.export-aws-endpoint }}
       run: |
         set -euo pipefail
@@ -225,6 +264,23 @@ runs:
             1|true|yes) export SPICEIO_WRITE_BACK=1 ;;
             *)          export SPICEIO_WRITE_BACK=0 ;;
           esac
+        fi
+        # OTEL is off unless an endpoint is given. Empty inputs must not pin
+        # the region or a blank API key — spiceio treats unset as off / default.
+        if [[ -n "$OTEL_ENDPOINT" ]]; then
+          export SPICEIO_OTEL_ENDPOINT="$OTEL_ENDPOINT"
+        fi
+        if [[ -n "$OTEL_API_KEY" ]]; then
+          export SPICEIO_OTEL_API_KEY="$OTEL_API_KEY"
+        fi
+        if [[ -n "$OTEL_REGION" ]]; then
+          export SPICEIO_OTEL_REGION="$OTEL_REGION"
+        fi
+        if [[ -n "$INSTANCE_ID" ]]; then
+          export SPICEIO_INSTANCE_ID="$INSTANCE_ID"
+        fi
+        if [[ -n "$MACHINE" ]]; then
+          export SPICEIO_MACHINE="$MACHINE"
         fi
 
         SPICEIO_LOG="${RUNNER_TEMP}/spiceio.log"

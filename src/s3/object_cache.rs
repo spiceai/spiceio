@@ -672,7 +672,6 @@ impl ObjectCache {
         g.remove(key);
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner
             .lock()
@@ -681,7 +680,6 @@ impl ObjectCache {
             .len()
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -701,7 +699,6 @@ impl ObjectCache {
         }
     }
 
-    #[cfg(test)]
     pub fn total_bytes(&self) -> u64 {
         self.inner
             .lock()
