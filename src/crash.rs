@@ -208,9 +208,11 @@ fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
     let base = IMAGE_BASE.get().copied().unwrap_or(0);
     let slide = IMAGE_SLIDE.get().copied().unwrap_or(0);
 
+    let instance = crate::instance::id().unwrap_or("-");
     let report = format!(
         "\n=== spiceio crash report (panic) ===\n\
          version : {version} (pid {pid}, uptime {uptime}s)\n\
+         instance: {instance}\n\
          thread  : {thread_name}\n\
          panicked at {location}:\n  {msg}\n\
          image   : base 0x{base:x} slide 0x{slide:x} \

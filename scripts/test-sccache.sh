@@ -139,8 +139,9 @@ SPICEIO_LOG_FILE="${SPICEIO_LOG_FILE:-}" \
 SPICEIO_PID=$!
 
 echo "[test] waiting for spiceio on ${BIND}..."
-for i in $(seq 1 30); do
-    if curl -sf -o /dev/null "${ENDPOINT}/" 2>/dev/null; then
+for i in $(seq 1 60); do
+    if curl -sf -o /dev/null "${ENDPOINT}/" 2>/dev/null \
+        && $AWS s3 ls 2>/dev/null | grep -q "$BUCKET"; then
         echo "[test] spiceio ready"
         break
     fi

@@ -117,6 +117,12 @@ The binary requires these environment variables:
 - `SPICEIO_CLEANUP_GRACE_SECS` — startup cleanup leaves WAL temps / upload dirs newer than this alone (default `900`), so instances sharing one share don't delete each other's in-flight state; `0` restores a blanket sweep
 - `SPICEIO_LOG_FILE` — append logs to this file in addition to stderr (optional; non-blocking, never stalls the proxy)
 - `SPICEIO_ACCESS_LOG` — per-request TSV metrics log for benchmarking (optional; off by default, one atomic load per request when off)
+- `SPICEIO_INSTANCE_ID` — process identity (default: UUID v4 at startup). Logged and sent as OTEL `service.instance.id`
+- `SPICEIO_MACHINE` — `machine` dimension on OTEL metrics (default: kernel hostname)
+- `SPICEIO_OTEL_ENDPOINT` — push performance metrics over OTLP/gRPC to a Spice Cloud app (`org/app`, `https://spice.ai/org/app`, or a raw gRPC URL). Off when unset
+- `SPICEIO_OTEL_API_KEY` — Spice Cloud app API key (`x-api-key`). Required for Cloud ingest
+- `SPICEIO_OTEL_REGION` — Cloud region when the endpoint is an org/app pair (default `us-east-1`)
+- `SPICEIO_OTEL_INTERVAL_SECS` — push interval (default `15`)
 - `SPICEIO_OBJECT_CACHE_BYTES` — max total GET body cache size (default `8589934592` = **8 GiB**, i.e. up to 8 GiB resident). **The most effective tuning knob**: the body cache is the only path that answers a GET without backend I/O, and eviction is O(log n) so a large cache costs no CPU. Budget is logged at startup, hit rate at shutdown; lower it on hosts that cannot spare the memory
 - `SPICEIO_OBJECT_CACHE_MAX_OBJECT` — max size of a single cached object (default: 1/64 of the budget, so it scales with it — 128 MiB at the 8 GiB default). The cap is about how many *other* objects one admission evicts: a fixed 32 MiB cap against a 256 MiB budget measured a hit-rate drop from 93% to 60%
 - `SPICEIO_OBJECT_CACHE_ENTRIES` — max cache entries (default `131072`, sized so *bytes* stay the binding constraint rather than the entry count)
@@ -128,7 +134,7 @@ The binary requires these environment variables:
 
 ## Architecture
 
-The codebase has five modules:
+The codebase has these modules:
 
 - **`s3`** — HTTP layer. Parses incoming S3 API requests and produces XML responses. `router.rs` is the central dispatch (path-style bucket routing). Covers GetObject, PutObject, CopyObject, DeleteObject, HeadObject, ListObjectsV1/V2, multipart uploads (including UploadPartCopy, the form `aws s3 cp`/`sync` use for objects above the ~8 MiB multipart threshold), and stub endpoints for ACL/tagging/versioning. `xml.rs` is a hand-rolled XML builder. `multipart.rs` manages upload state in-memory, with parts stored as temp files under `.spiceio-uploads/` on the SMB share. `body.rs` implements `SpiceioBody`, a zero-copy streaming response body (channel-backed for large reads, inline for XML/errors).
 
@@ -140,6 +146,8 @@ The codebase has five modules:
 
 - **`http`** — HTTP front-end tuning for the S3 listener (connection builder, header-read timeout, accept backoff, shutdown grace). Kept out of the accept loop so `tests/http_frontend.rs` exercises the same configuration the server runs with. HTTP/1.1 only — every S3 client speaks HTTP/1.1 to a plain-HTTP endpoint, and the protocol-sniffing `auto` server both pulls in the whole HTTP/2 stack and defers the header timeout past the connect-and-say-nothing case it exists for.
 
+- **`instance`** — Process instance id (UUID v4, overridable) and hostname, used as OTEL resource attributes.
+- **`otel`** — OTLP/gRPC push exporter to a Spice Cloud app. Hand-rolled protobuf + HTTP/2 (no OpenTelemetry SDK). Off unless `SPICEIO_OTEL_ENDPOINT` is set; every data point carries `machine` and `service.instance.id`.
 - **`crash`** — Crash reporting. A panic hook (location + backtrace, works with `panic = "abort"`) and an async-signal-safe fatal-signal handler (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP/SIGABRT: fault address, registers, frame-pointer backtrace). Reports are written synchronously to stderr and `SPICEIO_LOG_FILE`, bypassing the async logger. Release builds stay stripped; `target/release/spiceio.dSYM` (from `split-debuginfo = "packed"`) symbolizes the raw addresses offline via `atos -l <image base>`. Tested end-to-end via the hidden `--crash-test <panic|segv|abort>` flag (`tests/crash_report.rs`).
 
 **Request flow:** HTTP request → `s3::router::handle_request` → S3 operation → `smb::ops::ShareSession` method → `smb::client::SmbClient` wire operations → TCP to SMB server.
