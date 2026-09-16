@@ -94,15 +94,21 @@ impl Encoder {
         self.fixed64(field, v.to_bits());
     }
 
-    fn packed_uint64(&mut self, field: u32, values: &[u64]) {
+    /// Packed repeated `fixed64` (proto3 default packing for that type).
+    ///
+    /// `HistogramDataPoint.bucket_counts` is `fixed64` in the OTLP that Spice
+    /// Cloud / the OSS runtime decode (`opentelemetry-proto` 0.32,
+    /// `#[prost(fixed64, repeated, tag = "6")]`). Packed varints are rejected
+    /// with `invalid wire type: Varint (expected SixtyFourBit)`.
+    fn packed_fixed64(&mut self, field: u32, values: &[u64]) {
         if values.is_empty() {
             return;
         }
-        let mut inner = Encoder::new();
-        for &v in values {
-            inner.varint(v);
+        self.tag(field, WIRE_LEN);
+        self.varint((values.len() * 8) as u64);
+        for v in values {
+            self.buf.extend_from_slice(&v.to_le_bytes());
         }
-        self.bytes(field, &inner.buf);
     }
 
     fn packed_double(&mut self, field: u32, values: &[f64]) {
@@ -223,10 +229,14 @@ impl Emit<'_> {
             e.message(1, |e| {
                 e.fixed64(2, self.start);
                 e.fixed64(3, self.time);
-                // HistogramDataPoint.count = uint64, bucket_counts = packed uint64.
-                e.uint64(4, h.count);
+                // HistogramDataPoint.count / bucket_counts are protobuf
+                // `fixed64` in the OTLP the Spice runtime ingests
+                // (`opentelemetry-proto` 0.32). Encoding them as uint64
+                // varints is what Cloud rejected as
+                // `invalid wire type: Varint (expected SixtyFourBit)`.
+                e.fixed64(4, h.count);
                 e.double(5, h.sum as f64);
-                e.packed_uint64(6, &h.buckets);
+                e.packed_fixed64(6, &h.buckets);
                 e.packed_double(7, DURATION_BOUNDS_US);
                 point_attrs(e, 9, self.resource, attrs);
                 e.double(11, h.min as f64);
@@ -508,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn histogram_count_and_buckets_are_varints() {
+    fn histogram_count_and_buckets_are_fixed64() {
         let mut r = Registry::new();
         r.record("GET", 200, 0, 64, 1500, 1500);
         r.record("GET", 200, 0, 32, 80, 90);
@@ -518,15 +528,15 @@ mod tests {
             .into_iter()
             .next()
             .expect("data point");
-        let count = varint_field(point, 4).expect("count as uint64 varint, not fixed64");
+        let count = fixed64_field(point, 4).expect("count as fixed64, not uint64 varint");
         assert_eq!(count, 2);
         let packed = len_field(point, 6).expect("bucket_counts packed");
-        assert_ne!(
+        assert_eq!(
             packed.len(),
             (DURATION_BOUNDS_US.len() + 1) * 8,
-            "bucket_counts encoded as packed fixed64, not packed uint64"
+            "bucket_counts must be packed fixed64 (n*8 bytes), not packed varints"
         );
-        let buckets = packed_varints(packed).expect("packed uint64 buckets");
+        let buckets = packed_fixed64s(packed).expect("packed fixed64 buckets");
         assert_eq!(buckets.len(), DURATION_BOUNDS_US.len() + 1);
         assert_eq!(buckets.iter().sum::<u64>(), count);
     }
@@ -663,25 +673,30 @@ mod tests {
         })
     }
 
-    fn varint_field(buf: &[u8], field: u32) -> Option<u64> {
+    fn fixed64_field(buf: &[u8], field: u32) -> Option<u64> {
         fields(buf)
             .into_iter()
-            .find_map(|(n, w, _, v)| (n == field && w == WIRE_VARINT).then_some(v).flatten())
+            .find_map(|(n, w, bytes, _)| (n == field && w == WIRE_FIXED64).then_some(bytes))
+            .and_then(|bytes| Some(u64::from_le_bytes(bytes.try_into().ok()?)))
+    }
+
+    fn packed_fixed64s(buf: &[u8]) -> Option<Vec<u64>> {
+        if !buf.len().is_multiple_of(8) {
+            return None;
+        }
+        Some(
+            buf.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect(),
+        )
     }
 
     fn len_field(buf: &[u8], field: u32) -> Option<&[u8]> {
         fields(buf)
             .into_iter()
             .find_map(|(n, w, bytes, _)| (n == field && w == WIRE_LEN).then_some(bytes))
-    }
-
-    fn packed_varints(buf: &[u8]) -> Option<Vec<u64>> {
-        let mut i = 0;
-        let mut out = Vec::new();
-        while i < buf.len() {
-            out.push(read_varint(buf, &mut i)?);
-        }
-        Some(out)
     }
 
     fn is_histogram(metric: &[u8]) -> bool {
