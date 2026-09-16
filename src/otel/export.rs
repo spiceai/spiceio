@@ -72,7 +72,11 @@ impl Endpoint {
     }
 
     fn authority(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -270,16 +274,25 @@ async fn read_grpc_status(res: http::Response<Incoming>) -> Result<(), String> {
         .await
         .map_err(|e| format!("read response: {e}"))?;
     let trailers = collected.trailers();
-    let grpc_status = grpc_field(trailers, &parts.headers, "grpc-status")
-        .unwrap_or(if status.is_success() { "0" } else { "" });
-    if grpc_status == "0" {
-        return Ok(());
-    }
-    let msg = grpc_field(trailers, &parts.headers, "grpc-message").unwrap_or("");
-    if grpc_status.is_empty() {
-        Err(format!("HTTP {status} (no grpc-status)"))
-    } else {
-        Err(format!("grpc-status {grpc_status}: {msg}"))
+    interpret_grpc_status(
+        status,
+        grpc_field(trailers, &parts.headers, "grpc-status"),
+        grpc_field(trailers, &parts.headers, "grpc-message").unwrap_or(""),
+    )
+}
+
+/// HTTP 200 from a proxy is not a gRPC OK. Only an explicit `grpc-status: 0`
+/// (headers or trailers) counts as a successful export; anything else restores
+/// the interval for retry.
+fn interpret_grpc_status(
+    http_status: http::StatusCode,
+    grpc_status: Option<&str>,
+    grpc_message: &str,
+) -> Result<(), String> {
+    match grpc_status {
+        Some("0") => Ok(()),
+        Some(code) => Err(format!("grpc-status {code}: {grpc_message}")),
+        None => Err(format!("HTTP {http_status} (no grpc-status)")),
     }
 }
 
@@ -330,5 +343,39 @@ mod tests {
     fn rejects_empty() {
         assert!(Endpoint::parse("", "").is_err());
         assert!(Endpoint::parse("   ", "").is_err());
+    }
+
+    #[test]
+    fn ipv6_authority_stays_bracketed() {
+        let e = Endpoint::parse("http://[::1]:4317", "").unwrap();
+        assert_eq!(e.host, "::1");
+        assert_eq!(e.port, 4317);
+        assert_eq!(e.authority(), "[::1]:4317");
+        let e = Endpoint::parse("[2001:db8::1]:443", "").unwrap();
+        assert_eq!(e.host, "2001:db8::1");
+        assert_eq!(e.authority(), "[2001:db8::1]:443");
+        let e = Endpoint::parse("https://[::1]", "").unwrap();
+        assert_eq!(e.port, 443);
+        assert_eq!(e.authority(), "[::1]:443");
+        let e = Endpoint::parse("http://127.0.0.1:50051", "").unwrap();
+        assert_eq!(e.authority(), "127.0.0.1:50051");
+    }
+
+    #[test]
+    fn missing_grpc_status_is_an_error_even_on_http_200() {
+        assert_eq!(
+            interpret_grpc_status(http::StatusCode::OK, None, "").unwrap_err(),
+            "HTTP 200 OK (no grpc-status)"
+        );
+        assert!(interpret_grpc_status(http::StatusCode::OK, Some("0"), "").is_ok());
+        assert_eq!(
+            interpret_grpc_status(http::StatusCode::OK, Some("13"), "rejected").unwrap_err(),
+            "grpc-status 13: rejected"
+        );
+        assert!(
+            interpret_grpc_status(http::StatusCode::BAD_GATEWAY, None, "")
+                .unwrap_err()
+                .contains("no grpc-status")
+        );
     }
 }

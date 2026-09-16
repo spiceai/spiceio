@@ -124,7 +124,11 @@ pub async fn shutdown(timeout: Duration) {
     }
     ENABLED.store(false, Ordering::Relaxed);
     if let Some(stop) = STOP.get() {
-        stop.notify_waiters();
+        // `notify_one` stores a permit if the exporter is inside `push_once`
+        // rather than waiting on `notified()`. `notify_waiters` would drop
+        // that signal, the loop would sleep the next interval, and the
+        // promised final push would not run before process exit.
+        stop.notify_one();
         // Give the task a moment to flush; we do not join it, because a
         // hung export is exactly what `timeout` exists to bound and the
         // process is exiting anyway.

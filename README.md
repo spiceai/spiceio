@@ -171,8 +171,8 @@ Pushed metrics (delta sums/histograms over the interval, gauges as snapshots):
 | Metric | Type | Dimensions |
 | ------ | ---- | ---------- |
 | `spiceio_http_requests` | Sum | `method`, `status`, `machine`, `service.instance.id` |
-| `spiceio_http_request_bytes` / `spiceio_http_response_bytes` | Sum | `method`, `machine`, `service.instance.id` |
-| `spiceio_http_duration_us` / `spiceio_http_head_duration_us` | Histogram | `method`, `machine`, `service.instance.id` |
+| `spiceio_http_request_bytes` / `spiceio_http_response_bytes` | Sum | `method`, `status`, `machine`, `service.instance.id` |
+| `spiceio_http_duration_us` / `spiceio_http_head_duration_us` | Histogram | `method`, `status`, `machine`, `service.instance.id` |
 | `spiceio_cache_hits` / `_misses` / `_hit_bytes` / `_bytes` / `_entries` | Gauge | `machine`, `service.instance.id` |
 | `spiceio_spill_*`, `spiceio_writeback_*`, `spiceio_smb_inflight`, `spiceio_uptime_seconds` | Gauge | `machine`, `service.instance.id` |
 

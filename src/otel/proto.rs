@@ -94,15 +94,15 @@ impl Encoder {
         self.fixed64(field, v.to_bits());
     }
 
-    fn packed_fixed64(&mut self, field: u32, values: &[u64]) {
+    fn packed_uint64(&mut self, field: u32, values: &[u64]) {
         if values.is_empty() {
             return;
         }
-        self.tag(field, WIRE_LEN);
-        self.varint((values.len() * 8) as u64);
-        for v in values {
-            self.buf.extend_from_slice(&v.to_le_bytes());
+        let mut inner = Encoder::new();
+        for &v in values {
+            inner.varint(v);
         }
+        self.bytes(field, &inner.buf);
     }
 
     fn packed_double(&mut self, field: u32, values: &[f64]) {
@@ -223,9 +223,10 @@ impl Emit<'_> {
             e.message(1, |e| {
                 e.fixed64(2, self.start);
                 e.fixed64(3, self.time);
-                e.fixed64(4, h.count);
+                // HistogramDataPoint.count = uint64, bucket_counts = packed uint64.
+                e.uint64(4, h.count);
                 e.double(5, h.sum as f64);
-                e.packed_fixed64(6, &h.buckets);
+                e.packed_uint64(6, &h.buckets);
                 e.packed_double(7, DURATION_BOUNDS_US);
                 point_attrs(e, 9, self.resource, attrs);
                 e.double(11, h.min as f64);
@@ -240,15 +241,14 @@ impl Emit<'_> {
             return;
         }
         let status_s = status.to_string();
-        let req_attrs = [("method", method), ("status", status_s.as_str())];
-        let method_attrs = [("method", method)];
+        let attrs = [("method", method), ("status", status_s.as_str())];
         self.sum(
             e,
             "spiceio_http_requests",
             "S3 requests completed in the interval",
             "1",
             s.requests,
-            &req_attrs,
+            &attrs,
         );
         if s.req_bytes > 0 {
             self.sum(
@@ -257,7 +257,7 @@ impl Emit<'_> {
                 "Request body bytes declared on completed requests",
                 "By",
                 s.req_bytes,
-                &method_attrs,
+                &attrs,
             );
         }
         if s.resp_bytes > 0 {
@@ -267,7 +267,7 @@ impl Emit<'_> {
                 "Response body bytes streamed to the client",
                 "By",
                 s.resp_bytes,
-                &method_attrs,
+                &attrs,
             );
         }
         self.histogram(
@@ -275,14 +275,14 @@ impl Emit<'_> {
             "spiceio_http_duration_us",
             "End-to-end request time, microseconds",
             &s.duration,
-            &method_attrs,
+            &attrs,
         );
         self.histogram(
             e,
             "spiceio_http_head_duration_us",
             "Time to response head, microseconds",
             &s.head,
-            &method_attrs,
+            &attrs,
         );
     }
 
@@ -489,5 +489,217 @@ mod tests {
                 "encoded payload missing {needle:?}: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn histogram_count_and_buckets_are_varints() {
+        let mut r = Registry::new();
+        r.record("GET", 200, 0, 64, 1500, 1500);
+        r.record("GET", 200, 0, 32, 80, 90);
+        let bytes = encode(&resource(), &r.snapshot(RuntimeGauges::default()));
+        let metric = named_metric(&bytes, "spiceio_http_duration_us").expect("duration histogram");
+        let point = histogram_points(metric)
+            .into_iter()
+            .next()
+            .expect("data point");
+        let count = varint_field(point, 4).expect("count as uint64 varint, not fixed64");
+        assert_eq!(count, 2);
+        let packed = len_field(point, 6).expect("bucket_counts packed");
+        assert_ne!(
+            packed.len(),
+            (DURATION_BOUNDS_US.len() + 1) * 8,
+            "bucket_counts encoded as packed fixed64, not packed uint64"
+        );
+        let buckets = packed_varints(packed).expect("packed uint64 buckets");
+        assert_eq!(buckets.len(), DURATION_BOUNDS_US.len() + 1);
+        assert_eq!(buckets.iter().sum::<u64>(), count);
+    }
+
+    #[test]
+    fn http_series_points_include_status_and_are_unique() {
+        let mut r = Registry::new();
+        r.record("GET", 200, 0, 64, 100, 150);
+        r.record("GET", 404, 0, 16, 80, 90);
+        r.record("PUT", 200, 10, 0, 200, 300);
+        let bytes = encode(&resource(), &r.snapshot(RuntimeGauges::default()));
+        let mut seen = std::collections::HashSet::new();
+        let mut http_with_status = 0;
+        for metric in metrics(&bytes) {
+            let name = string_field(metric, 1).unwrap_or("");
+            for point in data_points(metric) {
+                let attrs = kv_strings(point, if is_histogram(metric) { 9 } else { 7 });
+                if name.starts_with("spiceio_http_") {
+                    assert!(
+                        attrs.iter().any(|(k, _)| k == "status"),
+                        "{name} data point missing status: {attrs:?}"
+                    );
+                    http_with_status += 1;
+                }
+                let mut parts: Vec<String> =
+                    attrs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                parts.sort();
+                let id = format!("{name}|{}", parts.join(","));
+                assert!(seen.insert(id.clone()), "duplicate OTLP identity {id}");
+            }
+        }
+        assert!(
+            http_with_status >= 6,
+            "expected status-labeled GET/200, GET/404, PUT/200 points, got {http_with_status}"
+        );
+    }
+
+    fn read_varint(buf: &[u8], i: &mut usize) -> Option<u64> {
+        let mut v = 0u64;
+        let mut shift = 0;
+        while *i < buf.len() {
+            let b = buf[*i];
+            *i += 1;
+            v |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift >= 64 {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn fields(buf: &[u8]) -> Vec<(u32, u32, &[u8], Option<u64>)> {
+        let mut i = 0;
+        let mut out = Vec::new();
+        while i < buf.len() {
+            let Some(tag) = read_varint(buf, &mut i) else {
+                break;
+            };
+            let num = (tag >> 3) as u32;
+            let wire = (tag & 7) as u32;
+            match wire {
+                WIRE_VARINT => {
+                    let start = i;
+                    let Some(v) = read_varint(buf, &mut i) else {
+                        break;
+                    };
+                    out.push((num, wire, &buf[start..i], Some(v)));
+                }
+                WIRE_FIXED64 => {
+                    if i + 8 > buf.len() {
+                        break;
+                    }
+                    let start = i;
+                    i += 8;
+                    out.push((num, wire, &buf[start..i], None));
+                }
+                WIRE_LEN => {
+                    let Some(len) = read_varint(buf, &mut i) else {
+                        break;
+                    };
+                    let len = len as usize;
+                    if i + len > buf.len() {
+                        break;
+                    }
+                    let start = i;
+                    i += len;
+                    out.push((num, wire, &buf[start..i], None));
+                }
+                5 => {
+                    if i + 4 > buf.len() {
+                        break;
+                    }
+                    i += 4;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    fn messages(buf: &[u8], field: u32) -> Vec<&[u8]> {
+        fields(buf)
+            .into_iter()
+            .filter(|(n, w, _, _)| *n == field && *w == WIRE_LEN)
+            .map(|(_, _, bytes, _)| bytes)
+            .collect()
+    }
+
+    fn metrics(buf: &[u8]) -> Vec<&[u8]> {
+        let Some(rm) = messages(buf, 1).into_iter().next() else {
+            return Vec::new();
+        };
+        let Some(sm) = messages(rm, 2).into_iter().next() else {
+            return Vec::new();
+        };
+        messages(sm, 2)
+    }
+
+    fn named_metric<'a>(buf: &'a [u8], name: &str) -> Option<&'a [u8]> {
+        metrics(buf)
+            .into_iter()
+            .find(|m| string_field(m, 1) == Some(name))
+    }
+
+    fn string_field(buf: &[u8], field: u32) -> Option<&str> {
+        fields(buf).into_iter().find_map(|(n, w, bytes, _)| {
+            (n == field && w == WIRE_LEN)
+                .then(|| std::str::from_utf8(bytes).ok())
+                .flatten()
+        })
+    }
+
+    fn varint_field(buf: &[u8], field: u32) -> Option<u64> {
+        fields(buf)
+            .into_iter()
+            .find_map(|(n, w, _, v)| (n == field && w == WIRE_VARINT).then_some(v).flatten())
+    }
+
+    fn len_field(buf: &[u8], field: u32) -> Option<&[u8]> {
+        fields(buf)
+            .into_iter()
+            .find_map(|(n, w, bytes, _)| (n == field && w == WIRE_LEN).then_some(bytes))
+    }
+
+    fn packed_varints(buf: &[u8]) -> Option<Vec<u64>> {
+        let mut i = 0;
+        let mut out = Vec::new();
+        while i < buf.len() {
+            out.push(read_varint(buf, &mut i)?);
+        }
+        Some(out)
+    }
+
+    fn is_histogram(metric: &[u8]) -> bool {
+        !messages(metric, 9).is_empty()
+    }
+
+    fn histogram_points(metric: &[u8]) -> Vec<&[u8]> {
+        messages(metric, 9)
+            .into_iter()
+            .flat_map(|h| messages(h, 1))
+            .collect()
+    }
+
+    fn data_points(metric: &[u8]) -> Vec<&[u8]> {
+        let hist = histogram_points(metric);
+        if !hist.is_empty() {
+            return hist;
+        }
+        messages(metric, 7)
+            .into_iter()
+            .chain(messages(metric, 5))
+            .flat_map(|d| messages(d, 1))
+            .collect()
+    }
+
+    fn kv_strings(buf: &[u8], field: u32) -> Vec<(String, String)> {
+        messages(buf, field)
+            .into_iter()
+            .filter_map(|kv| {
+                let key = string_field(kv, 1)?.to_string();
+                let value_msg = messages(kv, 2).into_iter().next()?;
+                let value = string_field(value_msg, 1)?.to_string();
+                Some((key, value))
+            })
+            .collect()
     }
 }
