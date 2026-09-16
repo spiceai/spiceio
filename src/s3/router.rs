@@ -235,7 +235,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     // The first miss in a directory still lists (below, after a permit).
     if !key.is_empty()
         && matches!(*method, Method::GET | Method::HEAD)
-        && (*method == Method::HEAD || is_plain_object_query(query))
+        && is_plain_object_query(query)
     {
         if *method == Method::HEAD
             && let Some(resp) = try_backendless_head(hdrs, state, key).await

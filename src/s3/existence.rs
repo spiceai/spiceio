@@ -28,6 +28,12 @@ use tokio::sync::Notify;
 /// to per-key SMB opens rather than pin unbounded RAM.
 const MAX_DIR_NAMES: usize = 1_000_000;
 
+/// Cap on listed/in-flight directories. Analogous to `ensured_dirs` on the
+/// share session: a client that 404s a fresh parent every request must not
+/// grow the map without bound. Expired listings are dropped first; then the
+/// least-recently-probed complete listing.
+const MAX_DIRS: usize = 16_384;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Probe {
     /// Index off, listing in flight failed, or this directory has never been
@@ -41,10 +47,18 @@ pub enum Probe {
 }
 
 enum DirState {
-    Inflight(Arc<Notify>),
+    Inflight {
+        notify: Arc<Notify>,
+        /// Local PUT/DELETE that raced this listing. Applied when the list
+        /// is installed so we never publish a complete set that omits a
+        /// name this process just created (or still contains one it deleted).
+        pending_insert: HashSet<Box<str>>,
+        pending_remove: HashSet<Box<str>>,
+    },
     Listed {
         names: HashSet<Box<str>>,
         at: Instant,
+        last_used: Instant,
     },
 }
 
@@ -123,9 +137,14 @@ impl ExistenceIndex {
         if name.is_empty() {
             return Probe::Unknown;
         }
-        let g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
-        match g.get(dir) {
-            Some(DirState::Listed { names, at }) if !self.expired(*at) => {
+        let mut g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get_mut(dir) {
+            Some(DirState::Listed {
+                names,
+                at,
+                last_used,
+            }) if !self.expired(*at) => {
+                *last_used = Instant::now();
                 if names.contains(name) {
                     Probe::Present
                 } else {
@@ -150,63 +169,96 @@ impl ExistenceIndex {
         if name.is_empty() {
             return Probe::Unknown;
         }
-        if let p @ (Probe::Present | Probe::Absent) = self.probe(key) {
-            return p;
-        }
-
-        let notify = Arc::new(Notify::new());
-        let we_list = {
-            let mut g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
-            match g.get(dir) {
-                Some(DirState::Listed { at, .. }) if !self.expired(*at) => false,
-                Some(DirState::Inflight(_)) => false,
-                _ => {
-                    g.insert(dir.into(), DirState::Inflight(Arc::clone(&notify)));
-                    true
-                }
+        let mut list = Some(list);
+        loop {
+            if let p @ (Probe::Present | Probe::Absent) = self.probe(key) {
+                return p;
             }
-        };
 
-        if we_list {
+            let mut we_list = false;
+            let wait = {
+                let mut g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+                self.evict_if_needed(&mut g);
+                match g.get(dir) {
+                    Some(DirState::Listed { at, .. }) if !self.expired(*at) => None,
+                    Some(DirState::Inflight { notify, .. }) => {
+                        // Subscribe before the mutex is released so a listing
+                        // that finishes in the gap cannot notify nobody.
+                        Some(Arc::clone(notify).notified_owned())
+                    }
+                    _ => {
+                        g.insert(
+                            dir.into(),
+                            DirState::Inflight {
+                                notify: Arc::new(Notify::new()),
+                                pending_insert: HashSet::new(),
+                                pending_remove: HashSet::new(),
+                            },
+                        );
+                        we_list = true;
+                        None
+                    }
+                }
+            };
+            if let Some(notified) = wait {
+                notified.await;
+                continue;
+            }
+            if !we_list {
+                return self.probe(key);
+            }
+
             self.lists.fetch_add(1, Ordering::Relaxed);
+            let list = list.take().expect("list once");
             let listed = match list(dir.to_string()).await {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashSet::new()),
                 other => other,
             };
-            {
+            let notify = {
                 let mut g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
-                match listed {
-                    Ok(names) if names.len() <= MAX_DIR_NAMES => {
+                let pending = match g.remove(dir) {
+                    Some(DirState::Inflight {
+                        notify,
+                        pending_insert,
+                        pending_remove,
+                    }) => Some((notify, pending_insert, pending_remove)),
+                    other => {
+                        if let Some(st) = other {
+                            g.insert(dir.into(), st);
+                        }
+                        None
+                    }
+                };
+                match (listed, pending) {
+                    (Ok(names), Some((notify, inserts, removes)))
+                        if names.len() <= MAX_DIR_NAMES =>
+                    {
+                        let mut names: HashSet<Box<str>> =
+                            names.into_iter().map(|s| s.into_boxed_str()).collect();
+                        names.extend(inserts);
+                        for r in removes {
+                            names.remove(&r);
+                        }
+                        let now = Instant::now();
                         g.insert(
                             dir.into(),
                             DirState::Listed {
-                                names: names.into_iter().map(|s| s.into_boxed_str()).collect(),
-                                at: Instant::now(),
+                                names,
+                                at: now,
+                                last_used: now,
                             },
                         );
+                        Some(notify)
                     }
-                    _ => {
-                        // Failed or enormous: leave incomplete so the caller
-                        // falls back to an SMB open.
-                        g.remove(dir);
-                    }
+                    (_, Some((notify, _, _))) => Some(notify),
+                    _ => None,
                 }
+            };
+            if let Some(n) = notify {
+                n.notify_waiters();
             }
-            notify.notify_waiters();
             return self.probe(key);
         }
-
-        let waiter = {
-            let g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
-            match g.get(dir) {
-                Some(DirState::Inflight(n)) => Some(Arc::clone(n)),
-                _ => None,
-            }
-        };
-        if let Some(n) = waiter {
-            n.notified().await;
-        }
-        self.probe(key)
     }
 
     /// A local PUT/COPY published `key`. Only mutates an already-complete
@@ -220,8 +272,22 @@ impl ExistenceIndex {
             return;
         }
         let mut g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(DirState::Listed { names, .. }) = g.get_mut(dir) {
-            names.insert(name.into());
+        match g.get_mut(dir) {
+            Some(DirState::Listed {
+                names, last_used, ..
+            }) => {
+                *last_used = Instant::now();
+                names.insert(name.into());
+            }
+            Some(DirState::Inflight {
+                pending_insert,
+                pending_remove,
+                ..
+            }) => {
+                pending_remove.remove(name);
+                pending_insert.insert(name.into());
+            }
+            None => {}
         }
     }
 
@@ -235,13 +301,52 @@ impl ExistenceIndex {
             return;
         }
         let mut g = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(DirState::Listed { names, .. }) = g.get_mut(dir) {
-            names.remove(name);
+        match g.get_mut(dir) {
+            Some(DirState::Listed {
+                names, last_used, ..
+            }) => {
+                *last_used = Instant::now();
+                names.remove(name);
+            }
+            Some(DirState::Inflight {
+                pending_insert,
+                pending_remove,
+                ..
+            }) => {
+                pending_insert.remove(name);
+                pending_remove.insert(name.into());
+            }
+            None => {}
         }
     }
 
     fn expired(&self, at: Instant) -> bool {
         self.ttl.is_some_and(|ttl| at.elapsed() >= ttl)
+    }
+
+    fn evict_if_needed(&self, g: &mut HashMap<Box<str>, DirState>) {
+        if let Some(ttl) = self.ttl {
+            g.retain(|_, st| match st {
+                DirState::Listed { at, .. } => at.elapsed() < ttl,
+                DirState::Inflight { .. } => true,
+            });
+        }
+        while g.len() >= MAX_DIRS {
+            let victim = g
+                .iter()
+                .filter_map(|(k, st)| match st {
+                    DirState::Listed { last_used, .. } => Some((k.clone(), *last_used)),
+                    DirState::Inflight { .. } => None,
+                })
+                .min_by_key(|(_, used)| *used)
+                .map(|(k, _)| k);
+            match victim {
+                Some(k) => {
+                    g.remove(&k);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -261,11 +366,13 @@ fn parse_bool_env(name: &str) -> Option<bool> {
 impl ExistenceIndex {
     pub fn seed_listed(&self, dir: &str, names: &[&str]) {
         let mut g = self.dirs.lock().unwrap();
+        let now = Instant::now();
         g.insert(
             dir.into(),
             DirState::Listed {
                 names: names.iter().map(|s| (*s).into()).collect(),
-                at: Instant::now(),
+                at: now,
+                last_used: now,
             },
         );
     }
@@ -399,6 +506,31 @@ mod tests {
         assert_eq!(absent, 8);
         assert_eq!(present, 0);
         assert_eq!(idx.probe("d/only"), Probe::Present);
+    }
+
+    #[tokio::test]
+    async fn remember_during_list_is_merged_into_the_installed_set() {
+        let idx = Arc::new(ExistenceIndex::new(true, None));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let idx_list = Arc::clone(&idx);
+        let join = tokio::spawn(async move {
+            idx_list
+                .ensure_listed("d/old", move |_dir| async move {
+                    let _ = started_tx.send(());
+                    let _ = go_rx.await;
+                    Ok(HashSet::from(["old".into()]))
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        idx.remember("d/new");
+        idx.forget("d/old");
+        let _ = go_tx.send(());
+        let p = join.await.unwrap();
+        assert_eq!(p, Probe::Absent, "d/old was forgotten during the list");
+        assert_eq!(idx.probe("d/new"), Probe::Present);
+        assert_eq!(idx.probe("d/old"), Probe::Absent);
     }
 
     #[tokio::test]

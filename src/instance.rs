@@ -114,23 +114,17 @@ mod tests {
     #[test]
     fn uuid_v4_shape_and_version() {
         let id = generate_uuid_v4();
-        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(id.len(), 36);
         let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(parts.len(), 5, "{id}");
+        assert_eq!(parts.len(), 5);
         assert_eq!(parts[0].len(), 8);
         assert_eq!(parts[1].len(), 4);
         assert_eq!(parts[2].len(), 4);
         assert_eq!(parts[3].len(), 4);
         assert_eq!(parts[4].len(), 12);
-        assert!(
-            parts[2].starts_with('4'),
-            "version nibble must be 4, got {id}"
-        );
+        assert!(parts[2].starts_with('4'), "version nibble must be 4");
         let variant = u8::from_str_radix(&parts[3][..1], 16).unwrap();
-        assert!(
-            (8..12).contains(&variant),
-            "variant nibble must be 8..b, got {id}"
-        );
+        assert!((8..12).contains(&variant), "variant nibble must be 8..b");
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
     }
 
