@@ -34,11 +34,18 @@ jobs:
       SPICEIO_OTEL_API_KEY: ${{ secrets.SPICEIO_OTEL_API_KEY }}
       SPICEIO_OTEL_REGION: ${{ vars.SPICEIO_OTEL_REGION }}
       SPICEIO_INSTANCE_ID: ci-${{ github.run_id }}
-      SPICEIO_MACHINE: ${{ runner.name }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # `runner` is not available in job-level env. RUNNER_NAME is set on
+      # the runner; skip the export if empty so spiceio uses hostname.
+      - name: Set OTEL machine label
+        run: |
+          if [[ -n "${RUNNER_NAME:-}" ]]; then
+            echo "SPICEIO_MACHINE=${RUNNER_NAME}" >> "$GITHUB_ENV"
+          fi
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
