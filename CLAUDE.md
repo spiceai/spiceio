@@ -40,11 +40,14 @@ gates** — `make ci` never runs them.
 
 - `make bench-sccache` drives `spiceio-loadgen` (a dependency-free HTTP/1.1
   client built behind the `loadgen` feature) over **persistent keep-alive
-  connections**, which is how sccache actually talks to the proxy. It sweeps
-  concurrency, reports p50/p90/p99/p99.9 and TTFB per operation class, and runs
-  a second pass with the GET body cache disabled so proxy-cache hits and real
-  NAS reads are not conflated. Do not go back to per-request `curl` fan-out: it
-  pays a TCP handshake per request and cannot offer enough load to find the knee.
+  connections**, which is how sccache actually talks to the proxy. It pins
+  `SPICEIO_IMMUTABLE_OBJECTS=1` (sccache production; existence index on) —
+  `BENCH_IMMUTABLE=0` isolates the etag-revalidated miss path. It sweeps
+  concurrency, reports p99/p99.9 and TTFB per operation class (never p50 —
+  the usable-cache question is the tail), and runs a second pass with the
+  GET body cache disabled so proxy-cache hits and real NAS reads are not
+  conflated. Do not go back to per-request `curl` fan-out: it pays a TCP
+  handshake per request and cannot offer enough load to find the knee.
 - `make bench-sccache-build` runs real `cargo build`s three ways — no cache,
   sccache on local disk, sccache through spiceio — and reads sccache's own JSON
   stats (`--stats-format json`) for per-hit and per-write latency. The local-disk

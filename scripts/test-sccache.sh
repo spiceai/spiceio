@@ -625,7 +625,7 @@ for p in doc["phases"]:
     statuses = " ".join(f"{k}x{v}" for k, v in sorted(p["statuses"].items()))
     print(f"[metrics] burst phase={p['phase']} c={p['concurrency']} "
           f"ops={p['ops']} ops_s={p['ops_per_sec']:.1f} mib_s={p['mib_per_sec']:.1f} "
-          f"p50={lat['p50']/1000:.2f}ms p99={lat['p99']/1000:.2f}ms "
+          f"p99={lat['p99']/1000:.2f}ms p99.9={lat['p999']/1000:.2f}ms "
           f"max={lat['max']/1000:.2f}ms errors={e} status=[{statuses}]"
           + (f" failed=[{detail}]" if detail else ""), file=sys.stderr)
 print(ops, errs)
