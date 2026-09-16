@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::body::SpiceioBody;
+use super::existence::{ExistenceIndex, Probe};
 use super::headers::*;
 use super::multipart::MultipartStore;
 use super::object_cache::ObjectCache;
@@ -54,6 +55,9 @@ pub struct AppState {
     /// Enabled by default; when `SPICEIO_WRITE_BACK=0` disables it, every
     /// method below short-circuits on a single bool check.
     pub writeback: Arc<WriteBack>,
+    /// Lazy per-directory name set. Fast 404s for missing leaves after one
+    /// list of the parent; default on with immutable objects.
+    pub existence: Arc<ExistenceIndex>,
 }
 
 /// How long an operation that needs an object *on the backend* — a range read,
@@ -226,6 +230,26 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         && let Some(resp) = try_backendless_get(hdrs, state, key).await
     {
         return with_common_headers(resp, &request_id, &state.region);
+    }
+    // Existence-index 404s take no admission permit: they do not touch SMB.
+    // The first miss in a directory still lists (below, after a permit).
+    if !key.is_empty()
+        && matches!(*method, Method::GET | Method::HEAD)
+        && (*method == Method::HEAD || is_plain_object_query(query))
+    {
+        if *method == Method::HEAD
+            && let Some(resp) = try_backendless_head(hdrs, state, key).await
+        {
+            return with_common_headers(resp, &request_id, &state.region);
+        }
+        if state.existence.probe(key) == Probe::Absent {
+            let resp = if *method == Method::HEAD {
+                existence_miss_head(state)
+            } else {
+                existence_miss_get(state)
+            };
+            return with_common_headers(resp, &request_id, &state.region);
+        }
     }
 
     // Mutations acquire their permit inside the handler, after waiting for
@@ -879,6 +903,86 @@ async fn try_backendless_get(
     ))
 }
 
+/// HEAD analogue of [`try_backendless_get`]: pending write-back metadata, no SMB.
+async fn try_backendless_head(
+    hdrs: &http::HeaderMap,
+    state: &AppState,
+    key: &str,
+) -> Option<Response<SpiceioBody>> {
+    let (etag, last_modified, size) = state.writeback.pending_meta(key).await?;
+    let etag = format!("\"{etag}\"");
+    if let Some(im) = get_header(hdrs, IF_MATCH)
+        && !etag_matches(im, &etag)
+    {
+        return Some(error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "",
+        ));
+    }
+    if let Some(inm) = get_header(hdrs, IF_NONE_MATCH)
+        && etag_matches(inm, &etag)
+    {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", &etag)
+                .body(SpiceioBody::empty())
+                .unwrap(),
+        );
+    }
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", guess_content_type(key))
+            .header("Content-Length", size.to_string())
+            .header("ETag", &etag)
+            .header("Last-Modified", xml::epoch_to_http_date(last_modified))
+            .header("Accept-Ranges", "bytes")
+            .body(SpiceioBody::empty())
+            .unwrap(),
+    )
+}
+
+fn existence_miss_get(state: &AppState) -> Response<SpiceioBody> {
+    state.existence.note_absent();
+    let mut resp = error_response(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "The specified key does not exist.",
+    );
+    resp.headers_mut().insert(
+        "x-spiceio-existence",
+        http::HeaderValue::from_static("miss"),
+    );
+    resp
+}
+
+fn existence_miss_head(state: &AppState) -> Response<SpiceioBody> {
+    state.existence.note_absent();
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("x-spiceio-existence", "miss")
+        .body(SpiceioBody::empty())
+        .unwrap()
+}
+
+async fn existence_confirm_absent(state: &AppState, key: &str) -> bool {
+    if !state.existence.enabled() {
+        return false;
+    }
+    let share = Arc::clone(&state.share);
+    matches!(
+        state
+            .existence
+            .ensure_listed(key, move |dir| async move {
+                share.list_dir_file_names(&dir).await
+            })
+            .await,
+        Probe::Absent
+    )
+}
+
 async fn handle_get_object(
     hdrs: &http::HeaderMap,
     state: &AppState,
@@ -892,6 +996,10 @@ async fn handle_get_object(
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let if_modified_since = get_header(hdrs, IF_MODIFIED_SINCE).map(String::from);
     let if_unmodified_since = get_header(hdrs, IF_UNMODIFIED_SINCE).map(String::from);
+
+    if existence_confirm_absent(state, key).await {
+        return existence_miss_get(state);
+    }
 
     // ── Fast path: compound Create+Read+Close for small files ───────
     // Tries to read the entire file in one SMB round trip. Falls back to
@@ -944,6 +1052,7 @@ async fn handle_get_object(
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
                     cache.invalidate_stale(key).await;
+                    state.existence.forget(key);
                     return error_response(
                         StatusCode::NOT_FOUND,
                         "NoSuchKey",
@@ -985,6 +1094,7 @@ async fn handle_get_object(
                 };
 
                 let last_modified = xml::epoch_to_http_date(meta.last_modified);
+                state.existence.remember(key);
                 return Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", &meta.content_type)
@@ -997,6 +1107,7 @@ async fn handle_get_object(
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 cache.invalidate_stale(key).await;
+                state.existence.forget(key);
                 return error_response(
                     StatusCode::NOT_FOUND,
                     "NoSuchKey",
@@ -1017,6 +1128,7 @@ async fn handle_get_object(
         Ok(h) => h,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             cache.invalidate_stale(key).await;
+            state.existence.forget(key);
             return error_response(
                 StatusCode::NOT_FOUND,
                 "NoSuchKey",
@@ -1025,6 +1137,7 @@ async fn handle_get_object(
         }
         Err(e) => return io_to_s3_error(&e),
     };
+    state.existence.remember(key);
 
     stream_get_object(
         handle,
@@ -1528,6 +1641,7 @@ async fn handle_put_object(
         let etag = crate::smb::ops::provisional_etag(data.len() as u64, now);
         if state.writeback.enqueue(key, &etag, now, data.clone()).await {
             state.object_cache.insert(key, &etag, now, data);
+            state.existence.remember(key);
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header("ETag", format!("\"{etag}\""))
@@ -1548,6 +1662,7 @@ async fn handle_put_object(
                 state
                     .object_cache
                     .store(key, &meta.etag, meta.last_modified, data);
+                state.existence.remember(key);
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header("ETag", format!("\"{}\"", meta.etag));
@@ -1586,6 +1701,7 @@ async fn handle_put_object(
                 state
                     .object_cache
                     .store(key, &meta.etag, meta.last_modified, data.clone());
+                state.existence.remember(key);
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header("ETag", format!("\"{}\"", meta.etag));
@@ -1685,6 +1801,7 @@ async fn handle_put_object(
         }
         _ => state.object_cache.invalidate_stale(key).await,
     }
+    state.existence.remember(key);
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -1827,6 +1944,7 @@ async fn handle_copy_object(
             w.element("LastModified", &xml::epoch_to_iso8601(meta.last_modified));
             w.element("ETag", &format!("\"{}\"", meta.etag));
             w.close("CopyObjectResult");
+            state.existence.remember(dest_key);
             xml_response(StatusCode::OK, w.finish())
         }
         // Destination write: the source key was resolved above, so a missing
@@ -1853,11 +1971,13 @@ async fn handle_delete_object(state: &AppState, key: &str) -> Response<SpiceioBo
         Ok(()) => {
             state.writeback.cancel(key).await;
             state.object_cache.forget(key).await;
+            state.existence.forget(key);
             ok_no_content()
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             state.writeback.cancel(key).await;
             state.object_cache.forget(key).await;
+            state.existence.forget(key);
             ok_no_content()
         }
         Err(e) => io_to_s3_error(&e),
@@ -1907,8 +2027,13 @@ async fn handle_head_object(
             .unwrap();
     }
 
+    if existence_confirm_absent(state, key).await {
+        return existence_miss_head(state);
+    }
+
     match share.head_object(key).await {
         Ok(meta) => {
+            state.existence.remember(key);
             let etag = format!("\"{}\"", meta.etag);
 
             if let Some(ref im) = if_match
@@ -1955,10 +2080,13 @@ async fn handle_head_object(
                 .body(SpiceioBody::empty())
                 .unwrap()
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(SpiceioBody::empty())
-            .unwrap(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            state.existence.forget(key);
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(SpiceioBody::empty())
+                .unwrap()
+        }
         Err(e) => io_to_s3_error(&e),
     }
 }
@@ -2017,6 +2145,7 @@ async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<Spicei
             Ok(()) => {
                 state.writeback.cancel(key).await;
                 state.object_cache.forget(key).await;
+                state.existence.forget(key);
                 if !quiet {
                     w.open("Deleted");
                     w.element("Key", key);
@@ -2026,6 +2155,7 @@ async fn handle_delete_objects(body: Bytes, state: &AppState) -> Response<Spicei
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 state.writeback.cancel(key).await;
                 state.object_cache.forget(key).await;
+                state.existence.forget(key);
                 if !quiet {
                     w.open("Deleted");
                     w.element("Key", key);
@@ -2608,6 +2738,7 @@ async fn handle_complete_multipart_upload(
 
     state.writeback.cancel(key).await;
     state.object_cache.forget(key).await;
+    state.existence.remember(key);
 
     // Only now remove the upload from the store
     let upload = state.multipart.complete(upload_id).await;
@@ -3895,6 +4026,49 @@ mod replacement_regressions {
                 .status(),
             StatusCode::NOT_MODIFIED
         );
+    }
+
+    #[tokio::test]
+    async fn existence_index_answers_404_without_smb() {
+        let (mut state, _server) = state().await;
+        state.existence = Arc::new(ExistenceIndex::new(true, None));
+        state.existence.seed_listed("pre", &["hit"]);
+        assert_eq!(state.existence.probe("pre/miss"), Probe::Absent);
+        let get = existence_miss_get(&state);
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+        assert_eq!(get.headers()["x-spiceio-existence"], "miss");
+        let head = existence_miss_head(&state);
+        assert_eq!(head.status(), StatusCode::NOT_FOUND);
+        assert_eq!(head.headers()["x-spiceio-existence"], "miss");
+        assert_eq!(state.existence.absents(), 2);
+        assert_eq!(state.existence.probe("pre/hit"), Probe::Present);
+    }
+
+    #[tokio::test]
+    async fn existence_remember_after_put_stops_a_false_404() {
+        let idx = ExistenceIndex::new(true, None);
+        idx.seed_listed("pre", &[]);
+        assert_eq!(idx.probe("pre/new"), Probe::Absent);
+        idx.remember("pre/new");
+        assert_eq!(idx.probe("pre/new"), Probe::Present);
+        idx.forget("pre/new");
+        assert_eq!(idx.probe("pre/new"), Probe::Absent);
+    }
+
+    #[tokio::test]
+    async fn try_backendless_head_serves_pending_write() {
+        let (state, _server) = state().await;
+        assert!(
+            state
+                .writeback
+                .enqueue("k", "etag", 1, Bytes::from_static(b"body"))
+                .await
+        );
+        let headers = http::HeaderMap::new();
+        let resp = try_backendless_head(&headers, &state, "k").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-length"], "4");
+        assert_eq!(resp.headers()["etag"], "\"etag\"");
     }
 
     #[tokio::test]

@@ -127,8 +127,8 @@ fn usage() -> ! {
   --concurrency N    in-flight requests, one persistent connection each (default 64)
   --objects N        distinct keys in the working set (default 512)
   --ops N            requests per phase (default: max(objects, concurrency*20))
-  --phase LIST       comma-separated: put,get,head-hit,head-miss,get-miss,mixed,delete
-                     (default put,get,head-hit,head-miss,mixed)
+  --phase LIST       comma-separated: put,get,get-miss,head-hit,head-miss,mixed,delete
+                     (default put,get,get-miss,head-hit,head-miss,mixed)
   --warmup N         repetitions of each read phase; last one is reported (default 1)
   --timeout SECS     per-request timeout (default 60)
   --label TEXT       free-form label recorded in the JSON output
@@ -151,6 +151,7 @@ fn parse_args() -> Config {
         phases: vec![
             "put".into(),
             "get".into(),
+            "get-miss".into(),
             "head-hit".into(),
             "head-miss".into(),
             "mixed".into(),
@@ -1119,6 +1120,15 @@ mod tests {
         assert!(Op::Delete.accepts(204));
         assert!(Op::Delete.accepts(404));
         assert!(!Op::Delete.accepts(500));
+    }
+
+    #[test]
+    fn default_phases_include_get_miss() {
+        let phases = ["put", "get", "get-miss", "head-hit", "head-miss", "mixed"];
+        for name in phases {
+            assert!(Op::parse(name).is_some(), "{name}");
+        }
+        assert!(phases.contains(&"get-miss"));
     }
 
     #[test]

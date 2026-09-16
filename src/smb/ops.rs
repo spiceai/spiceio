@@ -375,6 +375,44 @@ impl ShareSession {
     /// walk descends into subdirectories (breadth-first). Spiceio-internal
     /// bookkeeping directories (`.spiceio-wal/`, `.spiceio-uploads/`) at the
     /// share root are hidden from both forms.
+    /// File names in one directory (no descent). Used by the existence index
+    /// to answer later missing-leaf GETs/HEADs without an SMB open. A missing
+    /// directory is an empty complete listing, not an error.
+    pub async fn list_dir_file_names(&self, dir_key: &str) -> io::Result<HashSet<String>> {
+        let (client, tree_id) = self.pick();
+        let dir_path = to_smb_path(dir_key.trim_end_matches('/'));
+        let dir = match client
+            .create(
+                tree_id,
+                &dir_path,
+                DesiredAccess::GenericRead as u32 | DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::DirectoryFile as u32,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(e) => return Err(e),
+        };
+        let entries = client.query_directory(tree_id, &dir.file_id, "*").await;
+        let _ = client.close(tree_id, &dir.file_id).await;
+        let entries = entries?;
+        let mut names = HashSet::with_capacity(entries.len());
+        for entry in entries {
+            if entry.is_directory() {
+                continue;
+            }
+            if dir_path.is_empty() && (entry.file_name == WAL_DIR || entry.file_name == UPLOADS_DIR)
+            {
+                continue;
+            }
+            names.insert(entry.file_name);
+        }
+        Ok(names)
+    }
+
     pub async fn list_objects(
         &self,
         prefix: &str,

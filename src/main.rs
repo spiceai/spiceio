@@ -268,6 +268,19 @@ async fn connect_share(
         }
     }
 
+    let existence = Arc::new(s3::existence::ExistenceIndex::from_env(
+        object_cache.immutable(),
+    ));
+    if existence.enabled() {
+        slog!(
+            "[spiceio] existence index: on (lazy directory lists for fast 404s{})",
+            existence
+                .ttl()
+                .map(|t| format!(", TTL {}s", t.as_secs()))
+                .unwrap_or_default()
+        );
+    }
+
     Ok(Arc::new(AppState {
         client_inflight: share.client_inflight(),
         share,
@@ -278,6 +291,7 @@ async fn connect_share(
         smb_slots,
         object_cache,
         writeback,
+        existence,
     }))
 }
 

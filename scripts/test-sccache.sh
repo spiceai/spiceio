@@ -602,7 +602,7 @@ if [[ -x "$LOADGEN" ]]; then
         --concurrency "$BURST_CONCURRENCY" \
         --objects "$BURST_OBJECTS" \
         --ops $((BURST_OBJECTS * 4)) \
-        --phase put,get,head-hit,head-miss,mixed \
+        --phase put,get,get-miss,head-hit,head-miss,mixed \
         --json "$BURST_JSON" || true
 
     if [[ -s "$BURST_JSON" ]]; then

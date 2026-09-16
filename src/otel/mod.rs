@@ -194,6 +194,8 @@ async fn runtime_gauges(state: &AppState) -> RuntimeGauges {
         writeback_flushed,
         smb_inflight: state.client_inflight.load(Ordering::Relaxed) as u64,
         uptime: Duration::ZERO,
+        existence_absents: state.existence.absents(),
+        existence_lists: state.existence.lists(),
     }
 }
 

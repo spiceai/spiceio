@@ -4,6 +4,7 @@
 //! copy, multipart, ACL/tagging/versioning stubs, CORS, region selection.
 
 pub mod body;
+pub mod existence;
 pub mod headers;
 pub mod listing;
 pub mod multipart;

@@ -122,6 +122,8 @@ pub struct RuntimeGauges {
     pub writeback_flushed: Option<u64>,
     pub smb_inflight: u64,
     pub uptime: Duration,
+    pub existence_absents: u64,
+    pub existence_lists: u64,
 }
 
 pub struct Registry {

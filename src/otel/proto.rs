@@ -385,6 +385,20 @@ impl Emit<'_> {
             "1",
             g.writeback_flushed,
         );
+        self.gauge(
+            e,
+            "spiceio_existence_absents",
+            "GET/HEAD 404s answered from the directory existence index (cumulative)",
+            "1",
+            g.existence_absents,
+        );
+        self.gauge(
+            e,
+            "spiceio_existence_lists",
+            "Directory listings performed to fill the existence index (cumulative)",
+            "1",
+            g.existence_lists,
+        );
     }
 }
 
@@ -470,6 +484,7 @@ mod tests {
     fn payload_carries_metric_name_machine_and_instance() {
         let mut r = Registry::new();
         r.record("GET", 200, 0, 64, 1500, 1500);
+        r.record("GET", 404, 0, 0, 80, 80);
         let snap = r.snapshot(RuntimeGauges::default());
         let bytes = encode(&resource(), &snap);
         let text = String::from_utf8_lossy(&bytes);
@@ -483,6 +498,7 @@ mod tests {
             "inst-1",
             "spiceio.share",
             "files",
+            "404",
         ] {
             assert!(
                 text.contains(needle),

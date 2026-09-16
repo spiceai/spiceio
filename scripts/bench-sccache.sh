@@ -10,7 +10,10 @@ set -euo pipefail
 # recording latency on both sides of the proxy at once:
 #
 #   client side  spiceio-loadgen: ops/s, MiB/s, mean/p50/p90/p99/p99.9, TTFB
-#   server side  SPICEIO_ACCESS_LOG: how long spiceio held each request
+#                phases include get-miss / head-miss (404 existence probes —
+#                the sccache cold-build path) as well as hits and mixed
+#   server side  SPICEIO_ACCESS_LOG: how long spiceio held each request,
+#                grouped by method:status so GET:404 is not mixed with GET:200
 #
 # The gap between them is HTTP framing and client cost; the server side alone is
 # spiceio plus its SMB round trips. Splitting them is the point — one end-to-end
@@ -28,7 +31,7 @@ set -euo pipefail
 #   BENCH_OBJECTS          distinct keys per phase (default 512)
 #   BENCH_OPS_PER_WORKER   requests each worker issues per phase (default 24)
 #   BENCH_SMB_CONNECTIONS  spiceio pool size (default: spiceio's own)
-#   BENCH_PHASES           loadgen phases (default put,get,head-hit,head-miss,mixed)
+#   BENCH_PHASES           loadgen phases (default put,get,get-miss,head-hit,head-miss,mixed)
 #   BENCH_PASSES           which passes to run (default "cached nocache")
 #                          `cached`/`nocache` pin SPICEIO_WRITE_BACK=0 so they
 #                          are baselines; also available: `writeback` (the
@@ -55,7 +58,7 @@ OBJECTS="${BENCH_OBJECTS:-512}"
 # 12 while the binary defaulted to 16, so every recorded run under-provisioned
 # the thing under test. Set BENCH_SMB_CONNECTIONS to sweep it deliberately.
 SMB_CONNS="${BENCH_SMB_CONNECTIONS:-}"
-PHASES="${BENCH_PHASES:-put,get,head-hit,head-miss,mixed}"
+PHASES="${BENCH_PHASES:-put,get,get-miss,head-hit,head-miss,mixed}"
 # Which passes to run. `cached` is the shipping configuration; `nocache`
 # disables the GET body cache so every read reaches the NAS. Narrowing this is
 # how a follow-up experiment (pool size, max I/O) isolates one variable.
@@ -238,7 +241,7 @@ with open(path, errors="replace") as fh:
             continue
         if t_ms < since:
             continue
-        e = by.setdefault(f[1], {"tot": [], "head": [], "bytes": 0, "err": 0})
+        e = by.setdefault(f"{f[1]}:{status}", {"tot": [], "head": [], "bytes": 0, "err": 0})
         e["tot"].append(total_us)
         e["head"].append(head_us)
         e["bytes"] += req + resp
@@ -271,13 +274,13 @@ print_access_table() {
         echo "${indent}(no access-log records in window)"
         return 0
     fi
-    printf "%s%-7s %8s %9s %10s %10s %10s %10s %10s %10s %5s\n" \
-        "$indent" method count MiB p50 p90 p99 max head_p50 head_p99 5xx
+    printf "%s%-12s %8s %9s %10s %10s %10s %10s %10s %10s %5s\n" \
+        "$indent" method:status count MiB p50 p90 p99 max head_p50 head_p99 5xx
     local m cnt bytes p50 p90 p99 mx hp50 hp99 errs
     while IFS=$'\t' read -r m cnt bytes p50 p90 p99 mx hp50 hp99 errs; do
         awk -v i="$indent" -v m="$m" -v c="$cnt" -v b="$bytes" -v a="$p50" -v d="$p90" \
             -v e="$p99" -v f="$mx" -v g="$hp50" -v j="$hp99" -v k="$errs" \
-            'BEGIN{printf "%s%-7s %8d %9.1f %8.2fms %8.2fms %8.2fms %8.2fms %8.2fms %8.2fms %5d\n",
+            'BEGIN{printf "%s%-12s %8d %9.1f %8.2fms %8.2fms %8.2fms %8.2fms %8.2fms %8.2fms %5d\n",
                    i, m, c, b/1048576, a/1000, d/1000, e/1000, f/1000, g/1000, j/1000, k}'
     done <"$out"
 }
