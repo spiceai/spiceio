@@ -39,9 +39,10 @@ set -euo pipefail
 #                          shipped default) and `nospill` (SPICEIO_SPILL_DIR=off),
 #                          for isolating the write-ack and disk-tier changes
 #   BENCH_IMMUTABLE        SPICEIO_IMMUTABLE_OBJECTS (default 1). sccache keys
-#                          are content-addressed; this is the production setting
-#                          and it turns on the existence index (fast 404s).
-#                          Set 0 to isolate those paths.
+#                          are content-addressed; this is the production setting.
+#                          Also pins SPICEIO_EXISTENCE_INDEX to the same value
+#                          and TTL to 0 so an ambient env cannot change the run.
+#                          Set 0 to isolate the etag-revalidated miss path.
 #   BENCH_OUT              results directory (default benches/results)
 #   BENCH_LABEL            label recorded in the report (default: git describe)
 #   BENCH_KEEP             1 to leave written objects on the share (default 0)
@@ -167,6 +168,8 @@ start_spiceio() {
         SPICEIO_REGION="$REGION" \
         ${SMB_CONNS:+SPICEIO_SMB_CONNECTIONS=$SMB_CONNS} \
         SPICEIO_IMMUTABLE_OBJECTS="$IMMUTABLE" \
+        SPICEIO_EXISTENCE_INDEX="$IMMUTABLE" \
+        SPICEIO_EXISTENCE_INDEX_TTL_SECS=0 \
         SPICEIO_LOG_FILE="$log" \
         SPICEIO_ACCESS_LOG="$ACCESS_FILE" \
         "$SPICEIO_BIN" >/dev/null 2>&1 &
@@ -345,7 +348,7 @@ echo "════════════════════════�
 echo " spiceio sccache bench — ${LABEL}"
 echo " target : smb://${SMB_SERVER}/${SMB_SHARE}  bucket=${BUCKET}"
 echo " pool   : ${SMB_CONNS:-spiceio default} SMB connections"
-echo " immutable: ${IMMUTABLE} (existence index follows)"
+echo " immutable: ${IMMUTABLE} (existence index pinned ${IMMUTABLE}, ttl 0)"
 echo " sweep  : concurrency [${CONCURRENCY_SWEEP}]  objects=${OBJECTS}  ops/worker=${OPS_PER_WORKER}"
 echo " phases : ${PHASES}"
 echo " results: ${RESULTS}"
@@ -367,8 +370,11 @@ for pass in $SELECTED_PASSES; do
             start_spiceio cached SPICEIO_WRITE_BACK=0
             ;;
         nocache)
+            # Memory *and* disk tiers off, otherwise immutable lookup_key
+            # still answers from spill after the PUT phase.
             start_spiceio nocache SPICEIO_WRITE_BACK=0 \
-                SPICEIO_OBJECT_CACHE_BYTES=0 SPICEIO_OBJECT_CACHE_ENTRIES=0
+                SPICEIO_OBJECT_CACHE_BYTES=0 SPICEIO_OBJECT_CACHE_ENTRIES=0 \
+                SPICEIO_SPILL_DIR=off
             ;;
         writeback)
             # PUT acknowledged from memory; the NAS write happens behind it (the
@@ -408,17 +414,22 @@ REPORT="${RESULTS}/report.md"
     echo "| host | \`$(uname -sr) $(sysctl -n hw.model 2>/dev/null || echo '?')\` |"
     echo
     echo "Client-observed latency from \`spiceio-loadgen\` over persistent"
-    echo "keep-alive connections. \`cached\` pins write-back off (so the"
-    echo "\`writeback\` pass is a comparison) and immutable objects on"
-    echo "(sccache production: GET hits skip the SMB revalidate, existence"
-    echo "index answers 404s). \`nocache\` disables the GET body cache so"
-    echo "every hit reaches the NAS."
+    echo "keep-alive connections. This run pinned immutable objects to"
+    echo "\`${IMMUTABLE}\` (existence index and TTL 0 pinned with it)."
+    if [[ "$IMMUTABLE" == "1" ]]; then
+        echo "GET hits skip the SMB revalidate; the existence index answers 404s."
+    else
+        echo "GET hits etag-revalidate; missing leaves still open on the NAS."
+    fi
+    echo "\`cached\` pins write-back off so the \`writeback\` pass is a"
+    echo "comparison. \`nocache\` sets the memory cache to zero *and*"
+    echo "\`SPICEIO_SPILL_DIR=off\`, so every hit reaches the NAS."
     echo
     for pass in ${PASSES[@]+"${PASSES[@]}"}; do
         echo "## ${pass}"
         echo
-        echo "| conc | phase | ops/s | MiB/s | p99 | p99.9 | err |"
-        echo "| ---: | --- | ---: | ---: | ---: | ---: | ---: |"
+        echo "| conc | phase | ops/s | MiB/s | p99 | p99.9 | max | err |"
+        echo "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |"
         for conc in $CONCURRENCY_SWEEP; do
             f="${RESULTS}/${pass}-c${conc}.json"
             [[ -s "$f" ]] || continue
@@ -438,7 +449,7 @@ for p in doc["phases"]:
     detail = ", ".join(f"{k}: {v}" for k, v in sorted(p["errors"].items()))
     err_cell = f"{err}" + (f" ({detail})" if detail else "")
     print(f"| {conc} | {p['phase']} | {p['ops_per_sec']:.1f} | {p['mib_per_sec']:.1f} "
-          f"| {ms(lat['p99'])} | {ms(lat['p999'])} | {err_cell} |")
+          f"| {ms(lat['p99'])} | {ms(lat['p999'])} | {ms(lat['max'])} | {err_cell} |")
 PY
         done
         echo

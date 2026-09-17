@@ -1575,14 +1575,16 @@ async fn stream_get_object(
 
 /// If-None-Match: * — fail if the key already exists.
 ///
-/// `memory_ack` is the write-back path: a listed-present name is enough to
-/// 412, a listed-absent name skips the NAS, and only Unknown takes a slot
-/// (dropped before the caller acks from memory). Write-through always stats.
+/// The existence index is a local listing and can disagree with a peer's
+/// create or delete, so it must not decide this precondition. Pending
+/// write-back metadata is this instance's own ack and is authoritative.
+/// `need_slot` is the memory-ack path, which does not already hold an SMB
+/// permit: take one for the stat and drop it before the caller acks.
 async fn put_if_none_match_star(
     state: &AppState,
     share: &ShareSession,
     key: &str,
-    memory_ack: bool,
+    need_slot: bool,
 ) -> Option<Response<SpiceioBody>> {
     let precondition = || {
         error_response(
@@ -1596,23 +1598,18 @@ async fn put_if_none_match_star(
     if state.writeback.pending_meta(key).await.is_some() {
         return Some(precondition());
     }
-    if memory_ack {
-        match state.existence.probe(key) {
-            Probe::Present => return Some(precondition()),
-            Probe::Absent => return None,
-            Probe::Unknown => {}
+    let _stat = if need_slot {
+        match acquire_smb_slot(state).await {
+            Ok(p) => Some(p),
+            Err(()) => {
+                return Some(service_unavailable(
+                    "spiceio is at capacity waiting on the SMB backend; please retry.",
+                ));
+            }
         }
-        let Ok(_stat) = acquire_smb_slot(state).await else {
-            return Some(service_unavailable(
-                "spiceio is at capacity waiting on the SMB backend; please retry.",
-            ));
-        };
-        return match share.head_object(key).await {
-            Ok(_) => Some(precondition()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => Some(io_to_s3_error(&e)),
-        };
-    }
+    } else {
+        None
+    };
     match share.head_object(key).await {
         Ok(_) => Some(precondition()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -1649,6 +1646,12 @@ async fn handle_put_object(
         {
             return resp;
         }
+        let cl = content_length.expect("writeback_ack requires Content-Length");
+        let Some(_collect) = state.writeback.try_begin_collect(cl) else {
+            return service_unavailable(
+                "spiceio is at capacity buffering write-back bodies; please retry.",
+            );
+        };
         let data = match collect_body(body, content_length).await {
             Ok(b) => b,
             Err(resp) => return *resp,
@@ -4223,6 +4226,23 @@ mod replacement_regressions {
         assert!(
             String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
                 .contains("InvalidPart")
+        );
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_does_not_trust_existence_absent() {
+        let (mut state, _server) = state().await;
+        state.existence = Arc::new(ExistenceIndex::new(true, None));
+        state.existence.seed_listed("pre", &[]);
+        let share = Arc::clone(&state.share);
+        let timed = tokio::time::timeout(
+            Duration::from_millis(80),
+            put_if_none_match_star(&state, share.as_ref(), "pre/x", true),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "If-None-Match:* must stat the NAS even when the local listing says absent"
         );
     }
 }
