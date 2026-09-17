@@ -1573,6 +1573,17 @@ async fn stream_get_object(
     }
 }
 
+/// Memory-ack is only for bodies that fit *both* the object-cache cap (so the
+/// pending generation can be served) *and* the write-back byte ceiling. A body
+/// larger than the queue would fail `try_begin_collect` even with no concurrent
+/// PUTs and 503 instead of the documented write-through.
+fn writeback_memory_ack_eligible(state: &AppState, content_length: Option<u64>) -> bool {
+    state.writeback.enabled()
+        && content_length.is_some_and(|cl| {
+            cl <= state.object_cache.max_object_bytes() && cl <= state.writeback.max_bytes()
+        })
+}
+
 /// If-None-Match: * — fail if the key already exists.
 ///
 /// The existence index is a local listing and can disagree with a peer's
@@ -1633,8 +1644,7 @@ async fn handle_put_object(
     let share = &state.share;
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
-    let writeback_ack = state.writeback.enabled()
-        && content_length.is_some_and(|cl| cl <= state.object_cache.max_object_bytes());
+    let writeback_ack = writeback_memory_ack_eligible(state, content_length);
 
     // Memory-ack PUTs must not take an SMB slot: they are not backend demand,
     // and holding one queued GET/HEAD behind a write that never touches the
@@ -4227,6 +4237,20 @@ mod replacement_regressions {
             String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
                 .contains("InvalidPart")
         );
+    }
+
+    #[tokio::test]
+    async fn memory_ack_skips_bodies_larger_than_the_write_back_ceiling() {
+        let (mut state, _server) = state().await;
+        state.writeback = Arc::new(WriteBack::new(true, 64));
+        state.object_cache = Arc::new(ObjectCache::new(false, 1024, 200, 16));
+        assert!(
+            !writeback_memory_ack_eligible(&state, Some(100)),
+            "100 bytes fits the 200-byte object cap but not the 64-byte queue; must write through, not 503"
+        );
+        assert!(writeback_memory_ack_eligible(&state, Some(64)));
+        assert!(!writeback_memory_ack_eligible(&state, Some(65)));
+        assert!(!writeback_memory_ack_eligible(&state, None));
     }
 
     #[tokio::test]

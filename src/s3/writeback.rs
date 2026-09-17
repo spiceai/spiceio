@@ -1284,6 +1284,19 @@ mod tests {
     }
 
     #[test]
+    fn a_body_larger_than_the_ceiling_cannot_be_collected_even_alone() {
+        let w = WriteBack::new(true, 64);
+        assert!(
+            w.try_begin_collect(65).is_none(),
+            "a 65-byte body against a 64-byte ceiling must not enter collect"
+        );
+        assert!(
+            w.try_begin_collect(64).is_some(),
+            "exactly the ceiling is still a collect candidate"
+        );
+    }
+
+    #[test]
     fn collect_reservation_is_capped_by_the_write_back_ceiling() {
         let w = WriteBack::new(true, 100);
         let a = w.try_begin_collect(60).expect("first collect");
