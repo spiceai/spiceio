@@ -903,45 +903,45 @@ async fn try_backendless_get(
     ))
 }
 
-/// HEAD analogue of [`try_backendless_get`]: pending write-back metadata, no SMB.
+/// HEAD analogue of [`try_backendless_get`]: pending write-back metadata, or
+/// an immutable cache hit. Same contract as GET — if the body is already
+/// resident, the NAS has nothing to add to Content-Length / ETag / mtime.
 async fn try_backendless_head(
     hdrs: &http::HeaderMap,
     state: &AppState,
     key: &str,
 ) -> Option<Response<SpiceioBody>> {
-    let (etag, last_modified, size) = state.writeback.pending_meta(key).await?;
+    let (etag, last_modified, size, cache_hit) =
+        if let Some((etag, last_modified, size)) = state.writeback.pending_meta(key).await {
+            (etag, last_modified, size, false)
+        } else if state.object_cache.immutable() {
+            let hit = state.object_cache.lookup_key(key).await?;
+            (hit.etag, hit.last_modified, hit.body.len() as u64, true)
+        } else {
+            return None;
+        };
     let etag = format!("\"{etag}\"");
-    if let Some(im) = get_header(hdrs, IF_MATCH)
-        && !etag_matches(im, &etag)
-    {
-        return Some(error_response(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
-            "",
-        ));
+    if let Some(resp) = conditional_get_short_circuit(
+        &get_header(hdrs, IF_MATCH).map(String::from),
+        &get_header(hdrs, IF_NONE_MATCH).map(String::from),
+        &get_header(hdrs, IF_MODIFIED_SINCE).map(String::from),
+        &get_header(hdrs, IF_UNMODIFIED_SINCE).map(String::from),
+        &etag,
+        last_modified,
+    ) {
+        return Some(resp);
     }
-    if let Some(inm) = get_header(hdrs, IF_NONE_MATCH)
-        && etag_matches(inm, &etag)
-    {
-        return Some(
-            Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header("ETag", &etag)
-                .body(SpiceioBody::empty())
-                .unwrap(),
-        );
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", guess_content_type(key))
+        .header("Content-Length", size.to_string())
+        .header("ETag", &etag)
+        .header("Last-Modified", xml::epoch_to_http_date(last_modified))
+        .header("Accept-Ranges", "bytes");
+    if cache_hit {
+        builder = builder.header("x-spiceio-cache", "HIT");
     }
-    Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", guess_content_type(key))
-            .header("Content-Length", size.to_string())
-            .header("ETag", &etag)
-            .header("Last-Modified", xml::epoch_to_http_date(last_modified))
-            .header("Accept-Ranges", "bytes")
-            .body(SpiceioBody::empty())
-            .unwrap(),
-    )
+    Some(builder.body(SpiceioBody::empty()).unwrap())
 }
 
 fn existence_miss_get(state: &AppState) -> Response<SpiceioBody> {
@@ -1573,6 +1573,61 @@ async fn stream_get_object(
     }
 }
 
+/// Memory-ack is only for bodies that fit *both* the object-cache cap (so the
+/// pending generation can be served) *and* the write-back byte ceiling. A body
+/// larger than the queue would fail `try_begin_collect` even with no concurrent
+/// PUTs and 503 instead of the documented write-through.
+fn writeback_memory_ack_eligible(state: &AppState, content_length: Option<u64>) -> bool {
+    state.writeback.enabled()
+        && content_length.is_some_and(|cl| {
+            cl <= state.object_cache.max_object_bytes() && cl <= state.writeback.max_bytes()
+        })
+}
+
+/// If-None-Match: * — fail if the key already exists.
+///
+/// The existence index is a local listing and can disagree with a peer's
+/// create or delete, so it must not decide this precondition. Pending
+/// write-back metadata is this instance's own ack and is authoritative.
+/// `need_slot` is the memory-ack path, which does not already hold an SMB
+/// permit: take one for the stat and drop it before the caller acks.
+async fn put_if_none_match_star(
+    state: &AppState,
+    share: &ShareSession,
+    key: &str,
+    need_slot: bool,
+) -> Option<Response<SpiceioBody>> {
+    let precondition = || {
+        error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold.",
+        )
+    };
+    // A write acknowledged from memory is an object that exists, even though
+    // the NAS cannot see it yet — a stat would miss it and let the write through.
+    if state.writeback.pending_meta(key).await.is_some() {
+        return Some(precondition());
+    }
+    let _stat = if need_slot {
+        match acquire_smb_slot(state).await {
+            Ok(p) => Some(p),
+            Err(()) => {
+                return Some(service_unavailable(
+                    "spiceio is at capacity waiting on the SMB backend; please retry.",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    match share.head_object(key).await {
+        Ok(_) => Some(precondition()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => Some(io_to_s3_error(&e)),
+    }
+}
+
 // ── PutObject (streaming, with conditional-write via If-None-Match) ─────────
 
 async fn handle_put_object(
@@ -1585,59 +1640,33 @@ async fn handle_put_object(
     let Ok(_mutation) = state.writeback.begin_mutation(key).await else {
         return service_unavailable("A previous write is still in progress; please retry.");
     };
-    let Ok(_permit) = acquire_smb_slot(state).await else {
-        return service_unavailable(
-            "spiceio is at capacity waiting on the SMB backend; please retry.",
-        );
-    };
 
     let share = &state.share;
     let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
-    // Conditional write: If-None-Match: * means "only if not exists"
-    if let Some(ref inm) = if_none_match
-        && inm.trim() == "*"
-    {
-        // A write acknowledged from memory is an object that exists, even
-        // though the NAS cannot see it yet — the stat below would miss it and
-        // let the conditional write through.
-        if state.writeback.pending_meta(key).await.is_some() {
-            return error_response(
-                StatusCode::PRECONDITION_FAILED,
-                "PreconditionFailed",
-                "At least one of the preconditions you specified did not hold.",
-            );
-        }
-        match share.head_object(key).await {
-            Ok(_) => {
-                return error_response(
-                    StatusCode::PRECONDITION_FAILED,
-                    "PreconditionFailed",
-                    "At least one of the preconditions you specified did not hold.",
-                );
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return io_to_s3_error(&e),
-        }
-    }
+    let writeback_ack = writeback_memory_ack_eligible(state, content_length);
 
-    // ── Write-back: acknowledge from memory, reach the NAS later ────
-    //
-    // The whole body has to be in hand for this: the queue serves the pending
-    // generation directly until the flush lands. Within that bound the backend round trip is pure
-    // latency for the client — see `writeback` for what the 200 promises.
-    if state.writeback.enabled()
-        && let Some(cl) = content_length
-        && cl <= state.object_cache.max_object_bytes()
-    {
+    // Memory-ack PUTs must not take an SMB slot: they are not backend demand,
+    // and holding one queued GET/HEAD behind a write that never touches the
+    // NAS (and made flushers yield to a client that was not waiting on SMB).
+    if writeback_ack {
+        if let Some(ref inm) = if_none_match
+            && inm.trim() == "*"
+            && let Some(resp) = put_if_none_match_star(state, share, key, true).await
+        {
+            return resp;
+        }
+        let cl = content_length.expect("writeback_ack requires Content-Length");
+        let Some(_collect) = state.writeback.try_begin_collect(cl) else {
+            return service_unavailable(
+                "spiceio is at capacity buffering write-back bodies; please retry.",
+            );
+        };
         let data = match collect_body(body, content_length).await {
             Ok(b) => b,
             Err(resp) => return *resp,
         };
         let now = crate::smb::ops::now_epoch_secs();
-        // Provisional metadata, in the backend's own etag format: the NAS
-        // assigns the real mtime when the flush lands, and both cache tiers
-        // adopt it then (see `WriteBack::flush_one`).
         let etag = crate::smb::ops::provisional_etag(data.len() as u64, now);
         if state.writeback.enqueue(key, &etag, now, data.clone()).await {
             state.object_cache.insert(key, &etag, now, data);
@@ -1654,7 +1683,11 @@ async fn handle_put_object(
         // Refused — the queue is at its ceiling or shutdown has begun. Write
         // through synchronously with the body already collected, which is the
         // backpressure a backlogged backend is supposed to apply to clients.
-        // The mutation guard keeps the predecessor paused until publication.
+        let Ok(_permit) = acquire_smb_slot(state).await else {
+            return service_unavailable(
+                "spiceio is at capacity waiting on the SMB backend; please retry.",
+            );
+        };
         return match share.put_object_atomic(key, &data).await {
             Ok(meta) => {
                 state.writeback.cancel(key).await;
@@ -1673,6 +1706,18 @@ async fn handle_put_object(
             }
             Err(e) => io_to_s3_write_error(&e),
         };
+    }
+
+    let Ok(_permit) = acquire_smb_slot(state).await else {
+        return service_unavailable(
+            "spiceio is at capacity waiting on the SMB backend; please retry.",
+        );
+    };
+    if let Some(ref inm) = if_none_match
+        && inm.trim() == "*"
+        && let Some(resp) = put_if_none_match_star(state, share, key, false).await
+    {
+        return resp;
     }
 
     // ── Buffered path: publish small bodies through the WAL ─────────
@@ -4072,6 +4117,55 @@ mod replacement_regressions {
     }
 
     #[tokio::test]
+    async fn try_backendless_head_serves_immutable_cache_hit() {
+        let (mut state, _server) = state().await;
+        state.object_cache = Arc::new(ObjectCache::new(true, 1024, 1024, 64));
+        state
+            .object_cache
+            .insert("k", "etag", 1, Bytes::from_static(b"body"));
+        let headers = http::HeaderMap::new();
+        let resp = try_backendless_head(&headers, &state, "k").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-length"], "4");
+        assert_eq!(resp.headers()["etag"], "\"etag\"");
+        assert_eq!(resp.headers()["x-spiceio-cache"], "HIT");
+        assert!(resp.headers().get("x-spiceio-cache").is_some());
+    }
+
+    #[tokio::test]
+    async fn try_backendless_head_skips_etag_revalidated_cache() {
+        let (state, _server) = state().await;
+        state
+            .object_cache
+            .insert("k", "etag", 1, Bytes::from_static(b"body"));
+        let headers = http::HeaderMap::new();
+        assert!(
+            try_backendless_head(&headers, &state, "k").await.is_none(),
+            "etag-revalidated HEAD must still stat the NAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_backendless_head_prefers_pending_over_cache() {
+        let (mut state, _server) = state().await;
+        state.object_cache = Arc::new(ObjectCache::new(true, 1024, 1024, 64));
+        state
+            .object_cache
+            .insert("k", "old", 1, Bytes::from_static(b"old!"));
+        assert!(
+            state
+                .writeback
+                .enqueue("k", "new", 2, Bytes::from_static(b"new!"))
+                .await
+        );
+        let headers = http::HeaderMap::new();
+        let resp = try_backendless_head(&headers, &state, "k").await.unwrap();
+        assert_eq!(resp.headers()["etag"], "\"new\"");
+        assert_eq!(resp.headers()["content-length"], "4");
+        assert!(resp.headers().get("x-spiceio-cache").is_none());
+    }
+
+    #[tokio::test]
     async fn delete_retires_pending_bytes_only_after_backend_success() {
         for (status, preserved) in [(0xC0000022, true), (0xC0000034, false)] {
             let (state, mut server) = state().await;
@@ -4142,6 +4236,37 @@ mod replacement_regressions {
         assert!(
             String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
                 .contains("InvalidPart")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_ack_skips_bodies_larger_than_the_write_back_ceiling() {
+        let (mut state, _server) = state().await;
+        state.writeback = Arc::new(WriteBack::new(true, 64));
+        state.object_cache = Arc::new(ObjectCache::new(false, 1024, 200, 16));
+        assert!(
+            !writeback_memory_ack_eligible(&state, Some(100)),
+            "100 bytes fits the 200-byte object cap but not the 64-byte queue; must write through, not 503"
+        );
+        assert!(writeback_memory_ack_eligible(&state, Some(64)));
+        assert!(!writeback_memory_ack_eligible(&state, Some(65)));
+        assert!(!writeback_memory_ack_eligible(&state, None));
+    }
+
+    #[tokio::test]
+    async fn if_none_match_star_does_not_trust_existence_absent() {
+        let (mut state, _server) = state().await;
+        state.existence = Arc::new(ExistenceIndex::new(true, None));
+        state.existence.seed_listed("pre", &[]);
+        let share = Arc::clone(&state.share);
+        let timed = tokio::time::timeout(
+            Duration::from_millis(80),
+            put_if_none_match_star(&state, share.as_ref(), "pre/x", true),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "If-None-Match:* must stat the NAS even when the local listing says absent"
         );
     }
 }

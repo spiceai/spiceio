@@ -263,6 +263,22 @@ pub struct WriteBack {
     flushed: AtomicU64,
     rejected: AtomicU64,
     retries: AtomicU64,
+    /// Bodies currently in `collect_body` on the memory-ack path. Bounded
+    /// against `max_bytes` so concurrent PUTs cannot buffer an unbounded
+    /// amount of process memory before enqueue (or a slot wait) runs.
+    collect_bytes: AtomicU64,
+}
+
+/// Holds a reservation against the write-back collect ceiling for one body.
+pub struct CollectGuard<'a> {
+    wb: &'a WriteBack,
+    len: u64,
+}
+
+impl Drop for CollectGuard<'_> {
+    fn drop(&mut self) {
+        self.wb.collect_bytes.fetch_sub(self.len, Ordering::Relaxed);
+    }
 }
 
 impl WriteBack {
@@ -286,6 +302,29 @@ impl WriteBack {
             flushed: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            collect_bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Reserve `len` bytes of collect-buffer against the write-back ceiling.
+    /// Independent of SMB admission: a memory-ack PUT must not wait on a
+    /// backend slot, but it still must not unbounded-buffer the process.
+    pub fn try_begin_collect(&self, len: u64) -> Option<CollectGuard<'_>> {
+        if len == 0 {
+            return Some(CollectGuard { wb: self, len: 0 });
+        }
+        loop {
+            let cur = self.collect_bytes.load(Ordering::Relaxed);
+            if cur.saturating_add(len) > self.max_bytes {
+                return None;
+            }
+            if self
+                .collect_bytes
+                .compare_exchange(cur, cur + len, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(CollectGuard { wb: self, len });
+            }
         }
     }
 
@@ -1242,6 +1281,36 @@ mod tests {
         assert!(!w.enqueue("k", "e", 1, Bytes::from_static(b"x")).await);
         assert!(w.pending_meta("k").await.is_none());
         assert!(w.snapshot().await.is_empty());
+    }
+
+    #[test]
+    fn a_body_larger_than_the_ceiling_cannot_be_collected_even_alone() {
+        let w = WriteBack::new(true, 64);
+        assert!(
+            w.try_begin_collect(65).is_none(),
+            "a 65-byte body against a 64-byte ceiling must not enter collect"
+        );
+        assert!(
+            w.try_begin_collect(64).is_some(),
+            "exactly the ceiling is still a collect candidate"
+        );
+    }
+
+    #[test]
+    fn collect_reservation_is_capped_by_the_write_back_ceiling() {
+        let w = WriteBack::new(true, 100);
+        let a = w.try_begin_collect(60).expect("first collect");
+        assert!(
+            w.try_begin_collect(50).is_none(),
+            "60+50 exceeds the 100-byte ceiling"
+        );
+        let b = w.try_begin_collect(40).expect("60+40 fits");
+        drop(a);
+        assert!(
+            w.try_begin_collect(50).is_some(),
+            "dropping the first reservation frees 60 bytes"
+        );
+        drop(b);
     }
 
     #[tokio::test]

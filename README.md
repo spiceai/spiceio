@@ -390,7 +390,8 @@ make bench-sccache-build  # real cargo builds: spiceio vs local disk vs no cache
 
 Measurements, not gates — `make ci` never runs them. `bench-sccache` drives
 `spiceio-loadgen` over persistent keep-alive connections (how sccache actually
-talks to the proxy), sweeps concurrency, and reports p50/p90/p99/p99.9 and TTFB
+talks to the proxy), pins `SPICEIO_IMMUTABLE_OBJECTS=1` (sccache production;
+existence index on), sweeps concurrency, and reports p99/p99.9 and TTFB
 per operation class, alongside server-side per-request timings from
 `SPICEIO_ACCESS_LOG`. `bench-sccache-build` runs real `cargo build`s three ways
 and reads sccache's own per-hit and per-write latency, with a local-disk cache

@@ -9,7 +9,8 @@ set -euo pipefail
 # connections, content-addressed keys, a realistic object-size mix — and
 # recording latency on both sides of the proxy at once:
 #
-#   client side  spiceio-loadgen: ops/s, MiB/s, mean/p50/p90/p99/p99.9, TTFB
+#   client side  spiceio-loadgen: ops/s, MiB/s, p99/p99.9/max, TTFB
+#                (never p50 — the usable-cache question is the tail)
 #                phases include get-miss / head-miss (404 existence probes —
 #                the sccache cold-build path) as well as hits and mixed
 #   server side  SPICEIO_ACCESS_LOG: how long spiceio held each request,
@@ -37,6 +38,11 @@ set -euo pipefail
 #                          are baselines; also available: `writeback` (the
 #                          shipped default) and `nospill` (SPICEIO_SPILL_DIR=off),
 #                          for isolating the write-ack and disk-tier changes
+#   BENCH_IMMUTABLE        SPICEIO_IMMUTABLE_OBJECTS (default 1). sccache keys
+#                          are content-addressed; this is the production setting.
+#                          Also pins SPICEIO_EXISTENCE_INDEX to the same value
+#                          and TTL to 0 so an ambient env cannot change the run.
+#                          Set 0 to isolate the etag-revalidated miss path.
 #   BENCH_OUT              results directory (default benches/results)
 #   BENCH_LABEL            label recorded in the report (default: git describe)
 #   BENCH_KEEP             1 to leave written objects on the share (default 0)
@@ -65,6 +71,11 @@ PHASES="${BENCH_PHASES:-put,get,get-miss,head-hit,head-miss,mixed}"
 SELECTED_PASSES="${BENCH_PASSES:-cached nocache}"
 OPS_PER_WORKER="${BENCH_OPS_PER_WORKER:-24}"
 KEEP="${BENCH_KEEP:-0}"
+# Pin rather than inherit: an ambient SPICEIO_IMMUTABLE_OBJECTS (launchd env,
+# leftover shell) would otherwise make two runs of the same tree incomparable.
+# 1 is sccache production and enables the existence index; 0 is the old
+# etag-revalidated miss path.
+IMMUTABLE="${BENCH_IMMUTABLE:-1}"
 
 : "${SPICEIO_SMB_USER:?SPICEIO_SMB_USER is required}"
 : "${SPICEIO_SMB_PASS:?SPICEIO_SMB_PASS is required}"
@@ -156,6 +167,9 @@ start_spiceio() {
         SPICEIO_BUCKET="$BUCKET" \
         SPICEIO_REGION="$REGION" \
         ${SMB_CONNS:+SPICEIO_SMB_CONNECTIONS=$SMB_CONNS} \
+        SPICEIO_IMMUTABLE_OBJECTS="$IMMUTABLE" \
+        SPICEIO_EXISTENCE_INDEX="$IMMUTABLE" \
+        SPICEIO_EXISTENCE_INDEX_TTL_SECS=0 \
         SPICEIO_LOG_FILE="$log" \
         SPICEIO_ACCESS_LOG="$ACCESS_FILE" \
         "$SPICEIO_BIN" >/dev/null 2>&1 &
@@ -262,8 +276,8 @@ for method in sorted(by):
     t, h = sorted(e["tot"]), sorted(e["head"])
     print("\t".join(str(v) for v in (
         method, len(t), e["bytes"],
-        pct(t, 0.50), pct(t, 0.90), pct(t, 0.99), t[-1] if t else 0,
-        pct(h, 0.50), pct(h, 0.99), e["err"],
+        pct(t, 0.99), pct(t, 0.999), t[-1] if t else 0,
+        pct(h, 0.99), e["err"],
     )))
 PY
 }
@@ -274,14 +288,14 @@ print_access_table() {
         echo "${indent}(no access-log records in window)"
         return 0
     fi
-    printf "%s%-12s %8s %9s %10s %10s %10s %10s %10s %10s %5s\n" \
-        "$indent" method:status count MiB p50 p90 p99 max head_p50 head_p99 5xx
-    local m cnt bytes p50 p90 p99 mx hp50 hp99 errs
-    while IFS=$'\t' read -r m cnt bytes p50 p90 p99 mx hp50 hp99 errs; do
-        awk -v i="$indent" -v m="$m" -v c="$cnt" -v b="$bytes" -v a="$p50" -v d="$p90" \
-            -v e="$p99" -v f="$mx" -v g="$hp50" -v j="$hp99" -v k="$errs" \
-            'BEGIN{printf "%s%-12s %8d %9.1f %8.2fms %8.2fms %8.2fms %8.2fms %8.2fms %8.2fms %5d\n",
-                   i, m, c, b/1048576, a/1000, d/1000, e/1000, f/1000, g/1000, j/1000, k}'
+    printf "%s%-12s %8s %9s %10s %10s %10s %10s %5s\n" \
+        "$indent" method:status count MiB p99 p99.9 max head_p99 5xx
+    local m cnt bytes p99 p999 mx hp99 errs
+    while IFS=$'\t' read -r m cnt bytes p99 p999 mx hp99 errs; do
+        awk -v i="$indent" -v m="$m" -v c="$cnt" -v b="$bytes" \
+            -v e="$p99" -v n="$p999" -v f="$mx" -v j="$hp99" -v k="$errs" \
+            'BEGIN{printf "%s%-12s %8d %9.1f %8.2fms %8.2fms %8.2fms %8.2fms %5d\n",
+                   i, m, c, b/1048576, e/1000, n/1000, f/1000, j/1000, k}'
     done <"$out"
 }
 
@@ -334,6 +348,7 @@ echo "════════════════════════�
 echo " spiceio sccache bench — ${LABEL}"
 echo " target : smb://${SMB_SERVER}/${SMB_SHARE}  bucket=${BUCKET}"
 echo " pool   : ${SMB_CONNS:-spiceio default} SMB connections"
+echo " immutable: ${IMMUTABLE} (existence index pinned ${IMMUTABLE}, ttl 0)"
 echo " sweep  : concurrency [${CONCURRENCY_SWEEP}]  objects=${OBJECTS}  ops/worker=${OPS_PER_WORKER}"
 echo " phases : ${PHASES}"
 echo " results: ${RESULTS}"
@@ -355,8 +370,11 @@ for pass in $SELECTED_PASSES; do
             start_spiceio cached SPICEIO_WRITE_BACK=0
             ;;
         nocache)
+            # Memory *and* disk tiers off, otherwise immutable lookup_key
+            # still answers from spill after the PUT phase.
             start_spiceio nocache SPICEIO_WRITE_BACK=0 \
-                SPICEIO_OBJECT_CACHE_BYTES=0 SPICEIO_OBJECT_CACHE_ENTRIES=0
+                SPICEIO_OBJECT_CACHE_BYTES=0 SPICEIO_OBJECT_CACHE_ENTRIES=0 \
+                SPICEIO_SPILL_DIR=off
             ;;
         writeback)
             # PUT acknowledged from memory; the NAS write happens behind it (the
@@ -389,20 +407,29 @@ REPORT="${RESULTS}/report.md"
     echo "| label | \`${LABEL}\` |"
     echo "| target | \`smb://${SMB_SERVER}/${SMB_SHARE}\` |"
     echo "| SMB pool | ${SMB_CONNS:-spiceio default} |"
+    echo "| immutable | \`${IMMUTABLE}\` |"
     echo "| key space | ${OBJECTS} objects |"
     echo "| ops per worker per phase | ${OPS_PER_WORKER} |"
     echo "| phases | \`${PHASES}\` |"
     echo "| host | \`$(uname -sr) $(sysctl -n hw.model 2>/dev/null || echo '?')\` |"
     echo
     echo "Client-observed latency from \`spiceio-loadgen\` over persistent"
-    echo "keep-alive connections. \`cached\` is the shipping configuration;"
-    echo "\`nocache\` disables the GET body cache so every read reaches the NAS."
+    echo "keep-alive connections. This run pinned immutable objects to"
+    echo "\`${IMMUTABLE}\` (existence index and TTL 0 pinned with it)."
+    if [[ "$IMMUTABLE" == "1" ]]; then
+        echo "GET hits skip the SMB revalidate; the existence index answers 404s."
+    else
+        echo "GET hits etag-revalidate; missing leaves still open on the NAS."
+    fi
+    echo "\`cached\` pins write-back off so the \`writeback\` pass is a"
+    echo "comparison. \`nocache\` sets the memory cache to zero *and*"
+    echo "\`SPICEIO_SPILL_DIR=off\`, so every hit reaches the NAS."
     echo
     for pass in ${PASSES[@]+"${PASSES[@]}"}; do
         echo "## ${pass}"
         echo
-        echo "| conc | phase | ops/s | MiB/s | p50 | p90 | p99 | p99.9 | err |"
-        echo "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        echo "| conc | phase | ops/s | MiB/s | p99 | p99.9 | max | err |"
+        echo "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |"
         for conc in $CONCURRENCY_SWEEP; do
             f="${RESULTS}/${pass}-c${conc}.json"
             [[ -s "$f" ]] || continue
@@ -422,8 +449,7 @@ for p in doc["phases"]:
     detail = ", ".join(f"{k}: {v}" for k, v in sorted(p["errors"].items()))
     err_cell = f"{err}" + (f" ({detail})" if detail else "")
     print(f"| {conc} | {p['phase']} | {p['ops_per_sec']:.1f} | {p['mib_per_sec']:.1f} "
-          f"| {ms(lat['p50'])} | {ms(lat['p90'])} | {ms(lat['p99'])} "
-          f"| {ms(lat['p999'])} | {err_cell} |")
+          f"| {ms(lat['p99'])} | {ms(lat['p999'])} | {ms(lat['max'])} | {err_cell} |")
 PY
         done
         echo

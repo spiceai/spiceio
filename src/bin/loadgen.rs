@@ -23,9 +23,11 @@
 //! `DELETE`), and per size class within a phase:
 //!
 //! * throughput — ops/s and MiB/s over the phase wall clock
-//! * latency — mean/p50/p90/p99/p99.9/max, from request write to last body byte
-//! * time to first byte — the same percentiles, isolating the response-head
-//!   path (SMB open + first read) from the streaming path
+//! * latency — p99/p99.9/max (JSON also records mean/p50/p90), from request
+//!   write to last body byte. Printed tables never show p50: the number that
+//!   decides whether a cache is usable is the tail, not the median.
+//! * time to first byte — the same printed percentiles, isolating the
+//!   response-head path (SMB open + first read) from the streaming path
 //! * outcomes — status-code histogram, connection errors, timeouts
 //!
 //! Results print as a table and, with `--json <path>`, as one JSON document per
@@ -844,39 +846,35 @@ fn fmt_us(us: u64) -> String {
 
 fn print_header() {
     println!(
-        "\n{:<14} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
-        "phase", "ops", "ops/s", "MiB/s", "mean", "p50", "p90", "p99", "p99.9", "err"
+        "\n{:<14} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        "phase", "ops", "ops/s", "MiB/s", "p99", "p99.9", "max", "err"
     );
-    println!("{}", "─".repeat(106));
+    println!("{}", "─".repeat(86));
 }
 
 fn print_phase(r: &PhaseResult) {
     println!(
-        "{:<14} {:>6} {:>9.1} {:>9.1} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        "{:<14} {:>6} {:>9.1} {:>9.1} {:>9} {:>9} {:>9} {:>7}",
         r.name,
         r.samples.ops,
         r.ops_per_sec(),
         r.mib_per_sec(),
-        fmt_us(mean(&r.total_sorted)),
-        fmt_us(pct(&r.total_sorted, 50.0)),
-        fmt_us(pct(&r.total_sorted, 90.0)),
         fmt_us(pct(&r.total_sorted, 99.0)),
         fmt_us(pct(&r.total_sorted, 99.9)),
+        fmt_us(r.total_sorted.last().copied().unwrap_or(0)),
         r.samples.error_count(),
     );
     // TTFB only tells you something new when a body follows it.
     if r.samples.bytes > 0 {
         println!(
-            "{:<14} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            "{:<14} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
             "  └ ttfb",
             "",
             "",
             "",
-            fmt_us(mean(&r.ttfb_sorted)),
-            fmt_us(pct(&r.ttfb_sorted, 50.0)),
-            fmt_us(pct(&r.ttfb_sorted, 90.0)),
             fmt_us(pct(&r.ttfb_sorted, 99.0)),
             fmt_us(pct(&r.ttfb_sorted, 99.9)),
+            fmt_us(r.ttfb_sorted.last().copied().unwrap_or(0)),
             "",
         );
     }
