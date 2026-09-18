@@ -94,9 +94,10 @@ Rules:
 - Custom curl benches / 10× stress **do not replace** `scripts/test-sccache.sh`.
   That script asserts sccache **cache hits > 0 and write errors == 0**, then
   drains spiceio and SHA-256-checks the SHA-keyed sccache objects on the NAS
-  through a second instance with write-back, spill, and the object cache off.
-  A local smbfs mount (`SPICEIO_SMB_MOUNT=/Volumes/ai_platform_dev`) is opt-in
-  — CI runners do not have one. Hits during the warm build can be served from
+  (`spiceio-sccache-nas`, covered by `cargo test --features loadgen`) through a
+  second instance with write-back, spill, and the object cache off. A local
+  smbfs mount (`SPICEIO_SMB_MOUNT=/Volumes/ai_platform_dev`) is opt-in — CI
+  runners do not have one. Hits during the warm build can be served from
   memory, so they do not prove durability.
 - `scripts/test-writeback.sh` is the dedicated check that an *asynchronously
   acknowledged* write reaches the NAS for synthetic objects. It cannot be

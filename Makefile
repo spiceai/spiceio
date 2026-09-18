@@ -31,14 +31,13 @@ lint: fmt-check check clippy doc
 
 # Unit tests only (no SMB).
 test-unit: test-clean-unit
-	# --features loadgen so spiceio-loadgen's own tests run: they cover the
-	# per-operation status classifier that decides whether the load burst can
-	# see a failed write, and would silently not compile without it.
+	# --features loadgen so spiceio-loadgen and spiceio-sccache-nas tests run:
+	# loadgen's status classifier, and the NAS durability checker's path /
+	# listing / digest tests (no SMB). They would silently not compile without it.
 	cargo test --locked --features loadgen
 
 test-clean-unit:
 	python3 scripts/test-sccache-clean-unit.py
-	python3 scripts/test-sccache-nas.py self-test
 
 # Destructive retention test against an already-running instance. Requires
 # SCCACHE_BUCKET; SCCACHE_ENDPOINT and SCCACHE_S3_KEY_PREFIX select the cache.

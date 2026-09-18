@@ -15,6 +15,7 @@ BIND="${SPICEIO_BIND:-127.0.0.1:18333}"
 : "${SPICEIO_SMB_PASS:?SPICEIO_SMB_PASS is required}"
 
 SPICEIO_BIN="./target/debug/spiceio"
+NAS_BIN="./target/debug/spiceio-sccache-nas"
 TEST_TARGET_DIR="./target/test-sccache"
 ENDPOINT="http://${BIND}"
 # Pass --region explicitly: AWS CLI errors out without one on some runners
@@ -617,7 +618,12 @@ echo ""
 echo "======================================="
 echo "[test] snapshot sccache objects for NAS verify"
 echo "======================================="
-python3 scripts/test-sccache-nas.py snapshot \
+if [[ ! -x "$NAS_BIN" ]]; then
+    echo "[test] FAIL: ${NAS_BIN} not built — cargo build --features loadgen --bins"
+    FAIL=$((FAIL + 1))
+    exit 1
+fi
+"$NAS_BIN" snapshot \
     --endpoint "$ENDPOINT" \
     --bucket "$BUCKET" \
     --prefix "$SCCACHE_PREFIX" \
@@ -796,7 +802,7 @@ if nas_mount_requested; then
         exit 1
     fi
     echo "[test] verifying SHA-256 on mount ${SMB_MOUNT}"
-    python3 scripts/test-sccache-nas.py verify \
+    "$NAS_BIN" verify \
         --manifest "$NAS_MANIFEST" \
         --mount "$SMB_MOUNT"
     echo "  PASS: sccache objects on ${SMB_MOUNT} match the acknowledged SHA-256"
@@ -845,7 +851,7 @@ else
         fi
         sleep 0.5
     done
-    python3 scripts/test-sccache-nas.py verify \
+    "$NAS_BIN" verify \
         --manifest "$NAS_MANIFEST" \
         --endpoint "$ENDPOINT" \
         --bucket "$BUCKET"
