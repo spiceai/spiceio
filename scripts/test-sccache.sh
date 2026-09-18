@@ -20,7 +20,10 @@ ENDPOINT="http://${BIND}"
 # Pass --region explicitly: AWS CLI errors out without one on some runners
 # (no AWS_DEFAULT_REGION in env, no ~/.aws/config).
 AWS="aws --endpoint-url $ENDPOINT --no-sign-request --region $REGION"
-TEST_PREFIX="spiceio-test-$$"
+# $$ is reused after wraparound; a random token keeps an interrupted run's
+# leftover objects from satisfying a later run's cache-hit / durability checks.
+TEST_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(4))')
+TEST_PREFIX="spiceio-test-$$-${TEST_TOKEN}"
 # Isolate this run's compiler cache. A shared prefix would let the
 # post-shutdown NAS check pass on leftover objects from a previous run.
 SCCACHE_PREFIX="${TEST_PREFIX}/sccache"
@@ -48,6 +51,18 @@ FAIL=0
 # `[spiceio] error:` lines. We tee back to stderr so CI still streams live.
 SPICEIO_STDERR=$(mktemp /tmp/spiceio-sccache-stderr.XXXXXX)
 
+nas_mount_requested() {
+    [[ -n "$SMB_MOUNT" && "$SMB_MOUNT" != "off" && "$SMB_MOUNT" != "0" && "$SMB_MOUNT" != "false" ]]
+}
+
+nas_mount_ready() {
+    nas_mount_requested || return 1
+    [[ -d "$SMB_MOUNT" ]] || return 1
+    # Require smbfs, not merely "something is mounted here" (APFS/local would
+    # let the durability check hash a local directory and then rm -rf it).
+    mount | grep -F " on ${SMB_MOUNT} (smbfs" >/dev/null
+}
+
 # ── Cleanup on exit ─────────────────────────────────────────────────────────
 
 SPICEIO_PID=""
@@ -59,7 +74,7 @@ cleanup() {
     # Remove test objects. Prefer the local mount when spiceio is already
     # down; AWS CLI against a dead proxy is a no-op.
     $AWS s3 rm "s3://${BUCKET}/${TEST_PREFIX}/" --recursive 2>/dev/null || true
-    if [[ "$SMB_MOUNT" != "off" && -d "${SMB_MOUNT}/${TEST_PREFIX}" ]]; then
+    if nas_mount_ready && [[ -d "${SMB_MOUNT}/${TEST_PREFIX}" ]]; then
         rm -rf "${SMB_MOUNT}/${TEST_PREFIX}" 2>/dev/null || true
     fi
     if [[ -n "$SPICEIO_PID2" ]]; then
@@ -123,30 +138,31 @@ assert_fail() {
     fi
 }
 
-# SIGTERM, wait for the process, then for the async logger + tee to flush so
-# shutdown / write-back drain lines are in SPICEIO_STDERR before we grep them.
+# SIGTERM, wait for the process, then for this process's own shutdown lines
+# to land in the log. The capture file is shared, so we only inspect bytes
+# written after the kill — a peer's earlier "shutting down" must not count.
+# Sets STOP_LOG / STOP_LOG_OFFSET for callers that grep the suffix.
 stop_spiceio() {
     local __pidvar="$1" pid="${!1}"
+    local log="${2:-$SPICEIO_STDERR}"
     [[ -z "$pid" ]] && return 0
+    local offset=0
+    if [[ -f "$log" ]]; then
+        offset=$(wc -c < "$log" | tr -d ' ')
+    fi
     kill -TERM "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     printf -v "$__pidvar" '%s' ""
+    STOP_LOG="$log"
+    STOP_LOG_OFFSET="$offset"
     for _ in $(seq 1 50); do
-        grep -q 'all connections drained\|shutting down' "$SPICEIO_STDERR" 2>/dev/null && break
+        if [[ -f "$log" ]] && tail -c +"$((offset + 1))" "$log" 2>/dev/null \
+                | grep -q 'all connections drained\|shutting down'; then
+            break
+        fi
         sleep 0.1
     done
     sleep 0.2
-}
-
-nas_mount_requested() {
-    [[ -n "$SMB_MOUNT" && "$SMB_MOUNT" != "off" && "$SMB_MOUNT" != "0" && "$SMB_MOUNT" != "false" ]]
-}
-
-nas_mount_ready() {
-    nas_mount_requested || return 1
-    [[ -d "$SMB_MOUNT" ]] || return 1
-    # macOS: `... on /Volumes/share (smbfs, ...)`.
-    mount | grep -F " on ${SMB_MOUNT} (" >/dev/null
 }
 
 # ── Start spiceio ───────────────────────────────────────────────────────────
@@ -760,14 +776,13 @@ sccache --stop-server 2>/dev/null || true
 if [[ -n "$SPICEIO_PID2" ]]; then
     stop_spiceio SPICEIO_PID2
 fi
-WRITER_LOG="$SPICEIO_STDERR"
 stop_spiceio SPICEIO_PID
+WRITER_SUFFIX=$(tail -c +"$((STOP_LOG_OFFSET + 1))" "$STOP_LOG" 2>/dev/null || true)
 
-if grep -q 'did not reach the NAS before shutdown\|were acknowledged but are lost' \
-        "$WRITER_LOG" 2>/dev/null; then
+if printf '%s' "$WRITER_SUFFIX" | grep -q 'did not reach the NAS before shutdown\|were acknowledged but are lost'; then
     echo "  FAIL: shutdown left acknowledged writes off the NAS"
-    grep -E 'did not reach the NAS before shutdown|were acknowledged but are lost' \
-        "$WRITER_LOG" | sed 's/^/    /'
+    printf '%s' "$WRITER_SUFFIX" | grep -E 'did not reach the NAS before shutdown|were acknowledged but are lost' \
+        | sed 's/^/    /'
     FAIL=$((FAIL + 1))
     exit 1
 fi
@@ -786,14 +801,17 @@ if nas_mount_requested; then
         --mount "$SMB_MOUNT"
     echo "  PASS: sccache objects on ${SMB_MOUNT} match the acknowledged SHA-256"
     PASS=$((PASS + 1))
-    rm -rf "${SMB_MOUNT}/${TEST_PREFIX}" 2>/dev/null || true
+    if nas_mount_ready; then
+        rm -rf "${SMB_MOUNT}/${TEST_PREFIX}" 2>/dev/null || true
+    fi
 else
     echo "[test] SPICEIO_SMB_MOUNT unset — reading back through a cache-less instance"
     BIND_PORT="${BIND##*:}"
     STALE_PID=$(lsof -i ":${BIND_PORT}" -sTCP:LISTEN -t 2>/dev/null || true)
     if [[ -n "$STALE_PID" ]]; then
-        echo "$STALE_PID" | xargs kill 2>/dev/null || true
-        sleep 1
+        echo "  FAIL: ${BIND} still in use (pid ${STALE_PID}) after stopping spiceio; not killing an unverified process"
+        FAIL=$((FAIL + 1))
+        exit 1
     fi
     SPICEIO_BIND="$BIND" \
     SPICEIO_SMB_SERVER="$SMB_SERVER" \

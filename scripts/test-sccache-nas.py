@@ -143,6 +143,8 @@ def _refresh_ancestors(path: Path, mount: Path) -> None:
         try:
             os.listdir(current)
         except OSError:
+            # Parent may not exist yet; listdir is a best-effort smbfs cache
+            # refresh and a missing directory is the miss path, not a failure.
             pass
         if current == mount:
             break
