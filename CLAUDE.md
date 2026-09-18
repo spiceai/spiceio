@@ -92,13 +92,17 @@ make ci                           # or: ./scripts/ci-local.sh
 Rules:
 
 - Custom curl benches / 10× stress **do not replace** `scripts/test-sccache.sh`.
-  That script asserts sccache **cache hits > 0 and write errors == 0** — the
-  exact failure mode unit tests and HTTP-only benches miss.
-- `scripts/test-writeback.sh` is the only check that an *asynchronously
-  acknowledged* write reaches the NAS. It cannot be replaced by asserting
-  against the instance that took the write — that instance's own cache answers
-  either way — so it restarts and reads back through a second instance with
-  write-back and the spill both off.
+  That script asserts sccache **cache hits > 0 and write errors == 0**, then
+  drains spiceio and SHA-256-checks the SHA-keyed sccache objects on the NAS
+  through a second instance with write-back, spill, and the object cache off.
+  A local smbfs mount (`SPICEIO_SMB_MOUNT=/Volumes/ai_platform_dev`) is opt-in
+  — CI runners do not have one. Hits during the warm build can be served from
+  memory, so they do not prove durability.
+- `scripts/test-writeback.sh` is the dedicated check that an *asynchronously
+  acknowledged* write reaches the NAS for synthetic objects. It cannot be
+  replaced by asserting against the instance that took the write — that
+  instance's own cache answers either way — so it restarts and reads back
+  through a second instance with write-back and the spill both off.
 - If `SPICEIO_SMB_USER`/`PASS` are set, `make ci` **requires** the live suites
   (`CI_REQUIRE_LIVE=1` by default). Do not unset credentials to skip them.
 - Without credentials, `make ci` still runs lint + unit tests and prints SKIP

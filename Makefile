@@ -38,6 +38,7 @@ test-unit: test-clean-unit
 
 test-clean-unit:
 	python3 scripts/test-sccache-clean-unit.py
+	python3 scripts/test-sccache-nas.py self-test
 
 # Destructive retention test against an already-running instance. Requires
 # SCCACHE_BUCKET; SCCACHE_ENDPOINT and SCCACHE_S3_KEY_PREFIX select the cache.

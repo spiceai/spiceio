@@ -21,7 +21,15 @@ ENDPOINT="http://${BIND}"
 # (no AWS_DEFAULT_REGION in env, no ~/.aws/config).
 AWS="aws --endpoint-url $ENDPOINT --no-sign-request --region $REGION"
 TEST_PREFIX="spiceio-test-$$"
+# Isolate this run's compiler cache. A shared prefix would let the
+# post-shutdown NAS check pass on leftover objects from a previous run.
+SCCACHE_PREFIX="${TEST_PREFIX}/sccache"
 TEST_WORK=$(mktemp -d /tmp/spiceio-sccache-work.XXXXXX)
+NAS_MANIFEST="${TEST_WORK}/sccache-nas-manifest.json"
+# Local smbfs mount of the same share. Off by default: CI runners do not
+# have one, so the NAS check reads back through a cache-less spiceio.
+# Opt in locally with SPICEIO_SMB_MOUNT=/Volumes/ai_platform_dev.
+SMB_MOUNT="${SPICEIO_SMB_MOUNT:-off}"
 # Never stop or reconfigure a developer's default sccache daemon.
 if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
     SCCACHE_SERVER_PORT=$(python3 - <<'PORT'
@@ -48,8 +56,12 @@ cleanup() {
     echo ""
     echo "[test] cleaning up..."
     sccache --stop-server 2>/dev/null || true
-    # Remove test objects
+    # Remove test objects. Prefer the local mount when spiceio is already
+    # down; AWS CLI against a dead proxy is a no-op.
     $AWS s3 rm "s3://${BUCKET}/${TEST_PREFIX}/" --recursive 2>/dev/null || true
+    if [[ "$SMB_MOUNT" != "off" && -d "${SMB_MOUNT}/${TEST_PREFIX}" ]]; then
+        rm -rf "${SMB_MOUNT}/${TEST_PREFIX}" 2>/dev/null || true
+    fi
     if [[ -n "$SPICEIO_PID2" ]]; then
         kill "$SPICEIO_PID2" 2>/dev/null || true
         wait "$SPICEIO_PID2" 2>/dev/null || true
@@ -109,6 +121,32 @@ assert_fail() {
         echo "  PASS: $label"
         PASS=$((PASS + 1))
     fi
+}
+
+# SIGTERM, wait for the process, then for the async logger + tee to flush so
+# shutdown / write-back drain lines are in SPICEIO_STDERR before we grep them.
+stop_spiceio() {
+    local __pidvar="$1" pid="${!1}"
+    [[ -z "$pid" ]] && return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    printf -v "$__pidvar" '%s' ""
+    for _ in $(seq 1 50); do
+        grep -q 'all connections drained\|shutting down' "$SPICEIO_STDERR" 2>/dev/null && break
+        sleep 0.1
+    done
+    sleep 0.2
+}
+
+nas_mount_requested() {
+    [[ -n "$SMB_MOUNT" && "$SMB_MOUNT" != "off" && "$SMB_MOUNT" != "0" && "$SMB_MOUNT" != "false" ]]
+}
+
+nas_mount_ready() {
+    nas_mount_requested || return 1
+    [[ -d "$SMB_MOUNT" ]] || return 1
+    # macOS: `... on /Volumes/share (smbfs, ...)`.
+    mount | grep -F " on ${SMB_MOUNT} (" >/dev/null
 }
 
 # ── Start spiceio ───────────────────────────────────────────────────────────
@@ -402,7 +440,7 @@ export SCCACHE_BUCKET="$BUCKET"
 export SCCACHE_ENDPOINT="$ENDPOINT"
 export SCCACHE_REGION="$REGION"
 export SCCACHE_S3_USE_SSL=false
-export SCCACHE_S3_KEY_PREFIX="spiceio/${REGION}/${BUCKET}"
+export SCCACHE_S3_KEY_PREFIX="$SCCACHE_PREFIX"
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 export RUSTC_WRAPPER=sccache
@@ -556,6 +594,21 @@ verify_warm_or_retry() {
 echo ""
 verify_warm_or_retry
 
+# Record the bytes spiceio acknowledged for this run's SHA-keyed sccache
+# objects. GETs here may be served from memory — the NAS check after
+# shutdown is what proves write-back actually landed them.
+echo ""
+echo "======================================="
+echo "[test] snapshot sccache objects for NAS verify"
+echo "======================================="
+python3 scripts/test-sccache-nas.py snapshot \
+    --endpoint "$ENDPOINT" \
+    --bucket "$BUCKET" \
+    --prefix "$SCCACHE_PREFIX" \
+    --out "$NAS_MANIFEST"
+echo "  PASS: recorded SHA-256 of sccache objects under ${SCCACHE_PREFIX}"
+PASS=$((PASS + 1))
+
 # ════════════════════════════════════════════════════════════════════════════
 # Concurrent load burst
 # ════════════════════════════════════════════════════════════════════════════
@@ -689,6 +742,101 @@ SCCACHE_ENDPOINT="$ENDPOINT" SCCACHE_BUCKET="$BUCKET" \
     SCCACHE_S3_KEY_PREFIX="$TEST_PREFIX/retention" \
     ./scripts/test-sccache-clean.py
 
+# ── NAS durability: SHA-keyed sccache objects after shutdown ────────────────
+#
+# Write-back acknowledges PutObject from memory. The warm-build hits above
+# can therefore succeed without the bodies ever reaching the share. Drain
+# this instance, then SHA-256 the same keys on the NAS through a second
+# spiceio with write-back, spill, and the object cache all off. A local
+# smbfs mount is opt-in (SPICEIO_SMB_MOUNT) — CI runners do not have one.
+
+echo ""
+echo "======================================="
+echo "[test] NAS write-back of sccache objects"
+echo "======================================="
+
+sccache --stop-server 2>/dev/null || true
+
+if [[ -n "$SPICEIO_PID2" ]]; then
+    stop_spiceio SPICEIO_PID2
+fi
+WRITER_LOG="$SPICEIO_STDERR"
+stop_spiceio SPICEIO_PID
+
+if grep -q 'did not reach the NAS before shutdown\|were acknowledged but are lost' \
+        "$WRITER_LOG" 2>/dev/null; then
+    echo "  FAIL: shutdown left acknowledged writes off the NAS"
+    grep -E 'did not reach the NAS before shutdown|were acknowledged but are lost' \
+        "$WRITER_LOG" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+    exit 1
+fi
+echo "  PASS: graceful shutdown did not report lost writes"
+PASS=$((PASS + 1))
+
+if nas_mount_requested; then
+    if ! nas_mount_ready; then
+        echo "  FAIL: SPICEIO_SMB_MOUNT=${SMB_MOUNT} is not a mounted smbfs volume"
+        FAIL=$((FAIL + 1))
+        exit 1
+    fi
+    echo "[test] verifying SHA-256 on mount ${SMB_MOUNT}"
+    python3 scripts/test-sccache-nas.py verify \
+        --manifest "$NAS_MANIFEST" \
+        --mount "$SMB_MOUNT"
+    echo "  PASS: sccache objects on ${SMB_MOUNT} match the acknowledged SHA-256"
+    PASS=$((PASS + 1))
+    rm -rf "${SMB_MOUNT}/${TEST_PREFIX}" 2>/dev/null || true
+else
+    echo "[test] SPICEIO_SMB_MOUNT unset — reading back through a cache-less instance"
+    BIND_PORT="${BIND##*:}"
+    STALE_PID=$(lsof -i ":${BIND_PORT}" -sTCP:LISTEN -t 2>/dev/null || true)
+    if [[ -n "$STALE_PID" ]]; then
+        echo "$STALE_PID" | xargs kill 2>/dev/null || true
+        sleep 1
+    fi
+    SPICEIO_BIND="$BIND" \
+    SPICEIO_SMB_SERVER="$SMB_SERVER" \
+    SPICEIO_SMB_PORT="$SMB_PORT" \
+    SPICEIO_SMB_USER="$SPICEIO_SMB_USER" \
+    SPICEIO_SMB_PASS="$SPICEIO_SMB_PASS" \
+    SPICEIO_SMB_DOMAIN="$SMB_DOMAIN" \
+    SPICEIO_SMB_SHARE="$SMB_SHARE" \
+    SPICEIO_BUCKET="$BUCKET" \
+    SPICEIO_REGION="$REGION" \
+    SPICEIO_WRITE_BACK=0 \
+    SPICEIO_SPILL_DIR=off \
+    SPICEIO_OBJECT_CACHE_BYTES=1 \
+    SPICEIO_OBJECT_CACHE_ENTRIES=1 \
+    SPICEIO_LOG_FILE="${SPICEIO_LOG_FILE:-}" \
+    "$SPICEIO_BIN" 2> >(tee -a "$SPICEIO_STDERR" >&2) &
+    SPICEIO_PID=$!
+    for i in $(seq 1 60); do
+        if curl -sf -o /dev/null "${ENDPOINT}/" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$SPICEIO_PID" 2>/dev/null; then
+            echo "  FAIL: cache-less spiceio exited before becoming ready"
+            FAIL=$((FAIL + 1))
+            exit 1
+        fi
+        if [[ "$i" -eq 60 ]]; then
+            echo "  FAIL: cache-less spiceio not ready after 30s"
+            FAIL=$((FAIL + 1))
+            exit 1
+        fi
+        sleep 0.5
+    done
+    python3 scripts/test-sccache-nas.py verify \
+        --manifest "$NAS_MANIFEST" \
+        --endpoint "$ENDPOINT" \
+        --bucket "$BUCKET"
+    echo "  PASS: sccache objects on the NAS match the acknowledged SHA-256"
+    PASS=$((PASS + 1))
+    $AWS s3 rm "s3://${BUCKET}/${TEST_PREFIX}/" --recursive 2>/dev/null || true
+    stop_spiceio SPICEIO_PID
+fi
+
 # ── Stderr guard ────────────────────────────────────────────────────────────
 #
 # Any `[spiceio] error:` line means a code path is leaking through the
@@ -696,21 +844,9 @@ SCCACHE_ENDPOINT="$ENDPOINT" SCCACHE_BUCKET="$BUCKET" \
 # (NotFound on HEAD probes, sharing violations, etc.) are mapped to typed
 # `io::ErrorKind`s and logged via `slog!` without the "error:" prefix.
 
-# Stop both spiceio instances *before* grepping the captured stderr. tee in
-# the process substitutions only closes the capture file when each spiceio
-# closes its stderr fd, so we have to kill+wait here rather than rely on
-# the EXIT trap. Clear PIDs so the trap's own kills become no-ops.
-if [[ -n "$SPICEIO_PID2" ]]; then
-    kill "$SPICEIO_PID2" 2>/dev/null || true
-    wait "$SPICEIO_PID2" 2>/dev/null || true
-    SPICEIO_PID2=""
-fi
-if [[ -n "$SPICEIO_PID" ]]; then
-    kill "$SPICEIO_PID" 2>/dev/null || true
-    wait "$SPICEIO_PID" 2>/dev/null || true
-    SPICEIO_PID=""
-fi
-sleep 0.2  # tee in <(...) isn't directly waitable; let it drain.
+# Both spiceio instances are already stopped (and PIDs cleared) so the EXIT
+# trap's kills are no-ops. Sleep so tee in <(...) finishes flushing.
+sleep 0.2
 
 if [[ -s "$SPICEIO_STDERR" ]] && grep -q '\[spiceio\] error:' "$SPICEIO_STDERR"; then
     echo ""
