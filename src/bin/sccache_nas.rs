@@ -646,11 +646,17 @@ fn try_decode_chunked(mut rest: &[u8]) -> Option<Vec<u8>> {
         let size = usize::from_str_radix(size_hex, 16).ok()?;
         rest = &rest[line_end + 2..];
         if size == 0 {
-            // Trailer, then a blank line.
-            if rest.windows(2).any(|w| w == b"\r\n") {
-                return Some(body);
+            // Trailer section, terminated by a blank line. The first CRLF in
+            // a non-empty trailer is not the end of the response — leftover
+            // trailer bytes on a keep-alive socket would corrupt the next GET.
+            loop {
+                let trailer_end = rest.windows(2).position(|w| w == b"\r\n")?;
+                let line = &rest[..trailer_end];
+                rest = &rest[trailer_end + 2..];
+                if line.is_empty() {
+                    return Some(body);
+                }
             }
-            return None;
         }
         if rest.len() < size + 2 {
             return None;
@@ -916,6 +922,11 @@ fn flag(args: &[String], i: &mut usize) -> Result<String, String> {
         .ok_or_else(|| "missing flag value".to_string())
 }
 
+fn parse_timeout_secs(s: &str) -> Result<Duration, String> {
+    let secs: f64 = s.parse().map_err(|_| "invalid --timeout".to_string())?;
+    Duration::try_from_secs_f64(secs).map_err(|_| "invalid --timeout".to_string())
+}
+
 fn usage() -> ! {
     eprintln!(
         "spiceio-sccache-nas — SHA-256 check that sccache objects reached the NAS
@@ -977,10 +988,7 @@ async fn run() -> Result<(), String> {
                     "--endpoint" => endpoint = Some(flag(&args, &mut i)?),
                     "--bucket" => bucket = Some(flag(&args, &mut i)?),
                     "--timeout" => {
-                        let secs: f64 = flag(&args, &mut i)?
-                            .parse()
-                            .map_err(|_| "invalid --timeout".to_string())?;
-                        timeout = Duration::from_secs_f64(secs);
+                        timeout = parse_timeout_secs(&flag(&args, &mut i)?)?;
                     }
                     other => return Err(format!("unknown flag {other}")),
                 }
@@ -1008,7 +1016,7 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
 
     const LEAF: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1058,6 +1066,26 @@ mod tests {
         let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         assert_eq!(try_decode_chunked(raw).unwrap(), b"hello world");
         assert!(try_decode_chunked(b"5\r\nhel").is_none());
+        // Non-empty trailer must be consumed through the terminating blank line.
+        assert_eq!(
+            try_decode_chunked(b"5\r\nhello\r\n0\r\nFoo: bar\r\n\r\n").unwrap(),
+            b"hello"
+        );
+        assert!(try_decode_chunked(b"0\r\nFoo: bar\r\n").is_none());
+    }
+
+    #[test]
+    #[should_panic]
+    fn from_secs_f64_panics_on_negative() {
+        let _ = Duration::from_secs_f64(-1.0);
+    }
+
+    #[test]
+    fn parse_timeout_rejects_non_finite() {
+        assert!(parse_timeout_secs("-1").is_err());
+        assert!(parse_timeout_secs("nan").is_err());
+        assert!(parse_timeout_secs("inf").is_err());
+        assert!(parse_timeout_secs("1.5").is_ok());
     }
 
     #[test]
@@ -1159,23 +1187,30 @@ mod tests {
                 let peer = Arc::clone(&peer);
                 tokio::spawn(async move {
                     // Keep-alive: the live checker reuses one TCP connection.
-                    // Closing after the first reply would hide the Content-Length
-                    // status-line bug (EOF looks like a complete body).
+                    // Buffer through the header terminator so a split TCP read
+                    // cannot parse an incomplete request as path `/`.
+                    let mut acc = Vec::new();
                     loop {
                         let mut buf = vec![0u8; 8192];
                         let n = match stream.read(&mut buf).await {
                             Ok(0) | Err(_) => return,
                             Ok(n) => n,
                         };
-                        let req = String::from_utf8_lossy(&buf[..n]);
-                        let line = req.lines().next().unwrap_or("");
-                        let path = line.split_whitespace().nth(1).unwrap_or("/");
-                        let body = {
-                            let guard = peer.lock().await;
-                            s3_reply(path, &guard)
-                        };
-                        if stream.write_all(&body).await.is_err() {
-                            return;
+                        acc.extend_from_slice(&buf[..n]);
+                        while let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let end = pos + 4;
+                            let req = acc[..end].to_vec();
+                            acc.drain(..end);
+                            let text = String::from_utf8_lossy(&req);
+                            let line = text.lines().next().unwrap_or("");
+                            let path = line.split_whitespace().nth(1).unwrap_or("/");
+                            let body = {
+                                let guard = peer.lock().await;
+                                s3_reply(path, &guard)
+                            };
+                            if stream.write_all(&body).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 });
@@ -1280,5 +1315,35 @@ mod tests {
             .await
             .unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_buffers_split_http_request() {
+        let peer = Arc::new(Mutex::new(Peer {
+            objects: vec![("pre/.sccache_check".into(), b"Hell".to_vec())],
+            prefixes: vec![("pre/".into(), vec![])],
+        }));
+        let addr = serve_s3(peer).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /bucket?list-type=2&prefix=pre%2F&delimiter=%2F&max-keys=1000 HTTP/1.1\r\n",
+            )
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stream
+            .write_all(b"Host: x\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("mock did not answer a split request")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(text.contains("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("ListBucketResult"), "{text}");
     }
 }

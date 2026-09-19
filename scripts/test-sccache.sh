@@ -219,29 +219,48 @@ start_spiceio() {
     exit 1
 }
 
-# Reclaim spiceio-test-* trees left by interrupted runs. Only prefixes whose
-# newest object is older than STALE_TEST_PREFIX_HOURS (default 2) are removed,
-# so a concurrent live run's unique token is left alone.
+# Heartbeat so a concurrent run is not inferred "stale" from directory mtime
+# (nested sccache writes do not refresh the top-level spiceio-test-* dir).
+ALIVE_NAME=".spiceio-test-alive"
+
+write_alive_marker() {
+    printf '%s %s\n' "$TEST_TOKEN" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${TEST_WORK}/alive"
+    $AWS s3 cp "${TEST_WORK}/alive" "s3://${BUCKET}/${TEST_PREFIX}/${ALIVE_NAME}" --quiet
+}
+
+# Reclaim spiceio-test-* trees left by interrupted runs. A prefix is stale
+# when its heartbeat marker is missing or older than STALE_TEST_PREFIX_HOURS
+# (default 2). The current run's token is skipped.
 sweep_stale_test_prefixes() {
     local hours="${STALE_TEST_PREFIX_HOURS:-2}"
-    echo "[test] sweeping spiceio-test-* prefixes older than ${hours}h"
+    echo "[test] sweeping spiceio-test-* prefixes whose ${ALIVE_NAME} is older than ${hours}h"
     if nas_mount_ready; then
-        local cutoff_mmin=$((hours * 60))
-        find "$SMB_MOUNT" -maxdepth 1 -mindepth 1 -type d -name 'spiceio-test-*' \
-            ! -name "$TEST_PREFIX" -mmin "+${cutoff_mmin}" -print \
-            | while IFS= read -r dir; do
-                echo "[test] removing stale ${dir}"
+        local now mtime dir marker
+        now=$(date +%s)
+        for dir in "$SMB_MOUNT"/spiceio-test-*; do
+            [[ -d "$dir" ]] || continue
+            [[ "$(basename "$dir")" == "$TEST_PREFIX" ]] && continue
+            marker="${dir}/${ALIVE_NAME}"
+            if [[ ! -f "$marker" ]]; then
+                echo "[test] removing stale ${dir} (no ${ALIVE_NAME})"
                 rm -rf "$dir"
-            done
+                continue
+            fi
+            mtime=$(stat -f %m "$marker" 2>/dev/null || echo 0)
+            if (( now - mtime > hours * 3600 )); then
+                echo "[test] removing stale ${dir} (${ALIVE_NAME} age $((now - mtime))s)"
+                rm -rf "$dir"
+            fi
+        done
         return 0
     fi
-    python3 - "$ENDPOINT" "$BUCKET" "$hours" "$TEST_PREFIX" <<'PY'
+    python3 - "$ENDPOINT" "$BUCKET" "$hours" "$TEST_PREFIX" "$ALIVE_NAME" <<'PY'
 import sys
 import runpy
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
-endpoint, bucket, hours, keep = sys.argv[1:5]
+endpoint, bucket, hours, keep, alive_name = sys.argv[1:6]
 cutoff = datetime.now(timezone.utc) - timedelta(hours=int(hours))
 api = runpy.run_path("scripts/sccache")
 client = api["S3"](endpoint, bucket)
@@ -270,14 +289,14 @@ try:
     for prefix in prefixes:
         if not prefix or prefix == keep_prefix:
             continue
-        newest = None
+        alive = None
         keys = []
         for page in client.pages(prefix):
             for obj in page:
                 keys.append(obj["key"])
-                if newest is None or obj["modified"] > newest:
-                    newest = obj["modified"]
-        if keys and newest is not None and newest >= cutoff:
+                if obj["key"].endswith("/" + alive_name) or obj["key"] == prefix + alive_name:
+                    alive = obj["modified"]
+        if alive is not None and alive >= cutoff:
             continue
         for i in range(0, len(keys), 1000):
             client.delete(keys[i:i + 1000])
@@ -370,6 +389,7 @@ echo "[test] starting spiceio -> smb://${SPICEIO_SMB_USER}@${SMB_SERVER}:${SMB_P
 # Pin etag-revalidated so an ambient SPICEIO_IMMUTABLE_OBJECTS (launchd / shell)
 # cannot silently skip the default path. The immutable variant is a later pass.
 start_spiceio 1 SPICEIO_SMB_CONNECTIONS=128 SPICEIO_IMMUTABLE_OBJECTS=0
+write_alive_marker
 sweep_stale_test_prefixes
 
 # ════════════════════════════════════════════════════════════════════════════
