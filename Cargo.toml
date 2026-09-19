@@ -21,6 +21,13 @@ name = "spiceio-loadgen"
 path = "src/bin/loadgen.rs"
 required-features = ["loadgen"]
 
+# Live sccache NAS durability checker used by scripts/test-sccache.sh.
+# Same feature gate as loadgen: `make release` does not ship it.
+[[bin]]
+name = "spiceio-sccache-nas"
+path = "src/bin/sccache_nas.rs"
+required-features = ["loadgen"]
+
 [features]
 loadgen = []
 
