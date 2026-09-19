@@ -13,13 +13,18 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use spiceio::crypto::{Sha256, hex_encode, sha256};
+use spiceio::crypto::{Sha256, hex_encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const SHA_LEAF_LEN: usize = 64;
 const SCCACHE_ZIP_MAGIC: &[u8] = b"PK\x03\x04";
 const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Listings are XML; a 16 MiB page is already pathological.
+const MAX_COLLECTED_BYTES: usize = 16 * 1024 * 1024;
+/// Sanity cap on a single GET while hashing. Larger than the object-cache
+/// admission default (128 MiB) so a valid sccache artifact is not rejected.
+const MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Object {
@@ -71,8 +76,9 @@ fn mount_path(mount: &Path, key: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
-    hex_encode(&sha256(data))
+    hex_encode(&spiceio::crypto::sha256(data))
 }
 
 fn sha256_file(path: &Path) -> io::Result<(String, u64)> {
@@ -267,7 +273,7 @@ fn parse_list_page(xml: &str) -> Result<ListPage, String> {
     let truncated = xml_texts(xml, "IsTruncated")
         .first()
         .copied()
-        .unwrap_or("false");
+        .ok_or_else(|| "listing omitted a valid IsTruncated value".to_string())?;
     if truncated != "true" && truncated != "false" {
         return Err("listing omitted a valid IsTruncated value".into());
     }
@@ -408,8 +414,8 @@ impl S3 {
                     return Ok((status, body));
                 }
             }
-            if buf.len() > 64 * 1024 * 1024 {
-                return Err("S3 response exceeded 64 MiB".into());
+            if buf.len() > MAX_COLLECTED_BYTES {
+                return Err("S3 listing response exceeded 16 MiB".into());
             }
         }
         let Some(pos) = find_headers_end(&buf) else {
@@ -429,16 +435,65 @@ impl S3 {
         Ok((status, body))
     }
 
-    async fn get(&mut self, key: &str) -> Result<Vec<u8>, String> {
+    /// GET an object, hashing it as bytes arrive so a large artifact does not
+    /// have to fit in memory. Returns (first 4 bytes, size, sha256 hex).
+    async fn get_hashed(&mut self, key: &str) -> Result<([u8; 4], u64, String), String> {
         let path = format!("/{}/{}", encode_path(&self.bucket), encode_path(key));
-        let (status, body) = self.request(&path).await?;
-        if (200..300).contains(&status) {
-            return Ok(body);
+        for attempt in 0..3 {
+            match self.try_get_hashed(&path).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    self.drop_conn();
+                    if attempt == 2 {
+                        return Err(e);
+                    }
+                }
+            }
         }
-        Err(format!(
-            "GET failed with HTTP {status}: {:?}",
-            &body[..body.len().min(512)]
-        ))
+        Err("S3 request exhausted retries".into())
+    }
+
+    async fn try_get_hashed(&mut self, path: &str) -> Result<([u8; 4], u64, String), String> {
+        let host = self.endpoint.host.clone();
+        let head = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n"
+        );
+        let stream = self.ensure().await.map_err(|e| e.to_string())?;
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stream.flush().await.map_err(|e| e.to_string())?;
+
+        let mut buf = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(60), stream.read(&mut chunk))
+                .await
+                .map_err(|_| "S3 read timed out".to_string())?
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("S3 response missing headers".into());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_headers_end(&buf) {
+                let status = status_from_head(&buf[..pos])?;
+                if !(200..300).contains(&status) {
+                    return Err(format!("GET failed with HTTP {status}"));
+                }
+                let leftover = buf[pos..].to_vec();
+                if let Some(len) = header_content_length(&buf[..pos]) {
+                    return hash_content_length(stream, leftover, len).await;
+                }
+                if header_is_chunked(&buf[..pos]) {
+                    return hash_chunked(stream, leftover).await;
+                }
+                return Err("S3 response had neither Content-Length nor chunked encoding".into());
+            }
+            if buf.len() > MAX_COLLECTED_BYTES {
+                return Err("S3 response headers exceeded 16 MiB".into());
+            }
+        }
     }
 
     async fn list_directory(
@@ -464,6 +519,90 @@ impl S3 {
         }
         let xml = String::from_utf8(body).map_err(|_| "listing was not UTF-8".to_string())?;
         parse_list_page(&xml)
+    }
+}
+
+fn fill_magic(magic: &mut [u8; 4], filled: &mut usize, data: &[u8]) {
+    if *filled >= 4 {
+        return;
+    }
+    let take = (4 - *filled).min(data.len());
+    magic[*filled..*filled + take].copy_from_slice(&data[..take]);
+    *filled += take;
+}
+
+async fn read_timed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, String> {
+    tokio::time::timeout(Duration::from_secs(60), stream.read(buf))
+        .await
+        .map_err(|_| "S3 read timed out".to_string())?
+        .map_err(|e| e.to_string())
+}
+
+async fn hash_content_length(
+    stream: &mut TcpStream,
+    leftover: Vec<u8>,
+    len: usize,
+) -> Result<([u8; 4], u64, String), String> {
+    if len as u64 > MAX_OBJECT_BYTES {
+        return Err(format!(
+            "S3 object is {len} bytes; over {MAX_OBJECT_BYTES} byte sanity cap"
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut magic = [0u8; 4];
+    let mut magic_n = 0usize;
+    let mut got = 0usize;
+    if !leftover.is_empty() {
+        let take = leftover.len().min(len);
+        fill_magic(&mut magic, &mut magic_n, &leftover[..take]);
+        hasher.update(&leftover[..take]);
+        got += take;
+    }
+    let mut buf = [0u8; 64 * 1024];
+    while got < len {
+        let want = (len - got).min(buf.len());
+        let n = read_timed(stream, &mut buf[..want]).await?;
+        if n == 0 {
+            return Err("S3 response body shorter than Content-Length".into());
+        }
+        fill_magic(&mut magic, &mut magic_n, &buf[..n]);
+        hasher.update(&buf[..n]);
+        got += n;
+    }
+    Ok((magic, got as u64, hex_encode(&hasher.finalize())))
+}
+
+async fn hash_chunked(
+    stream: &mut TcpStream,
+    leftover: Vec<u8>,
+) -> Result<([u8; 4], u64, String), String> {
+    let mut pending = leftover;
+    let mut hasher = Sha256::new();
+    let mut magic = [0u8; 4];
+    let mut magic_n = 0usize;
+    loop {
+        if let Some(decoded) = try_decode_chunked(&pending) {
+            if decoded.len() as u64 > MAX_OBJECT_BYTES {
+                return Err(format!(
+                    "S3 object is {} bytes; over {MAX_OBJECT_BYTES} byte sanity cap",
+                    decoded.len()
+                ));
+            }
+            fill_magic(&mut magic, &mut magic_n, &decoded);
+            hasher.update(&decoded);
+            return Ok((magic, decoded.len() as u64, hex_encode(&hasher.finalize())));
+        }
+        let mut buf = [0u8; 64 * 1024];
+        let n = read_timed(stream, &mut buf).await?;
+        if n == 0 {
+            return Err("S3 chunked body was truncated".into());
+        }
+        pending.extend_from_slice(&buf[..n]);
+        if pending.len() as u64 > MAX_OBJECT_BYTES {
+            return Err(format!(
+                "S3 object exceeded {MAX_OBJECT_BYTES} byte sanity cap"
+            ));
+        }
     }
 }
 
@@ -593,22 +732,20 @@ async fn snapshot(endpoint: &str, bucket: &str, prefix: &str, out: &Path) -> Res
         if !is_sha_keyed(&key) {
             continue;
         }
-        let body = client.get(&key).await?;
-        if !body.starts_with(SCCACHE_ZIP_MAGIC) {
+        let (magic, size, digest) = client.get_hashed(&key).await?;
+        if magic.as_slice() != SCCACHE_ZIP_MAGIC {
             return Err(format!(
-                "{key} is not an sccache zip (magic={:?}); refusing to treat it as a compiler-cache object",
-                &body[..body.len().min(4)]
+                "{key} is not an sccache zip (magic={magic:?}); refusing to treat it as a compiler-cache object"
             ));
         }
-        if body.len() as u64 != listed_size {
+        if size != listed_size {
             return Err(format!(
-                "{key}: listing size {listed_size} != GET body {}",
-                body.len()
+                "{key}: listing size {listed_size} != GET body {size}"
             ));
         }
         objects.push(Object {
-            sha256: sha256_hex(&body),
-            size: body.len() as u64,
+            sha256: digest,
+            size,
             key,
         });
     }
@@ -722,15 +859,12 @@ async fn verify_http(manifest: &Manifest, endpoint: &str, bucket: &str) -> Resul
     let mut client = S3::new(endpoint, bucket)?;
     let mut errors = Vec::new();
     for obj in &manifest.objects {
-        match client.get(&obj.key).await {
-            Ok(body) => {
-                let digest = sha256_hex(&body);
-                if body.len() as u64 != obj.size {
+        match client.get_hashed(&obj.key).await {
+            Ok((_magic, size, digest)) => {
+                if size != obj.size {
                     errors.push(format!(
-                        "{}: size {} != acknowledged {}",
-                        obj.key,
-                        body.len(),
-                        obj.size
+                        "{}: size {size} != acknowledged {}",
+                        obj.key, obj.size
                     ));
                 } else if digest != obj.sha256 {
                     errors.push(format!(
@@ -935,6 +1069,20 @@ mod tests {
     }
 
     #[test]
+    fn list_page_requires_is_truncated() {
+        let xml = format!(
+            "<ListBucketResult>\
+               <Contents><Key>pre/a/b/c/{LEAF}</Key><Size>4</Size></Contents>\
+             </ListBucketResult>"
+        );
+        let err = match parse_list_page(&xml) {
+            Ok(_) => panic!("expected missing IsTruncated to fail"),
+            Err(e) => e,
+        };
+        assert!(err.contains("IsTruncated"), "{err}");
+    }
+
+    #[test]
     fn list_page_reads_contents_and_common_prefixes() {
         let xml = format!(
             "<ListBucketResult>\
@@ -1010,18 +1158,26 @@ mod tests {
                 };
                 let peer = Arc::clone(&peer);
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let Ok(n) = stream.read(&mut buf).await else {
-                        return;
-                    };
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    let line = req.lines().next().unwrap_or("");
-                    let path = line.split_whitespace().nth(1).unwrap_or("/");
-                    let body = {
-                        let guard = peer.lock().await;
-                        s3_reply(path, &guard)
-                    };
-                    let _ = stream.write_all(&body).await;
+                    // Keep-alive: the live checker reuses one TCP connection.
+                    // Closing after the first reply would hide the Content-Length
+                    // status-line bug (EOF looks like a complete body).
+                    loop {
+                        let mut buf = vec![0u8; 8192];
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let line = req.lines().next().unwrap_or("");
+                        let path = line.split_whitespace().nth(1).unwrap_or("/");
+                        let body = {
+                            let guard = peer.lock().await;
+                            s3_reply(path, &guard)
+                        };
+                        if stream.write_all(&body).await.is_err() {
+                            return;
+                        }
+                    }
                 });
             }
         });
@@ -1084,7 +1240,7 @@ mod tests {
 
     fn http_ok(body: Vec<u8>, ctype: &str) -> Vec<u8> {
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
             body.len()
         );
         let mut out = head.into_bytes();

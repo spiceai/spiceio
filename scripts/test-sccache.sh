@@ -219,6 +219,77 @@ start_spiceio() {
     exit 1
 }
 
+# Reclaim spiceio-test-* trees left by interrupted runs. Only prefixes whose
+# newest object is older than STALE_TEST_PREFIX_HOURS (default 2) are removed,
+# so a concurrent live run's unique token is left alone.
+sweep_stale_test_prefixes() {
+    local hours="${STALE_TEST_PREFIX_HOURS:-2}"
+    echo "[test] sweeping spiceio-test-* prefixes older than ${hours}h"
+    if nas_mount_ready; then
+        local cutoff_mmin=$((hours * 60))
+        find "$SMB_MOUNT" -maxdepth 1 -mindepth 1 -type d -name 'spiceio-test-*' \
+            ! -name "$TEST_PREFIX" -mmin "+${cutoff_mmin}" -print \
+            | while IFS= read -r dir; do
+                echo "[test] removing stale ${dir}"
+                rm -rf "$dir"
+            done
+        return 0
+    fi
+    python3 - "$ENDPOINT" "$BUCKET" "$hours" "$TEST_PREFIX" <<'PY'
+import sys
+import runpy
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+
+endpoint, bucket, hours, keep = sys.argv[1:5]
+cutoff = datetime.now(timezone.utc) - timedelta(hours=int(hours))
+api = runpy.run_path("scripts/sccache")
+client = api["S3"](endpoint, bucket)
+ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+deleted = 0
+try:
+    prefixes = []
+    token = None
+    seen = set()
+    while True:
+        query = {"list-type": "2", "prefix": "spiceio-test-", "delimiter": "/", "max-keys": "1000"}
+        if token:
+            query["continuation-token"] = token
+        root = ET.fromstring(client.request("GET", query=query))
+        for common in root.findall(f"{ns}CommonPrefixes"):
+            prefixes.append(common.findtext(f"{ns}Prefix", ""))
+        truncated = root.findtext(f"{ns}IsTruncated")
+        if truncated == "true":
+            token = root.findtext(f"{ns}NextContinuationToken")
+            if not token or token in seen:
+                break
+            seen.add(token)
+        else:
+            break
+    keep_prefix = keep.rstrip("/") + "/"
+    for prefix in prefixes:
+        if not prefix or prefix == keep_prefix:
+            continue
+        newest = None
+        keys = []
+        for page in client.pages(prefix):
+            for obj in page:
+                keys.append(obj["key"])
+                if newest is None or obj["modified"] > newest:
+                    newest = obj["modified"]
+        if keys and newest is not None and newest >= cutoff:
+            continue
+        for i in range(0, len(keys), 1000):
+            client.delete(keys[i:i + 1000])
+        deleted += len(keys)
+        if keys:
+            print(f"[test] removed stale prefix {prefix} ({len(keys)} object(s))", flush=True)
+finally:
+    client.close()
+print(f"[test] stale sweep deleted {deleted} object(s)", flush=True)
+PY
+}
+
 # Drain the writer and SHA-256-check NAS_MANIFEST. cleanup=1 also removes
 # TEST_PREFIX (last pass only — an earlier pass must leave the share for
 # the next spiceio start).
@@ -231,6 +302,13 @@ verify_nas_durability() {
     echo "[test] NAS write-back of sccache objects (${label})"
     echo "======================================="
 
+    # Fail while the writer is still up so EXIT cleanup can AWS-rm the prefix.
+    if nas_mount_requested && ! nas_mount_ready; then
+        echo "  FAIL: SPICEIO_SMB_MOUNT=${SMB_MOUNT} is not a mounted smbfs volume"
+        FAIL=$((FAIL + 1))
+        exit 1
+    fi
+
     sccache --stop-server 2>/dev/null || true
 
     if [[ -n "$SPICEIO_PID2" ]]; then
@@ -240,9 +318,9 @@ verify_nas_durability() {
     local writer_suffix
     writer_suffix=$(tail -c +"$((STOP_LOG_OFFSET + 1))" "$STOP_LOG" 2>/dev/null || true)
 
-    if printf '%s' "$writer_suffix" | grep -q 'did not reach the NAS before shutdown\|were acknowledged but are lost'; then
+    if printf '%s' "$writer_suffix" | grep -q 'did not reach the NAS before shutdown\|were acknowledged but are lost\|journalled write(s) remain on disk'; then
         echo "  FAIL: ${label} shutdown left acknowledged writes off the NAS"
-        printf '%s' "$writer_suffix" | grep -E 'did not reach the NAS before shutdown|were acknowledged but are lost' \
+        printf '%s' "$writer_suffix" | grep -E 'did not reach the NAS before shutdown|were acknowledged but are lost|journalled write(s) remain on disk' \
             | sed 's/^/    /'
         FAIL=$((FAIL + 1))
         exit 1
@@ -292,6 +370,7 @@ echo "[test] starting spiceio -> smb://${SPICEIO_SMB_USER}@${SMB_SERVER}:${SMB_P
 # Pin etag-revalidated so an ambient SPICEIO_IMMUTABLE_OBJECTS (launchd / shell)
 # cannot silently skip the default path. The immutable variant is a later pass.
 start_spiceio 1 SPICEIO_SMB_CONNECTIONS=128 SPICEIO_IMMUTABLE_OBJECTS=0
+sweep_stale_test_prefixes
 
 # ════════════════════════════════════════════════════════════════════════════
 # AWS CLI S3 API tests
