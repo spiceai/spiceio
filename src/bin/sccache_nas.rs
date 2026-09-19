@@ -387,16 +387,26 @@ impl S3 {
         let mut buf = Vec::new();
         loop {
             let mut chunk = [0u8; 4096];
-            let n = stream.read(&mut chunk).await.map_err(|e| e.to_string())?;
+            let n = tokio::time::timeout(Duration::from_secs(60), stream.read(&mut chunk))
+                .await
+                .map_err(|_| "S3 read timed out".to_string())?
+                .map_err(|e| e.to_string())?;
             if n == 0 {
                 break;
             }
             buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = find_headers_end(&buf)
-                && let Some(len) = header_content_length(&buf[..pos])
-                && buf.len() >= pos + len
-            {
-                break;
+            if let Some(pos) = find_headers_end(&buf) {
+                let head = &buf[..pos];
+                if let Some(len) = header_content_length(head) {
+                    if buf.len() >= pos + len {
+                        break;
+                    }
+                } else if header_is_chunked(head)
+                    && let Some(body) = try_decode_chunked(&buf[pos..])
+                {
+                    let status = status_from_head(head)?;
+                    return Ok((status, body));
+                }
             }
             if buf.len() > 64 * 1024 * 1024 {
                 return Err("S3 response exceeded 64 MiB".into());
@@ -410,8 +420,11 @@ impl S3 {
             buf.get(pos..pos + len)
                 .ok_or_else(|| "S3 response body shorter than Content-Length".to_string())?
                 .to_vec()
+        } else if header_is_chunked(&buf[..pos]) {
+            try_decode_chunked(&buf[pos..])
+                .ok_or_else(|| "S3 chunked body was truncated".to_string())?
         } else {
-            buf[pos..].to_vec()
+            return Err("S3 response had neither Content-Length nor chunked encoding".into());
         };
         Ok((status, body))
     }
@@ -467,10 +480,59 @@ fn status_from_head(head: &[u8]) -> Result<u16, String> {
         .ok_or_else(|| format!("bad status line: {line}"))
 }
 
+fn header_is_chunked(head: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return value
+                .split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+    false
+}
+
+/// Decode a complete HTTP/1.1 chunked body. `None` if more bytes are needed.
+fn try_decode_chunked(mut rest: &[u8]) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let size_hex = std::str::from_utf8(&rest[..line_end]).ok()?.trim();
+        let size_hex = size_hex.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            // Trailer, then a blank line.
+            if rest.windows(2).any(|w| w == b"\r\n") {
+                return Some(body);
+            }
+            return None;
+        }
+        if rest.len() < size + 2 {
+            return None;
+        }
+        body.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        if rest.len() < 2 || &rest[..2] != b"\r\n" {
+            return None;
+        }
+        rest = &rest[2..];
+    }
+}
+
 fn header_content_length(head: &[u8]) -> Option<usize> {
     let text = std::str::from_utf8(head).ok()?;
     for line in text.lines() {
-        let (name, value) = line.split_once(':')?;
+        // The status line has no colon. Using `?` on split_once would abort
+        // the whole scan and leave us waiting for EOF on a keep-alive socket.
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if name.eq_ignore_ascii_case("content-length") {
             return value.trim().parse().ok();
         }
@@ -848,6 +910,20 @@ mod tests {
         );
         assert!(cache_prefix("../sccache").is_err());
         assert!(cache_prefix("").is_err());
+    }
+
+    #[test]
+    fn content_length_skips_status_line() {
+        let head =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: 1862\r\n\r\n";
+        assert_eq!(header_content_length(head), Some(1862));
+    }
+
+    #[test]
+    fn chunked_body_round_trip() {
+        let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(try_decode_chunked(raw).unwrap(), b"hello world");
+        assert!(try_decode_chunked(b"5\r\nhel").is_none());
     }
 
     #[test]
