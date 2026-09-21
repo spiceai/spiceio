@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::RwLock;
@@ -17,22 +18,34 @@ use super::protocol::*;
 /// terminating well within a client's request timeout if the server is down.
 const MAX_RESET_RETRIES: u32 = 16;
 
+/// Extra missing-leaf opens after the first NotFound. The first extra is
+/// immediate. The second waits [`PUBLICATION_RETRY_WAIT`] because LAN RTT can
+/// be shorter than the server's rename/close interval — a single extra open
+/// with no wait 404'd live range-GETs of a 128 KiB key while a peer replaced
+/// it. Missing leaves stay off the reset/busy ladder. Successful opens and
+/// missing parents pay nothing.
+pub(crate) const MAX_PUBLICATION_RETRIES: u32 = 2;
+/// Same first step as [`busy_backoff`]: long enough for a peer to finish
+/// rename/close, short of the multi-hundred-millisecond reset ladder.
+const PUBLICATION_RETRY_WAIT: Duration = Duration::from_millis(4);
+
 /// A peer process does not share our publication locks. Recheck a missing
-/// leaf once to absorb its rename/close interval. The extra SMB round trip
-/// gives the peer time to close its writer; a fixed sleep here penalizes every
-/// genuine cache miss. Missing leaves cost at most one extra open, not the
-/// much longer reset/busy ladder. Successful opens and missing parents pay nothing.
+/// leaf up to [`MAX_PUBLICATION_RETRIES`] times to absorb its rename/close
+/// interval.
 #[derive(Default)]
 struct PublicationRetry {
-    retried: bool,
+    extra: u32,
 }
 
 impl PublicationRetry {
-    fn retry(&mut self, error: &io::Error) -> bool {
-        if self.retried || !is_missing_name(error) {
+    async fn retry(&mut self, error: &io::Error) -> bool {
+        if !is_missing_name(error) || self.extra >= MAX_PUBLICATION_RETRIES {
             return false;
         }
-        self.retried = true;
+        if self.extra > 0 {
+            tokio::time::sleep(PUBLICATION_RETRY_WAIT).await;
+        }
+        self.extra += 1;
         true
     }
 }
@@ -210,7 +223,7 @@ impl ShareSession {
         // Resilient open: under heavy concurrent load on a degraded NAS the
         // create can hit a transient reset; retry on a fresh connection so the
         // initial open of a streaming GET isn't lost (the client may not retry).
-        // Missing leaf names have a separate, single publication retry.
+        // Missing leaf names have a separate, bounded publication retry.
         let (client, tree_id, file) = self
             .retry_read_open(|client, tree_id| {
                 let smb_path = smb_path.clone();
@@ -908,9 +921,10 @@ impl ShareSession {
 
     /// Run a one-shot read open/stat with bounded retry on transient errors —
     /// connection resets and `ResourceBusy` (SMB sharing violations) — each
-    /// attempt on a freshly-picked live connection. A missing leaf name has one
-    /// separate retry for publication by a peer process; other NotFound cases
-    /// return immediately. A reset backs off the adaptive read size and a busy
+    /// attempt on a freshly-picked live connection. A missing leaf name has a
+    /// bounded retry for publication by a peer process (immediate, then once
+    /// more after a short wait); other NotFound cases return immediately. A
+    /// reset backs off the adaptive read size and a busy
     /// error backs off before retrying. The op receives the picked
     /// connection and returns whatever the caller needs (typically the picked
     /// `(client, tree_id)` plus the result).
@@ -926,7 +940,7 @@ impl ShareSession {
             match op(client, tree_id).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    if publication.retry(&e) {
+                    if publication.retry(&e).await {
                         continue;
                     }
                     if is_reset(&e) {
@@ -1411,7 +1425,7 @@ impl ShareSession {
                 )
                 .await;
             match result {
-                Err(e) if publication.retry(&e) => continue,
+                Err(e) if publication.retry(&e).await => continue,
                 result => return result,
             }
         }
@@ -1576,7 +1590,7 @@ impl ShareSession {
         // Resilient stat: retry the one-shot compound probe on a transient reset
         // (fresh connection each attempt) so a HEAD — and the pre-publication
         // metadata read in WAL commit — survives a degraded NAS. Missing leaf
-        // names also get the single, bounded peer-publication retry.
+        // names also get the bounded peer-publication retry.
         let smb_path = smb_path.to_string();
         let (cr, _) = self
             .retry_read_open(|client, tree_id| {
@@ -2274,7 +2288,7 @@ pub(crate) fn should_retry(e: &io::Error) -> bool {
 /// within a client request timeout.
 async fn busy_backoff(attempt: u32) {
     let ms = 4u64 << attempt.min(5); // 4, 8, 16, 32, 64, 128, 128, …
-    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    tokio::time::sleep(Duration::from_millis(ms)).await;
 }
 
 /// Every ancestor directory of `smb_path`, outermost first.
@@ -3837,6 +3851,35 @@ mod regression_publication {
         Ok(())
     }
 
+    async fn leaf_found_reply(server: &mut TcpStream, op: &str) {
+        let request = read_frame(server).await;
+        match op {
+            "head" | "head-raw" => stat_reply(server, &request).await,
+            "get" => {
+                let mut read = vec![0u8; 20];
+                read[..2].copy_from_slice(&17u16.to_le_bytes());
+                read[2] = 80;
+                read[4..8].copy_from_slice(&4u32.to_le_bytes());
+                read[16..].copy_from_slice(b"data");
+                compound_reply(
+                    server,
+                    &request,
+                    &[(0, create_body(4)), (0, read), (0, vec![0; 60])],
+                )
+                .await;
+            }
+            _ => {
+                compound_reply(server, &request, &[(0, create_body(4))]).await;
+                let close = read_frame(server).await;
+                assert_eq!(
+                    Header::decode(&close).unwrap().command,
+                    Command::Close as u16
+                );
+                error_reply(server, &close, 0).await;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn every_read_open_recovers_a_peers_missing_name_interval() {
         for op in READ_OPENS {
@@ -3851,32 +3894,7 @@ mod regression_publication {
                     let request = read_frame(&mut server).await;
                     error_reply(&mut server, &request, status).await;
                     drop(peer_writer);
-                    let request = read_frame(&mut server).await;
-                    match op {
-                        "head" | "head-raw" => stat_reply(&mut server, &request).await,
-                        "get" => {
-                            let mut read = vec![0u8; 20];
-                            read[..2].copy_from_slice(&17u16.to_le_bytes());
-                            read[2] = 80;
-                            read[4..8].copy_from_slice(&4u32.to_le_bytes());
-                            read[16..].copy_from_slice(b"data");
-                            compound_reply(
-                                &mut server,
-                                &request,
-                                &[(0, create_body(4)), (0, read), (0, vec![0; 60])],
-                            )
-                            .await;
-                        }
-                        _ => {
-                            compound_reply(&mut server, &request, &[(0, create_body(4))]).await;
-                            let close = read_frame(&mut server).await;
-                            assert_eq!(
-                                Header::decode(&close).unwrap().command,
-                                Command::Close as u16
-                            );
-                            error_reply(&mut server, &close, 0).await;
-                        }
-                    }
+                    leaf_found_reply(&mut server, op).await;
                 });
                 tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
                     .await
@@ -3888,12 +3906,32 @@ mod regression_publication {
     }
 
     #[tokio::test]
-    async fn a_genuinely_missing_leaf_is_rechecked_only_once() {
+    async fn a_second_missing_name_still_recovers_after_the_publication_wait() {
         for op in READ_OPENS {
             let (client, mut server) = pair().await;
             let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
             let backend = tokio::spawn(async move {
                 for _ in 0..2 {
+                    let request = read_frame(&mut server).await;
+                    error_reply(&mut server, &request, 0xC0000034).await;
+                }
+                leaf_found_reply(&mut server, op).await;
+            });
+            tokio::time::timeout(Duration::from_secs(1), read_leaf(&share, op))
+                .await
+                .unwrap()
+                .unwrap();
+            backend.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_missing_leaf_is_rechecked_a_bounded_number_of_times() {
+        for op in READ_OPENS {
+            let (client, mut server) = pair().await;
+            let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+            let backend = tokio::spawn(async move {
+                for _ in 0..=MAX_PUBLICATION_RETRIES {
                     let request = read_frame(&mut server).await;
                     error_reply(&mut server, &request, 0xC0000034).await;
                 }

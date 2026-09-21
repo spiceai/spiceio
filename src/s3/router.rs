@@ -3814,8 +3814,9 @@ mod regression_router {
                 .await
         );
         let backend = tokio::spawn(async move {
-            // The source remains absent after the bounded publication retry.
-            for _ in 0..2 {
+            // The source remains absent after the bounded publication retry
+            // (initial open plus MAX_PUBLICATION_RETRIES extras).
+            for _ in 0..=crate::smb::ops::MAX_PUBLICATION_RETRIES {
                 let r = read_frame(&mut server).await;
                 error_reply(&mut server, &r, 0xC0000034).await;
             }
