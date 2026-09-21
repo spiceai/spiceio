@@ -2,7 +2,7 @@
 	install uninstall loadgen bench-sccache bench-sccache-build bench-sccache-all
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
-# Prefer `make ci` explicitly when validating a PR — see CLAUDE.md.
+# Prefer `make ci` explicitly when validating a PR — see AGENTS.md.
 all: fmt ci
 
 build:
