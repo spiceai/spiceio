@@ -75,14 +75,14 @@ def _ok(handler: BaseHTTPRequestHandler) -> None:
     handler.wfile.write(b"ok")
 
 
-class StockUrllibLeakTests(unittest.TestCase):
-    def test_urlopen_forwards_authorization_to_other_host(self) -> None:
+class StockUrllibObservationTests(unittest.TestCase):
+    def test_urlopen_cross_host_authorization(self) -> None:
         def src_on_get(handler: BaseHTTPRequestHandler, location: str) -> None:
             handler.send_response(302)
             handler.send_header("Location", location)
             handler.end_headers()
 
-        src, dst, src_rec, dst_rec = _pair(src_on_get, lambda h: _ok(h))
+        src, dst, src_rec, dst_rec = _pair(src_on_get, _ok)
         self.addCleanup(_stop, src)
         self.addCleanup(_stop, dst)
 
@@ -94,8 +94,13 @@ class StockUrllibLeakTests(unittest.TestCase):
 
         self.assertEqual(body, b"ok")
         self.assertEqual(src_rec.authorization, AUTH)
-        # Evidence that the default opener is unsafe for the asset API hop.
-        self.assertEqual(dst_rec.authorization, AUTH)
+        # Observation only. CPython currently forwards Authorization; if that
+        # default is later fixed, github_fetch is still required to drop it
+        # and this check must not fail the unit gate.
+        print(
+            f"stock urllib destination Authorization={dst_rec.authorization!r}",
+            flush=True,
+        )
 
 
 class StripAuthTests(unittest.TestCase):
@@ -105,7 +110,7 @@ class StripAuthTests(unittest.TestCase):
             handler.send_header("Location", location)
             handler.end_headers()
 
-        src, dst, src_rec, dst_rec = _pair(src_on_get, lambda h: _ok(h))
+        src, dst, src_rec, dst_rec = _pair(src_on_get, _ok)
         self.addCleanup(_stop, src)
         self.addCleanup(_stop, dst)
 
@@ -148,7 +153,7 @@ class StripAuthTests(unittest.TestCase):
 class DownloadAssetTests(unittest.TestCase):
     def test_asset_hop_does_not_forward_token(self) -> None:
         dst_rec = _Record()
-        dst = _serve(_handler(dst_rec, lambda h: _ok(h)))
+        dst = _serve(_handler(dst_rec, _ok))
         self.addCleanup(_stop, dst)
 
         api_rec = _Record()
