@@ -41,45 +41,14 @@ download_public() {
   curl -fsSL --retry 3 --retry-delay 2 -o "${INSTALL_DIR}/${name}" "$(public_url "$name")"
 }
 
-# Private repos 404 the public URL. The asset API redirects to a signed URL;
-# curl must send the token only on the first hop (it strips Authorization on
-# cross-host redirects by default).
+# Private repos 404 the public URL. The asset API 302s to a signed URL on
+# another host. github_fetch.py sends GH_TOKEN only while the origin is
+# api.github.com and strips Authorization on that hop (stock urllib keeps it).
 download_private() {
   local name="$1"
-  python3 - "$REPO" "$VERSION" "$INSTALL_DIR" "$name" <<'PY'
-import json, os, sys, urllib.error, urllib.request
-
-repo, version, dest, name = sys.argv[1:]
-token = os.environ.get("GH_TOKEN", "")
-if version == "latest":
-    release_url = f"https://api.github.com/repos/{repo}/releases/latest"
-else:
-    release_url = f"https://api.github.com/repos/{repo}/releases/tags/{version}"
-
-def fetch(url, accept):
-    req = urllib.request.Request(url)
-    req.add_header("Accept", accept)
-    req.add_header("User-Agent", "spiceio-setup")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", "replace")[:300]
-        sys.stderr.write(f"::error::GitHub API HTTP {err.code} fetching release asset {name}: {body}\n")
-        sys.exit(1)
-
-release = json.loads(fetch(release_url, "application/vnd.github+json"))
-match = next((a for a in release.get("assets", []) if a.get("name") == name), None)
-if match is None:
-    have = ", ".join(sorted(a.get("name", "") for a in release.get("assets", []))) or "none"
-    sys.stderr.write(f"::error::release {version} of {repo} has no asset {name} (have: {have})\n")
-    sys.exit(1)
-data = fetch(match["url"], "application/octet-stream")
-with open(os.path.join(dest, name), "wb") as fh:
-    fh.write(data)
-PY
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  python3 "$here/github_fetch.py" "$REPO" "$VERSION" "$INSTALL_DIR" "$name"
 }
 
 download_without_gh() {
