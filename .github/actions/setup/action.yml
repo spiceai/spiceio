@@ -161,11 +161,11 @@ runs:
 
         mkdir -p "$INSTALL_DIR"
 
-        if [[ "$VERSION" == "latest" ]]; then
-          gh release download --repo "$REPO" --pattern "$ASSET" --pattern "${ASSET}.sha256" --dir "$INSTALL_DIR"
-        else
-          gh release download "$VERSION" --repo "$REPO" --pattern "$ASSET" --pattern "${ASSET}.sha256" --dir "$INSTALL_DIR"
-        fi
+        # gh is not guaranteed on a self-hosted macOS runner: the job PATH is
+        # the listener's .path file, and a stale one omits Homebrew. The helper
+        # uses gh when it is present and otherwise downloads the same assets.
+        export REPO INSTALL_DIR VERSION RUNNER_OS RUNNER_ARCH
+        bash "${GITHUB_ACTION_PATH}/download-release.sh"
 
         # Verify integrity
         cd "$INSTALL_DIR"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ── CI-local gate ────────────────────────────────────────────────────────────
+# ── CI-local gate ────────────────────────────────────────────
 #
 # Run the *same* checks GitHub Actions runs in `.github/workflows/ci.yml`, on
 # this machine. This exists so agents and humans cannot declare a PR "green"
@@ -56,9 +56,9 @@ fi
 
 step() {
     echo ""
-    echo "═══════════════════════════════════════════════════════════════"
+    echo "═════════════════════════════════════════════════════════════"
     echo " ci-local: $*"
-    echo "═══════════════════════════════════════════════════════════════"
+    echo "═════════════════════════════════════════════════════════════"
 }
 
 run_live_suites() {
@@ -105,11 +105,10 @@ if [[ "$LIVE_ONLY" -eq 0 ]]; then
     step "lint (make lint)"
     make lint
 
-    # ── 2. Unit tests ─────────────────────────────────────────────────────
-    step "unit tests (cargo test --locked --features loadgen)"
-    # --features loadgen also runs spiceio-loadgen's status-classifier tests.
-    cargo test --locked --features loadgen
-    make test-clean-unit
+    # ── 2. Unit tests ─────────────────────────────────────────
+    step "unit tests (make test-unit)"
+    # cargo tests plus the setup-action download / redirect checks.
+    make test-unit
 
     # ── 3. Debug binaries (live scripts expect ./target/debug/spiceio, and
     #      test-sccache.sh's load burst expects ./target/debug/spiceio-loadgen)
@@ -134,6 +133,6 @@ else
 fi
 
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
+echo "═════════════════════════════════════════════════════════════"
 echo " ci-local: ALL CHECKS PASSED (parity with .github/workflows/ci.yml)"
-echo "═══════════════════════════════════════════════════════════════"
+echo "═════════════════════════════════════════════════════════════"

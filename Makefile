@@ -1,4 +1,4 @@
-.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback test-sccache-clean test-clean-unit ci clean all \
+.PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback test-sccache-clean test-clean-unit test-setup-action ci clean all \
 	install uninstall loadgen bench-sccache bench-sccache-build bench-sccache-all
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
@@ -30,11 +30,16 @@ doc:
 lint: fmt-check check clippy doc
 
 # Unit tests only (no SMB).
-test-unit: test-clean-unit
+test-unit: test-clean-unit test-setup-action
 	# --features loadgen so spiceio-loadgen and spiceio-sccache-nas tests run:
 	# loadgen's status classifier, and the NAS durability checker's path /
 	# listing / digest tests (no SMB). They would silently not compile without it.
 	cargo test --locked --features loadgen
+
+# Setup-action download helper (no gh / curl-to-GitHub). Includes the
+# two-server check that Authorization is not forwarded on a host change.
+test-setup-action:
+	bash .github/actions/setup/test-download-release.sh
 
 test-clean-unit:
 	python3 scripts/test-sccache-clean-unit.py
@@ -66,7 +71,7 @@ test-writeback: build
 ci:
 	./scripts/ci-local.sh
 
-# ── sccache performance ─────────────────────────────────────────────────────
+# ── sccache performance ─────────────────────────────────────────
 #
 # Benchmarks, not gates: they measure, they do not pass or fail, and they are
 # never run by `make ci`. Both need SPICEIO_SMB_USER/PASS and write timestamped
@@ -88,7 +93,7 @@ bench-sccache-build: release
 
 bench-sccache-all: bench-sccache bench-sccache-build
 
-# ── local install ───────────────────────────────────────────────────────────
+# ── local install ───────────────────────────────────────────
 #
 # Puts the optimized build where a long-running local instance picks it up
 # (the launchd agent runs `~/.local/bin/spiceio`). Override BINDIR or PREFIX
