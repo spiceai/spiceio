@@ -1608,11 +1608,15 @@ impl ShareSession {
                 // an upload that is still being written. That makes liveness a
                 // property the server enforces, rather than an inference from
                 // a timestamp the server may not refresh until close.
+                // Read attributes: strict commits query the temp's metadata
+                // through this handle, which GENERIC_WRITE does not grant.
                 let file = client
                     .create(
                         tree_id,
                         &wal_path,
-                        DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                        DesiredAccess::GenericWrite as u32
+                            | DesiredAccess::Delete as u32
+                            | DesiredAccess::ReadAttributes as u32,
                         ShareAccess::Read as u32,
                         CreateDisposition::OverwriteIf as u32,
                         CreateOptions::NonDirectoryFile as u32,

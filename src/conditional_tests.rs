@@ -24,6 +24,7 @@ struct Handle {
     session: u64,
     exclusive: bool,
     delete: bool,
+    access: u32,
 }
 #[derive(Default)]
 struct Nas {
@@ -132,6 +133,7 @@ impl Nas {
                     session,
                     exclusive,
                     delete: u32_at(b, 40) & CreateOptions::DeleteOnClose as u32 != 0,
+                    access: u32_at(b, 24),
                 },
             );
             *related = handle;
@@ -161,6 +163,14 @@ impl Nas {
         };
         assert_eq!(h.session, session, "a handle crossed SMB sessions");
         let file = h.file;
+        // Like a real server: QUERY_INFO needs a handle opened with read
+        // attributes access (GENERIC_WRITE does not include it).
+        if command == Command::QueryInfo as u16
+            && h.access & (DesiredAccess::ReadAttributes as u32 | DesiredAccess::GenericRead as u32)
+                == 0
+        {
+            return Err(0xC0000022);
+        }
         if command == Command::Close as u16 {
             if h.delete && self.fail_delete_close {
                 return Err(0xC0000001);
@@ -588,6 +598,7 @@ async fn unlocked_read_miss_rechecks_for_a_peer_first_strict_publication() {
                             session: 99,
                             exclusive: true,
                             delete: false,
+                            access: DesiredAccess::GenericRead as u32,
                         },
                     );
                     handle
