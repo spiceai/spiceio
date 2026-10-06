@@ -1612,15 +1612,11 @@ impl ShareSession {
                 // an upload that is still being written. That makes liveness a
                 // property the server enforces, rather than an inference from
                 // a timestamp the server may not refresh until close.
-                // Read attributes: strict commits query the temp's metadata
-                // through this handle, which GENERIC_WRITE does not grant.
                 let file = client
                     .create(
                         tree_id,
                         &wal_path,
-                        DesiredAccess::GenericWrite as u32
-                            | DesiredAccess::Delete as u32
-                            | DesiredAccess::ReadAttributes as u32,
+                        WAL_TEMP_ACCESS,
                         ShareAccess::Read as u32,
                         CreateDisposition::OverwriteIf as u32,
                         CreateOptions::NonDirectoryFile as u32,
@@ -2189,6 +2185,14 @@ impl FileHandle {
 /// Directory on the SMB share where WAL temp files are stored.
 const WAL_DIR: &str = ".spiceio-wal";
 
+/// Desired access for a WAL temp handle, on its first open and on every reopen
+/// after a reset. Read attributes: strict commits query the temp's metadata
+/// through whichever handle the writer holds at publication, and GENERIC_WRITE
+/// does not grant it.
+const WAL_TEMP_ACCESS: u32 = DesiredAccess::GenericWrite as u32
+    | DesiredAccess::Delete as u32
+    | DesiredAccess::ReadAttributes as u32;
+
 /// Directory on the SMB share where multipart upload parts are stored.
 const UPLOADS_DIR: &str = ".spiceio-uploads";
 
@@ -2618,7 +2622,7 @@ impl WalWriter {
             .create(
                 tree_id,
                 &self.wal_path,
-                DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                WAL_TEMP_ACCESS,
                 // Same share mode as the original open (see `open_wal_write`).
                 ShareAccess::Read as u32,
                 CreateDisposition::Open as u32,
@@ -3827,6 +3831,37 @@ mod regression_publication {
         drop(writer);
         copy.await.unwrap();
         backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopened_wal_temp_can_still_query_its_metadata() {
+        // A strict commit queries the temp's metadata through whichever handle
+        // the writer holds, including one reopened after a mid-stream reset. A
+        // real server denies that QUERY_INFO without read-attributes access.
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let mut wal = verified_wal(client, pool);
+        let backend = tokio::spawn(async move {
+            let close = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&close).unwrap().command,
+                Command::Close as u16
+            );
+            error_reply(&mut server, &close, 0).await;
+            let open = read_frame(&mut server).await;
+            let parts = parse_compound_response(&Bytes::copy_from_slice(&open));
+            assert_eq!(parts[0].0.command, Command::Create as u16);
+            compound_reply(&mut server, &open, &[(0, create_body(4))]).await;
+            u32::from_le_bytes(parts[0].1[24..28].try_into().unwrap())
+        });
+        wal.reopen().await.unwrap();
+        let access = backend.await.unwrap();
+        assert_ne!(access & DesiredAccess::ReadAttributes as u32, 0);
+        assert_ne!(
+            access & DesiredAccess::Delete as u32,
+            0,
+            "rename needs DELETE"
+        );
     }
 
     #[tokio::test]
