@@ -39,6 +39,10 @@ struct Nas {
     fail_delete_close: bool,
     /// One-shot: hold the next rename until the test resumes it.
     pause_rename: Option<Arc<Pause>>,
+    /// Once set, every CLOSE of the next published file fails and leaves its
+    /// handle open: the handle's state after a failed CLOSE is unknown.
+    fail_close_after_rename: bool,
+    failing_close: Option<u64>,
 }
 #[derive(Default)]
 struct Pause {
@@ -182,6 +186,9 @@ impl Nas {
             if h.delete && self.fail_delete_close {
                 return Err(0xC0000001);
             }
+            if self.failing_close == Some(file) {
+                return Err(0xC0000001);
+            }
             let h = self.handles.remove(&handle).unwrap();
             if h.delete {
                 self.names.retain(|_, id| *id != file);
@@ -253,6 +260,9 @@ impl Nas {
                 self.names.retain(|_, id| *id != file);
                 self.names.insert(name, file);
                 self.publications += 1;
+                if self.fail_close_after_rename {
+                    self.failing_close = Some(file);
+                }
                 Ok(vec![2, 0])
             }
             _ => panic!("unexpected SMB command {command}, body={b:?}"),
@@ -877,6 +887,44 @@ async fn cancelled_publication_never_leaves_its_handle_open_without_the_lock() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "{open} handle(s) left open on the cancelled publication's session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn failed_close_of_a_published_handle_closes_the_session() {
+    // After the rename, a CLOSE that fails leaves the published handle's state
+    // unknown. Releasing only the lock would leave it open on a reusable
+    // session, where it blocks every later strict rename of the key.
+    let nas = Arc::new(Mutex::new(Nas::default()));
+    let a = instance(nas.clone(), 1).await;
+    a.share
+        .put_object_atomic("strict/key", b"old")
+        .await
+        .unwrap();
+    nas.lock().unwrap().fail_close_after_rename = true;
+    assert!(
+        a.share
+            .put_object_atomic("strict/key", b"new")
+            .await
+            .is_err()
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let open = nas
+            .lock()
+            .unwrap()
+            .handles
+            .values()
+            .filter(|h| h.session == 1)
+            .count();
+        if open == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{open} handle(s) left open on a session that still serves requests"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }

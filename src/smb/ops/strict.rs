@@ -490,16 +490,22 @@ impl WalWriter {
             }
             // Include the published name in the stable-storage boundary.
             client.flush_file(self.tree_id, &self.file_id).await?;
-            client.close(self.tree_id, &self.file_id).await?;
+            if let Err(e) = client.close(self.tree_id, &self.file_id).await {
+                // The published handle's state is unknown: close the session
+                // rather than leave it open where later strict renames hit it.
+                client.poison().await;
+                return Err(e);
+            }
             meta.etag = etag_for(verified.file_size, verified.last_write_time);
             meta.last_modified = filetime_to_epoch_secs(verified.last_write_time);
             Ok(meta)
         }
         .await;
-        if result.is_err() {
-            // Close the temp (or the renamed destination) while the lock is
-            // still held, so no later writer finds it open.
-            self.discard_temp().await;
+        // Close the temp (or the renamed destination) while the lock is still
+        // held, so no later writer finds it open. If that CLOSE fails too, the
+        // handle's state is unknown: close the session, and every handle on it.
+        if result.is_err() && !client.is_poisoned() && !self.discard_temp().await {
+            client.poison().await;
         }
         guard.publishing = false;
         let released = guard.release().await;

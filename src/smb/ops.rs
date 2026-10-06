@@ -2815,8 +2815,9 @@ impl WalWriter {
     }
 
     /// Close the current handle and best-effort delete the WAL temp file.
-    async fn discard_temp(&self) {
-        let _ = self.client.close(self.tree_id, &self.file_id).await;
+    /// Close and delete the temp. Returns whether the CLOSE succeeded.
+    async fn discard_temp(&self) -> bool {
+        let closed = self.client.close(self.tree_id, &self.file_id).await.is_ok();
         let _ = self
             .client
             .create_close(
@@ -2828,6 +2829,7 @@ impl WalWriter {
                 CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
+        closed
     }
 
     /// Abort the WAL write — close and delete the temp file.
