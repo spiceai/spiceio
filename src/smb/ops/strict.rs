@@ -46,6 +46,14 @@ impl ShareSession {
     /// Comma-separated S3 prefixes; `*` selects the whole bucket. Configure
     /// identically on every instance serving this share, before admitting traffic.
     pub fn with_strict_prefixes(mut self, prefixes: &str) -> io::Result<Self> {
+        self.strict_prefixes = Arc::new(Self::parse_strict_prefixes(prefixes)?);
+        Ok(self)
+    }
+
+    /// Validate and canonicalize `SPICEIO_STRICT_PREFIXES` without a session,
+    /// so startup can reject a malformed value before it starts retrying the
+    /// backend connection.
+    pub fn parse_strict_prefixes(prefixes: &str) -> io::Result<Vec<String>> {
         let mut values = Vec::new();
         if !prefixes.is_empty() {
             for prefix in prefixes.split(',') {
@@ -80,8 +88,7 @@ impl ShareSession {
                 });
             }
         }
-        self.strict_prefixes = Arc::new(values);
-        Ok(self)
+        Ok(values)
     }
 
     pub fn has_strict_prefixes(&self) -> bool {
@@ -185,6 +192,16 @@ impl ShareSession {
         name.len() >= 2
             && name.bytes().all(|b| b == b'.' || b == b' ')
             && name.bytes().filter(|&b| b == b'.').count() >= 2
+    }
+
+    /// Whether replaying a pending write for `key` could change strict state
+    /// without a lock: a strict key, or one the router now rejects because the
+    /// server can resolve it into the lock or a strict namespace. An older
+    /// release may have journalled such a key before these checks existed.
+    pub fn replay_reaches_strict_state(&self, key: &str) -> bool {
+        self.is_strict(key)
+            || Self::reserved_key(key)
+            || key.split(['/', '\\']).any(Self::is_parent_alias)
     }
 
     pub(super) async fn strict_lock(
@@ -579,5 +596,24 @@ mod tests {
             .with_strict_prefixes("safe/./metadata/")
             .unwrap();
         assert!(share.is_strict("safe/metadata/key"));
+    }
+
+    #[tokio::test]
+    async fn replay_of_reserved_or_alias_keys_counts_as_strict_state() {
+        // An older release may have journalled keys the router now rejects.
+        let (state, _server) = crate::test_support::state().await;
+        let share = (*state.share)
+            .clone()
+            .with_strict_prefixes("metadata/")
+            .unwrap();
+        for key in [
+            "metadata/key",
+            ".spiceio-locks/0123abcd",
+            "safe/.. /metadata/key",
+            "safe/.../x",
+        ] {
+            assert!(share.replay_reaches_strict_state(key), "{key}");
+        }
+        assert!(!share.replay_reaches_strict_state("cache/key"));
     }
 }

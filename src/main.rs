@@ -278,10 +278,13 @@ async fn connect_share(
                 format!("strict prefixes need every pending spill write checked, but the spill could not be audited: {e}"),
             )
         })?;
-        if pending.iter().any(|key| share.is_strict(key)) {
+        if pending
+            .iter()
+            .any(|key| share.replay_reaches_strict_state(key))
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "strict prefixes contain pending spill writes; drain them with the previous configuration before enabling strict mode",
+                "the disk spill holds pending writes for strict, reserved, or parent-alias keys; drain them with the previous configuration before enabling strict mode",
             ));
         }
     }
@@ -436,6 +439,14 @@ async fn main() {
     }
 
     let config = Config::from_env();
+
+    // A malformed value never becomes valid, so reject it here: inside the
+    // SMB connect loop below it would be retried forever behind a 503.
+    let strict_prefixes = env::var("SPICEIO_STRICT_PREFIXES").unwrap_or_default();
+    if let Err(e) = ShareSession::parse_strict_prefixes(&strict_prefixes) {
+        serr!("[spiceio] SPICEIO_STRICT_PREFIXES={strict_prefixes:?}: {e}");
+        flush_and_exit(1);
+    }
 
     // Bind TCP listener early (before SMB setup). If the port is taken,
     // auto-increment until an available port is found.
