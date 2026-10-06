@@ -14,11 +14,21 @@ pub(super) const LOCK_DIR: &str = ".spiceio-locks";
 const RECORD_MAGIC: &[u8; 8] = b"SPICEV01";
 const RECORD_LEN: usize = 48;
 
+/// The name a component reaches the share as: no stream suffix (`key::$DATA`
+/// is `key`; a named stream shares its file's lock), no trailing dots or
+/// spaces. `.` and `. ` reduce to nothing.
+fn canonical_component(s: &str) -> &str {
+    s.split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['.', ' '])
+}
+
 fn canonical_path(path: &str) -> String {
-    // Trim before filtering so components the server reduces to nothing
-    // (`.`, `. `) are dropped rather than kept as empty segments.
+    // Canonicalize before filtering so components that reduce to nothing
+    // are dropped rather than kept as empty segments.
     path.split(['/', '\\'])
-        .map(|s| s.trim_end_matches(['.', ' ']))
+        .map(canonical_component)
         .filter(|s| !s.is_empty())
         .map(str::to_uppercase)
         .collect::<Vec<_>>()
@@ -87,7 +97,7 @@ impl ShareSession {
         // Ordinary ASCII cache keys need no temporary normalized String even
         // when this instance also serves a strict metadata prefix.
         if key.is_ascii()
-            && !key.contains(['.', ' '])
+            && !key.contains(['.', ' ', ':'])
             && !key.contains("//")
             && !key.contains("\\\\")
             && !key.contains("/\\")
@@ -160,12 +170,7 @@ impl ShareSession {
         // Canonicalize each component first: `. ` reaches the share as `.`,
         // so it must not count as the first significant component.
         key.split(['/', '\\'])
-            .map(|s| {
-                s.split(':')
-                    .next()
-                    .unwrap_or_default()
-                    .trim_end_matches(['.', ' '])
-            })
+            .map(canonical_component)
             .find(|s| !s.is_empty())
             .is_some_and(|first| first.eq_ignore_ascii_case(LOCK_DIR))
     }
@@ -463,6 +468,8 @@ mod tests {
     fn lock_names_cover_smb_path_aliases() {
         assert_eq!(canonical_path("a/b"), canonical_path("/A//./B. "));
         assert_eq!(canonical_path("a/b"), canonical_path("A\\B"));
+        assert_eq!(canonical_path("a/b"), canonical_path("a/b::$DATA"));
+        assert_eq!(canonical_path("a/b"), canonical_path("a. :x/b"));
     }
 
     #[tokio::test]
@@ -488,6 +495,8 @@ mod tests {
         assert!(ShareSession::reserved_key("/. \\.spiceio-locks:s/x"));
         assert!(!ShareSession::reserved_key("x/.spiceio-locks/y"));
         assert!(share.is_strict(". /metadata/key"));
+        assert!(share.is_strict("metadata::$DATA/key"));
+        assert!(!share.is_strict("metadata-x:y/key"));
     }
 
     #[tokio::test]
