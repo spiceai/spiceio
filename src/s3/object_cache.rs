@@ -533,6 +533,17 @@ impl ObjectCache {
             .unwrap_or_default()
     }
 
+    /// Every pending write's key, whatever its size (`Spill::audit_dirty_keys`).
+    pub async fn spill_audit_dirty_keys(&self) -> std::io::Result<Vec<String>> {
+        let Some(spill) = self.spill.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let spill = Arc::clone(spill);
+        tokio::task::spawn_blocking(move || spill.audit_dirty_keys())
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
     /// Load at most one recovery body, after excluding entries owned by live
     /// work. The recovery loop drops it before reading the next descriptor.
     pub async fn spill_load_dirty(

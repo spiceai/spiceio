@@ -269,8 +269,16 @@ async fn connect_share(
                 "strict prefixes need the configured disk spill to be readable so pending writes can be checked; fix SPICEIO_SPILL_DIR or drain it first",
             ));
         }
-        let (dirty, _) = object_cache.spill_scan_dirty(Duration::ZERO).await;
-        if dirty.iter().any(|d| share.is_strict(&d.key)) {
+        // Every journalled key, not just the ones the current budget would
+        // replay: an entry written under a larger SPICEIO_SPILL_BYTES is still
+        // a pending write that a peer or a later restart publishes.
+        let pending = object_cache.spill_audit_dirty_keys().await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("strict prefixes need every pending spill write checked, but the spill could not be audited: {e}"),
+            )
+        })?;
+        if pending.iter().any(|key| share.is_strict(key)) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "strict prefixes contain pending spill writes; drain them with the previous configuration before enabling strict mode",
