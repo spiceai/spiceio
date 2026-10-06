@@ -223,24 +223,22 @@ def main():
             if renewer.is_alive():
                 renewer.join(timeout=70)
             if len(processes) == 2 and processes[1].poll() is None and lease["etag"]:
-                # Clean up only while still holding the lease: a run that lost
-                # it would delete the keys of the run that took over.
+                # Clean up only while still holding the lease, renewing before
+                # each step since a DELETE can wait out a whole HTTP timeout: a
+                # run that lost it would delete the keys of the run that took over.
                 try:
-                    held = not lease["lost"] and renew_once()
-                except OSError:
-                    held = False
-                if held:
+                    held = not lease["lost"]
                     for target in keys:
-                        try:
-                            request(1, "DELETE", target)
-                        except OSError:
-                            # Best-effort cleanup; the proxy may already be shutting down.
-                            pass
-                    try:
+                        held = held and renew_once()
+                        if not held:
+                            break
+                        request(1, "DELETE", target)
+                    if held:
                         release_lease()
-                    except OSError:
-                        # Unreleased, the lease expires after LEASE_TTL.
-                        pass
+                except OSError:
+                    # Best-effort cleanup; the proxy may already be shutting down,
+                    # and an unreleased lease expires after LEASE_TTL.
+                    pass
             for process in processes:
                 if process.poll() is None:
                     process.terminate()
