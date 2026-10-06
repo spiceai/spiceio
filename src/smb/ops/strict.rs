@@ -267,6 +267,34 @@ impl StrictGuard {
         client.flush_file(self.tree_id, &self.file_id).await
     }
 
+    /// Durably reserve the current object's timestamp before deleting it, so
+    /// a recreated object cannot reuse its ETag even when the object predates
+    /// its record (strict mode enabled over existing keys).
+    pub(super) async fn reserve_current(&self, path: &str) -> io::Result<()> {
+        let current = match self
+            .client
+            .as_ref()
+            .unwrap()
+            .create_close(
+                self.tree_id,
+                path,
+                DesiredAccess::ReadAttributes as u32,
+                ShareAccess::All as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32,
+            )
+            .await
+        {
+            Ok((file, _)) => file.last_write_time,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if current > self.generation().await? {
+            self.reserve(current).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn release(mut self) -> io::Result<()> {
         let client = self.client.as_ref().unwrap().clone();
         let result = client.close(self.tree_id, &self.file_id).await;

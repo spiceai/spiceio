@@ -646,6 +646,39 @@ async fn strict_delete_fails_when_its_close_fails() {
 }
 
 #[tokio::test]
+async fn strict_delete_reserves_a_pre_strict_object_timestamp() {
+    let nas = Arc::new(Mutex::new(Nas::default()));
+    let a = instance(nas.clone(), 1).await;
+    {
+        // An object written before strict mode: no version record, and the
+        // same (coarse) timestamp the test NAS gives every new file.
+        let mut backend = nas.lock().unwrap();
+        let file = backend.id();
+        backend.names.insert("STRICT\\KEY".into(), file);
+        backend.files.insert(
+            file,
+            File {
+                data: b"aaaa".to_vec(),
+                time: 133000000000000000,
+                flushed: true,
+            },
+        );
+    }
+    let old = etag(&request(a.clone(), "HEAD", "strict/key", "", b"").await);
+    expect_status(
+        &request(a.clone(), "DELETE", "strict/key", "", b"").await,
+        "204",
+    );
+    let recreated = request(a, "PUT", "strict/key", "If-None-Match: *\r\n", b"bbbb").await;
+    expect_status(&recreated, "200");
+    assert_ne!(
+        etag(&recreated),
+        old,
+        "delete must not let an ETag be reused"
+    );
+}
+
+#[tokio::test]
 async fn failed_stat_and_corrupt_version_record_never_publish() {
     let nas = Arc::new(Mutex::new(Nas::default()));
     let a = instance(nas.clone(), 1).await;

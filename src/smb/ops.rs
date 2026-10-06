@@ -708,7 +708,11 @@ impl ShareSession {
         if self.is_strict(key) {
             let (client, tree_id) = self.pick_live().await;
             let guard = self.strict_lock(&client, tree_id, &smb_path).await?;
-            let result = Self::delete_object_checked_on(&client, tree_id, &smb_path).await;
+            let result = async {
+                guard.reserve_current(&smb_path).await?;
+                Self::delete_object_checked_on(&client, tree_id, &smb_path).await
+            }
+            .await;
             guard.release().await?;
             return result;
         }
