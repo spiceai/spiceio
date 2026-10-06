@@ -548,6 +548,76 @@ async fn strict_reads_never_create_version_records() {
 }
 
 #[tokio::test]
+async fn unlocked_read_miss_rechecks_for_a_peer_first_strict_publication() {
+    let nas = Arc::new(Mutex::new(Nas::default()));
+    let a = instance(nas.clone(), 1).await;
+    let record = format!(
+        ".SPICEIO-LOCKS\\{}",
+        crate::crypto::hex_encode(&crate::crypto::sha256(b"STRICT\\KEY")).to_uppercase()
+    );
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = a
+        .share
+        .strict_read("strict\\key", || {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (nas, record, released) = (nas.clone(), record.clone(), released.clone());
+            async move {
+                if call > 0 {
+                    // The retry must wait until the peer's publication releases the lock.
+                    assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+                    return Ok("published");
+                }
+                // Between the absent-record check and this lookup, a peer
+                // takes the first lock record for a pre-existing object and is
+                // mid-rename, so this lookup sees the name missing.
+                let handle = {
+                    let mut backend = nas.lock().unwrap();
+                    let file = backend.id();
+                    backend.names.insert(record, file);
+                    backend.files.insert(file, File::default());
+                    let handle = backend.id();
+                    backend.handles.insert(
+                        handle,
+                        Handle {
+                            file,
+                            session: 99,
+                            exclusive: true,
+                            delete: false,
+                        },
+                    );
+                    handle
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    released.store(true, std::sync::atomic::Ordering::SeqCst);
+                    nas.lock().unwrap().handles.remove(&handle);
+                });
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "renaming",
+                ))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, "published");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // A miss with the record still absent is authoritative: no second lookup.
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let error = a
+        .share
+        .strict_read("strict\\other", || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<(), _>(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")) }
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn failed_stat_and_corrupt_version_record_never_publish() {
     let nas = Arc::new(Mutex::new(Nas::default()));
     let a = instance(nas.clone(), 1).await;

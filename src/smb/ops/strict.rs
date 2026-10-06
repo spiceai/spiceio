@@ -109,16 +109,46 @@ impl ShareSession {
         self.strict_prefixes.iter().any(|p| path.starts_with(p))
     }
 
-    pub(super) async fn strict_read_lock(&self, path: &str) -> io::Result<Option<StrictGuard>> {
+    /// Run a read `lookup` for `path`, holding its lock record when one exists.
+    ///
+    /// Reads never create a record, so misses cannot grow the permanent lock
+    /// namespace. Mutations create the record before checking or publishing
+    /// and hold it until they finish, so without one the lookup runs unlocked.
+    /// An unlocked miss is trusted only if the record is still absent
+    /// afterwards: one that appeared may belong to a peer whose first strict
+    /// publication was mid-rename, so take the lock and look again.
+    pub(crate) async fn strict_read<T, F, Fut>(&self, path: &str, mut lookup: F) -> io::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = io::Result<T>>,
+    {
         if !self.is_strict(path) {
-            return Ok(None);
+            return lookup().await;
         }
         let (client, tree_id) = self.pick_live().await;
-        // Reads never create a record, so misses cannot grow the permanent
-        // lock namespace. An absent record means no strict mutation holds or
-        // has ever held this key's lock: mutations create it before checking
-        // or publishing and keep it open until they finish.
-        match Self::strict_open(&client, tree_id, &lock_name(path), CreateDisposition::Open).await {
+        let name = lock_name(path);
+        if let Some(_guard) = Self::strict_open_existing(&client, tree_id, &name).await? {
+            return lookup().await;
+        }
+        let result = lookup().await;
+        if !result
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        {
+            return result;
+        }
+        match Self::strict_open_existing(&client, tree_id, &name).await? {
+            Some(_guard) => lookup().await,
+            None => result,
+        }
+    }
+
+    async fn strict_open_existing(
+        client: &Arc<SmbClient>,
+        tree_id: u32,
+        name: &str,
+    ) -> io::Result<Option<StrictGuard>> {
+        match Self::strict_open(client, tree_id, name, CreateDisposition::Open).await {
             Ok(guard) => Ok(Some(guard)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),

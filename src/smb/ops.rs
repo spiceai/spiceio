@@ -202,11 +202,12 @@ impl ShareSession {
     ) -> io::Result<(ObjectMeta, Bytes)> {
         let smb_path = to_smb_path(key);
         let _publication = self.publication(&smb_path).read_owned().await;
-        let _strict_read = self.strict_read_lock(&smb_path).await?;
         let (cr, data) = self
-            .retry_read_open(|client, tree_id| {
-                let smb_path = smb_path.clone();
-                async move { client.create_read_close(tree_id, &smb_path, max_read).await }
+            .strict_read(&smb_path, || {
+                self.retry_read_open(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    async move { client.create_read_close(tree_id, &smb_path, max_read).await }
+                })
             })
             .await?;
 
@@ -226,27 +227,28 @@ impl ShareSession {
     pub async fn open_read(&self, key: &str) -> io::Result<FileHandle> {
         let smb_path = to_smb_path(key);
         let _publication = self.publication(&smb_path).read_owned().await;
-        let _strict_read = self.strict_read_lock(&smb_path).await?;
         // Resilient open: under heavy concurrent load on a degraded NAS the
         // create can hit a transient reset; retry on a fresh connection so the
         // initial open of a streaming GET isn't lost (the client may not retry).
         // Missing leaf names have a separate, bounded publication retry.
         let (client, tree_id, file) = self
-            .retry_read_open(|client, tree_id| {
-                let smb_path = smb_path.clone();
-                async move {
-                    let file = client
-                        .create(
-                            tree_id,
-                            &smb_path,
-                            DesiredAccess::GenericRead as u32,
-                            ShareAccess::All as u32,
-                            CreateDisposition::Open as u32,
-                            CreateOptions::NonDirectoryFile as u32,
-                        )
-                        .await?;
-                    Ok((client, tree_id, file))
-                }
+            .strict_read(&smb_path, || {
+                self.retry_read_open(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    async move {
+                        let file = client
+                            .create(
+                                tree_id,
+                                &smb_path,
+                                DesiredAccess::GenericRead as u32,
+                                ShareAccess::All as u32,
+                                CreateDisposition::Open as u32,
+                                CreateOptions::NonDirectoryFile as u32,
+                            )
+                            .await?;
+                        Ok((client, tree_id, file))
+                    }
+                })
             })
             .await?;
 
@@ -738,22 +740,23 @@ impl ShareSession {
     pub async fn head_object(&self, key: &str) -> io::Result<ObjectMeta> {
         let smb_path = to_smb_path(key);
         let _publication = self.publication(&smb_path).read_owned().await;
-        let _strict_read = self.strict_read_lock(&smb_path).await?;
         let (cr, _) = self
-            .retry_read_open(|client, tree_id| {
-                let smb_path = smb_path.clone();
-                async move {
-                    client
-                        .create_close(
-                            tree_id,
-                            &smb_path,
-                            DesiredAccess::ReadAttributes as u32,
-                            ShareAccess::All as u32,
-                            CreateDisposition::Open as u32,
-                            CreateOptions::NonDirectoryFile as u32,
-                        )
-                        .await
-                }
+            .strict_read(&smb_path, || {
+                self.retry_read_open(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    async move {
+                        client
+                            .create_close(
+                                tree_id,
+                                &smb_path,
+                                DesiredAccess::ReadAttributes as u32,
+                                ShareAccess::All as u32,
+                                CreateDisposition::Open as u32,
+                                CreateOptions::NonDirectoryFile as u32,
+                            )
+                            .await
+                    }
+                })
             })
             .await?;
 
@@ -1471,24 +1474,26 @@ impl ShareSession {
         smb_path: &str,
     ) -> io::Result<CreateResponse> {
         let _publication = self.publication(smb_path).read_owned().await;
-        let _strict_read = self.strict_read_lock(smb_path).await?;
-        let mut publication = PublicationRetry::default();
-        loop {
-            let result = client
-                .create(
-                    tree_id,
-                    smb_path,
-                    DesiredAccess::GenericRead as u32,
-                    ShareAccess::All as u32,
-                    CreateDisposition::Open as u32,
-                    CreateOptions::NonDirectoryFile as u32,
-                )
-                .await;
-            match result {
-                Err(e) if publication.retry(&e).await => continue,
-                result => return result,
+        self.strict_read(smb_path, || async move {
+            let mut publication = PublicationRetry::default();
+            loop {
+                let result = client
+                    .create(
+                        tree_id,
+                        smb_path,
+                        DesiredAccess::GenericRead as u32,
+                        ShareAccess::All as u32,
+                        CreateDisposition::Open as u32,
+                        CreateOptions::NonDirectoryFile as u32,
+                    )
+                    .await;
+                match result {
+                    Err(e) if publication.retry(&e).await => continue,
+                    result => return result,
+                }
             }
-        }
+        })
+        .await
     }
 
     /// Delete a temp file (best effort).
