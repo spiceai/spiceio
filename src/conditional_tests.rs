@@ -2,7 +2,7 @@
 //! scripted replies this server enforces exclusive opens and replacement rules.
 use crate::s3::router::AppState;
 use crate::smb::{condition::WriteCondition, ops::ShareSession, protocol::*};
-use crate::test_support::{http_request, state};
+use crate::test_support::{http_request, state, state_and_client};
 use bytes::{Bytes, BytesMut};
 use std::{
     collections::HashMap,
@@ -37,6 +37,13 @@ struct Nas {
     fail_destination_stat: bool,
     disconnect_on_rename: bool,
     fail_delete_close: bool,
+    /// One-shot: hold the next rename until the test resumes it.
+    pause_rename: Option<Arc<Pause>>,
+}
+#[derive(Default)]
+struct Pause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 fn u32_at(b: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(b[n..n + 4].try_into().unwrap())
@@ -264,6 +271,11 @@ async fn serve(mut stream: TcpStream, nas: Arc<Mutex<Nas>>, session: u64) {
         let mut related = 0;
         for (index, (mut h, body)) in parts.iter().cloned().enumerate() {
             if h.command == Command::SetInfo as u16 && body[3] == 10 {
+                let pause = nas.lock().unwrap().pause_rename.take();
+                if let Some(pause) = pause {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
+                }
                 let mut backend = nas.lock().unwrap();
                 if backend.disconnect_on_rename {
                     backend.disconnect_on_rename = false;
@@ -302,7 +314,13 @@ async fn serve(mut stream: TcpStream, nas: Arc<Mutex<Nas>>, session: u64) {
 }
 
 async fn instance(nas: Arc<Mutex<Nas>>, session: u64) -> Arc<AppState> {
-    let (mut state, stream) = state().await;
+    instance_and_client(nas, session).await.0
+}
+async fn instance_and_client(
+    nas: Arc<Mutex<Nas>>,
+    session: u64,
+) -> (Arc<AppState>, Arc<crate::smb::client::SmbClient>) {
+    let (mut state, stream, client) = state_and_client().await;
     state.object_cache = Arc::new(crate::s3::object_cache::ObjectCache::new(
         true, 1024, 1024, 64,
     ));
@@ -315,7 +333,7 @@ async fn instance(nas: Arc<Mutex<Nas>>, session: u64) -> Arc<AppState> {
             .unwrap(),
     );
     tokio::spawn(serve(stream, nas, session));
-    Arc::new(state)
+    (Arc::new(state), client)
 }
 async fn request(
     state: Arc<AppState>,
@@ -808,4 +826,58 @@ async fn http_copy_and_multipart_conditions_reach_the_backend_commit() {
     let response = request(b, "GET", "strict/dest", "", b"").await;
     expect_status(&response, "200");
     assert!(response.ends_with("parts"), "{response}");
+}
+
+#[tokio::test]
+async fn cancelled_publication_never_leaves_its_handle_open_without_the_lock() {
+    // Cancel a strict PUT while its post-rename FLUSH waits for the connection.
+    // No in-flight request poisons the session then, so cancellation itself
+    // must not release the lock while the published handle stays open.
+    let nas = Arc::new(Mutex::new(Nas::default()));
+    let (a, client) = instance_and_client(nas.clone(), 1).await;
+    a.share
+        .put_object_atomic("strict/key", b"old")
+        .await
+        .unwrap();
+    let pause = Arc::new(Pause::default());
+    nas.lock().unwrap().pause_rename = Some(pause.clone());
+    let share = Arc::clone(&a.share);
+    let publish = tokio::spawn(async move { share.put_object_atomic("strict/key", b"new").await });
+    // The rename is in flight. Queue a holder for the stream ahead of the
+    // FLUSH that follows it (the stream mutex is FIFO), then cancel.
+    pause.reached.notified().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let holder = {
+        let (client, release) = (Arc::clone(&client), Arc::clone(&release));
+        tokio::spawn(async move {
+            let _stream = client.hold_stream().await;
+            release.notified().await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    pause.resume.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    publish.abort();
+    assert!(publish.await.unwrap_err().is_cancelled());
+    release.notify_one();
+    holder.await.unwrap();
+    // Whatever the cancellation spawned has run once the stream is free.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let open = nas
+            .lock()
+            .unwrap()
+            .handles
+            .values()
+            .filter(|h| h.session == 1)
+            .count();
+        if open == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{open} handle(s) left open on the cancelled publication's session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }

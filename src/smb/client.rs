@@ -355,6 +355,13 @@ impl SmbClient {
         Duration::from_millis(now_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed)))
     }
 
+    /// Test hook: hold the stream so later operations queue behind it, without
+    /// the poisoning a dropped `StreamGuard` implies.
+    #[cfg(test)]
+    pub(crate) async fn hold_stream(&self) -> tokio::sync::MutexGuard<'_, TcpStream> {
+        self.stream.lock().await
+    }
+
     /// Take exclusive use of the stream for one operation, counting it against
     /// this connection's queue depth until the guard drops. This is the only
     /// way to reach the stream, so the accounting cannot be skipped.

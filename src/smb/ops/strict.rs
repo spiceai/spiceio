@@ -240,6 +240,7 @@ impl ShareSession {
                         tree_id,
                         file_id: file.file_id,
                         size: file.file_size,
+                        publishing: false,
                     });
                 }
                 Err(e) if is_busy(&e) && tokio::time::Instant::now() < deadline => {
@@ -263,6 +264,11 @@ pub(super) struct StrictGuard {
     tree_id: u32,
     file_id: [u8; 16],
     size: u64,
+    /// Set while publication also holds the WAL handle on this session.
+    /// Dropping the guard then closes the session, which releases both
+    /// handles together: releasing only the lock would leave the published
+    /// handle open on a healthy connection, blocking the next strict rename.
+    publishing: bool,
 }
 
 impl StrictGuard {
@@ -338,10 +344,10 @@ impl StrictGuard {
 impl Drop for StrictGuard {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
-            let (tree, file) = (self.tree_id, self.file_id);
+            let (tree, file, publishing) = (self.tree_id, self.file_id, self.publishing);
             // Cancellation must release server locks as well as local mutexes.
             tokio::spawn(async move {
-                if client.close(tree, &file).await.is_err() {
+                if publishing || client.close(tree, &file).await.is_err() {
                     client.poison().await;
                 }
             });
@@ -375,11 +381,7 @@ impl WalWriter {
         meta: ObjectMeta,
         condition: &WriteCondition,
     ) -> io::Result<ObjectMeta> {
-        let result = self.publish_strict(share, meta, condition).await;
-        if result.is_err() {
-            self.discard_temp().await;
-        }
-        result
+        self.publish_strict(share, meta, condition).await
     }
 
     async fn publish_strict(
@@ -389,9 +391,13 @@ impl WalWriter {
         condition: &WriteCondition,
     ) -> io::Result<ObjectMeta> {
         let client = &self.client;
-        let guard = share
+        let mut guard = share
             .strict_lock(client, self.tree_id, &self.final_path)
             .await?;
+        // The WAL handle lives on the lock's session too. Until both are
+        // closed explicitly, cancellation must close the session (see
+        // `StrictGuard::publishing`).
+        guard.publishing = true;
         let result = async {
             let current = match client
                 .create_close(
@@ -490,6 +496,12 @@ impl WalWriter {
             Ok(meta)
         }
         .await;
+        if result.is_err() {
+            // Close the temp (or the renamed destination) while the lock is
+            // still held, so no later writer finds it open.
+            self.discard_temp().await;
+        }
+        guard.publishing = false;
         let released = guard.release().await;
         // Keep ConditionalRequestConflict when the lost connection also
         // prevents CLOSE from acknowledging lock release.

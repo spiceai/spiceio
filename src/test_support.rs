@@ -32,8 +32,15 @@ pub(crate) async fn pair() -> (Arc<SmbClient>, TcpStream) {
     (SmbClient::test_from_stream(c.unwrap()), s.unwrap().0)
 }
 pub(crate) async fn state() -> (AppState, TcpStream) {
+    let (state, server, _) = state_and_client().await;
+    (state, server)
+}
+/// `state()`, plus the instance's one SMB connection for tests that drive it.
+pub(crate) async fn state_and_client() -> (AppState, TcpStream, Arc<SmbClient>) {
     let (c, s) = pair().await;
-    let share = Arc::new(ShareSession::test_from_pool(SmbPool::test_from_client(c)));
+    let share = Arc::new(ShareSession::test_from_pool(SmbPool::test_from_client(
+        c.clone(),
+    )));
     (
         AppState {
             smb_slots: share.admission(),
@@ -48,6 +55,7 @@ pub(crate) async fn state() -> (AppState, TcpStream) {
             existence: Arc::new(crate::s3::existence::ExistenceIndex::disabled()),
         },
         s,
+        c,
     )
 }
 pub(crate) async fn read_frame(s: &mut TcpStream) -> Vec<u8> {
