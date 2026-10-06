@@ -15,11 +15,21 @@ const RECORD_MAGIC: &[u8; 8] = b"SPICEV01";
 const RECORD_LEN: usize = 48;
 
 fn canonical_path(path: &str) -> String {
+    // Trim before filtering so components the server reduces to nothing
+    // (`.`, `. `) are dropped rather than kept as empty segments.
     path.split(['/', '\\'])
-        .filter(|s| !s.is_empty() && *s != ".")
-        .map(|s| s.trim_end_matches(['.', ' ']).to_uppercase())
+        .map(|s| s.trim_end_matches(['.', ' ']))
+        .filter(|s| !s.is_empty())
+        .map(str::to_uppercase)
         .collect::<Vec<_>>()
         .join("\\")
+}
+
+fn lock_name(path: &str) -> String {
+    format!(
+        "{LOCK_DIR}\\{}",
+        hex_encode(&sha256(canonical_path(path).as_bytes()))
+    )
 }
 
 impl ShareSession {
@@ -43,7 +53,15 @@ impl ShareSession {
                     String::new()
                 } else {
                     let mut path = canonical_path(prefix);
-                    if prefix.ends_with(['/', '\\']) && !path.is_empty() {
+                    // The empty path is the `*` sentinel; a prefix such as `/`
+                    // or `.` must not silently select the whole bucket.
+                    if path.is_empty() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "invalid SPICEIO_STRICT_PREFIXES: use * for the whole bucket",
+                        ));
+                    }
+                    if prefix.ends_with(['/', '\\']) {
                         path.push('\\');
                     }
                     path
@@ -96,21 +114,30 @@ impl ShareSession {
             return Ok(None);
         }
         let (client, tree_id) = self.pick_live().await;
-        self.strict_lock(&client, tree_id, path).await.map(Some)
+        // Reads never create a record, so misses cannot grow the permanent
+        // lock namespace. An absent record means no strict mutation holds or
+        // has ever held this key's lock: mutations create it before checking
+        // or publishing and keep it open until they finish.
+        match Self::strict_open(&client, tree_id, &lock_name(path), CreateDisposition::Open).await {
+            Ok(guard) => Ok(Some(guard)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// The coordination namespace must never be mutable through S3.
     pub fn reserved_key(key: &str) -> bool {
+        // Canonicalize each component first: `. ` reaches the share as `.`,
+        // so it must not count as the first significant component.
         key.split(['/', '\\'])
-            .find(|s| !s.is_empty() && *s != ".")
-            .is_some_and(|first| {
-                first
-                    .split(':')
+            .map(|s| {
+                s.split(':')
                     .next()
                     .unwrap_or_default()
                     .trim_end_matches(['.', ' '])
-                    .eq_ignore_ascii_case(LOCK_DIR)
             })
+            .find(|s| !s.is_empty())
+            .is_some_and(|first| first.eq_ignore_ascii_case(LOCK_DIR))
     }
 
     pub(super) async fn strict_lock(
@@ -119,20 +146,26 @@ impl ShareSession {
         tree_id: u32,
         path: &str,
     ) -> io::Result<StrictGuard> {
-        let name = format!(
-            "{LOCK_DIR}\\{}",
-            hex_encode(&sha256(canonical_path(path).as_bytes()))
-        );
+        let name = lock_name(path);
         self.ensure_parent_dirs_on(client, tree_id, &name).await?;
+        Self::strict_open(client, tree_id, &name, CreateDisposition::OpenIf).await
+    }
+
+    async fn strict_open(
+        client: &Arc<SmbClient>,
+        tree_id: u32,
+        name: &str,
+        disposition: CreateDisposition,
+    ) -> io::Result<StrictGuard> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let result = client
                 .create(
                     tree_id,
-                    &name,
+                    name,
                     DesiredAccess::GenericRead as u32 | DesiredAccess::GenericWrite as u32,
                     0, // Server-enforced exclusive open across sessions and machines.
-                    CreateDisposition::OpenIf as u32,
+                    disposition as u32,
                     CreateOptions::NonDirectoryFile as u32,
                 )
                 .await;
@@ -421,5 +454,25 @@ mod tests {
             assert!(!share.is_strict(key), "{key}");
         }
         assert!(ShareSession::reserved_key("./.SPICEIO-LOCKS. /x"));
+        assert!(ShareSession::reserved_key(". /.spiceio-locks/x"));
+        assert!(ShareSession::reserved_key("/. \\.spiceio-locks:s/x"));
+        assert!(!ShareSession::reserved_key("x/.spiceio-locks/y"));
+        assert!(share.is_strict(". /metadata/key"));
+    }
+
+    #[tokio::test]
+    async fn strict_prefixes_that_normalize_to_nothing_are_rejected() {
+        let (state, _server) = crate::test_support::state().await;
+        for prefixes in ["/", ".", ". ", "...", "./", "metadata/,/"] {
+            assert!(
+                (*state.share)
+                    .clone()
+                    .with_strict_prefixes(prefixes)
+                    .is_err(),
+                "{prefixes:?}"
+            );
+        }
+        let share = (*state.share).clone().with_strict_prefixes("*").unwrap();
+        assert!(share.is_strict("anything"));
     }
 }

@@ -505,6 +505,49 @@ async fn conditional_streaming_copy_and_assembly_share_the_publication_check() {
 }
 
 #[tokio::test]
+async fn strict_reads_never_create_version_records() {
+    let nas = Arc::new(Mutex::new(Nas::default()));
+    let a = instance(nas.clone(), 1).await;
+    let records = || {
+        nas.lock()
+            .unwrap()
+            .names
+            .keys()
+            .filter(|name| name.starts_with(".SPICEIO-LOCKS\\"))
+            .count()
+    };
+    let share: &ShareSession = &a.share;
+    for key in ["strict/missing-1", "strict/missing-2"] {
+        let error = share.head_object(key).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let error = share.get_object_compound(key, 64).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+    assert_eq!(
+        records(),
+        0,
+        "a GET/HEAD miss must not create a lock record"
+    );
+    share
+        .put_object_conditional("strict/key", b"data", &WriteCondition::Absent)
+        .await
+        .unwrap();
+    assert_eq!(records(), 1);
+    // An existing record is still taken (and released) by reads.
+    assert_eq!(
+        share
+            .get_object_compound("strict/key", 64)
+            .await
+            .unwrap()
+            .1
+            .as_ref(),
+        b"data"
+    );
+    share.head_object("strict/missing-3").await.unwrap_err();
+    assert_eq!(records(), 1);
+}
+
+#[tokio::test]
 async fn failed_stat_and_corrupt_version_record_never_publish() {
     let nas = Arc::new(Mutex::new(Nas::default()));
     let a = instance(nas.clone(), 1).await;
