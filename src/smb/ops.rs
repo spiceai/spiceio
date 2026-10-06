@@ -429,11 +429,7 @@ impl ShareSession {
             if entry.is_directory() {
                 continue;
             }
-            if dir_path.is_empty()
-                && (entry.file_name == WAL_DIR
-                    || entry.file_name == UPLOADS_DIR
-                    || entry.file_name == strict::LOCK_DIR)
-            {
+            if dir_path.is_empty() && is_bookkeeping_dir(&entry.file_name) {
                 continue;
             }
             names.insert(entry.file_name);
@@ -530,9 +526,7 @@ impl ShareSession {
                 // part files as objects.
                 if dir_path.is_empty()
                     && entry.is_directory()
-                    && (entry.file_name == WAL_DIR
-                        || entry.file_name == UPLOADS_DIR
-                        || entry.file_name == strict::LOCK_DIR)
+                    && is_bookkeeping_dir(&entry.file_name)
                 {
                     continue;
                 }
@@ -2208,6 +2202,14 @@ const WAL_TEMP_ACCESS: u32 = DesiredAccess::GenericWrite as u32
 
 /// Directory on the SMB share where multipart upload parts are stored.
 const UPLOADS_DIR: &str = ".spiceio-uploads";
+
+/// spiceio's own directories at the share root. SMB lookups ignore case and
+/// keep the creator's casing, so `.SPICEIO-LOCKS` is the lock directory too.
+fn is_bookkeeping_dir(name: &str) -> bool {
+    [WAL_DIR, UPLOADS_DIR, strict::LOCK_DIR]
+        .iter()
+        .any(|dir| name.eq_ignore_ascii_case(dir))
+}
 
 /// Default grace period, in seconds, before startup cleanup will remove a WAL
 /// temp file or a multipart upload directory. Overridable via
@@ -3897,6 +3899,55 @@ mod regression_publication {
                     .unwrap();
             assert!(listing.0.is_empty() && listing.1.is_empty(), "{prefix}");
         }
+    }
+
+    fn directory_entry(name: &str, last: bool) -> Vec<u8> {
+        // FileIdBothDirectoryInformation, flagged as a directory.
+        let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let len = (104 + name.len()).next_multiple_of(8);
+        let mut entry = vec![0u8; len];
+        if !last {
+            entry[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        }
+        entry[56..60].copy_from_slice(&0x10u32.to_le_bytes());
+        entry[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        entry[104..104 + name.len()].copy_from_slice(&name);
+        entry
+    }
+
+    #[tokio::test]
+    async fn root_listing_hides_bookkeeping_directories_in_any_case() {
+        // SMB lookups ignore case and keep the creator's casing, so a
+        // `.SPICEIO-LOCKS` an older instance created is the lock directory.
+        // The fake server answers only the root listing: descending into any
+        // of these would send a CREATE that never gets a reply.
+        let (client, mut server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+        let backend = tokio::spawn(async move {
+            let open = read_frame(&mut server).await;
+            compound_reply(&mut server, &open, &[(0, create_body(0))]).await;
+            let query = read_frame(&mut server).await;
+            let mut entries = directory_entry(".SPICEIO-LOCKS", false);
+            entries.extend(directory_entry(".Spiceio-Wal", false));
+            entries.extend(directory_entry(".SPICEIO-UPLOADS", true));
+            let mut body = vec![0u8; 8];
+            body[..2].copy_from_slice(&9u16.to_le_bytes());
+            body[2..4].copy_from_slice(&((SMB2_HEADER_SIZE + 8) as u16).to_le_bytes());
+            body[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+            body.extend_from_slice(&entries);
+            compound_reply(&mut server, &query, &[(0, body)]).await;
+            let next_page = read_frame(&mut server).await;
+            error_reply(&mut server, &next_page, 0x8000_0006).await; // STATUS_NO_MORE_FILES
+            let close = read_frame(&mut server).await;
+            error_reply(&mut server, &close, 0).await;
+            server
+        });
+        let listing = tokio::time::timeout(Duration::from_secs(5), share.list_objects("", None))
+            .await
+            .expect("the listing descended into a bookkeeping directory")
+            .unwrap();
+        assert!(listing.0.is_empty() && listing.1.is_empty());
+        drop(backend.await.unwrap());
     }
 
     #[tokio::test]
