@@ -232,6 +232,7 @@ async fn connect_share(
     // L2: the machine-wide disk tier. Namespaced by backend identity so
     // instances fronting *different* shares can share one directory without
     // ever serving each other's objects.
+    let mut spill_failed = false;
     if let Some(dir) = spill_dir.as_deref() {
         let namespace = format!("{}:{}/{}", smb_config.server, smb_config.port, smb_share);
         let max_object = s3::object_cache::default_max_object_bytes(spill_bytes);
@@ -251,12 +252,23 @@ async fn connect_share(
             }
             // A cache tier that cannot be opened is a missing optimization, not
             // a reason to refuse to serve.
-            Err(e) => serr!("[spiceio] disk spill disabled: cannot use {dir}: {e}"),
+            Err(e) => {
+                serr!("[spiceio] disk spill disabled: cannot use {dir}: {e}");
+                spill_failed = true;
+            }
         }
     }
     let object_cache = Arc::new(object_cache);
 
     if share.has_strict_prefixes() {
+        // Fail closed: an unreadable spill may hold acknowledged writes for
+        // strict keys that a later replay would publish outside the lock.
+        if spill_failed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strict prefixes need the configured disk spill to be readable so pending writes can be checked; fix SPICEIO_SPILL_DIR or drain it first",
+            ));
+        }
         let (dirty, _) = object_cache.spill_scan_dirty(Duration::ZERO).await;
         if dirty.iter().any(|d| share.is_strict(&d.key)) {
             return Err(std::io::Error::new(
