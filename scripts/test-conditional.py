@@ -93,19 +93,25 @@ def main():
             assert time.monotonic() < deadline, f"another run still holds {lease_key} after {LEASE_WAIT}s"
             time.sleep(2)
 
+    def renew_once():
+        # Owner-checked: succeeds only if no other run has taken the lease over.
+        result = request(1, "PUT", lease_key, lease_body(time.time() + LEASE_TTL),
+                         {"If-Match": lease["etag"]})
+        if result[0] != 200:
+            lease["lost"] = True
+            return False
+        lease["etag"] = result[1]["etag"]
+        return True
+
     def renew_lease():
         # Renew well inside the TTL: a step may wait out a whole HTTP timeout,
         # and a slow but healthy run must not lose its keys to the next one.
         while not stop_renewing.wait(LEASE_TTL / 5):
             try:
-                result = request(1, "PUT", lease_key, lease_body(time.time() + LEASE_TTL),
-                                 {"If-Match": lease["etag"]})
+                if not renew_once():
+                    return
             except OSError:
                 continue  # Retried at the next interval, long before the lease lapses.
-            if result[0] != 200:
-                lease["lost"] = True
-                return
-            lease["etag"] = result[1]["etag"]
 
     def release_lease():
         # If-Match: a run that outlived its lease must not clear the new holder's.
@@ -216,14 +222,20 @@ def main():
             stop_renewing.set()
             if renewer.is_alive():
                 renewer.join(timeout=70)
-            if len(processes) == 2 and processes[1].poll() is None:
-                for target in keys:
-                    try:
-                        request(1, "DELETE", target)
-                    except OSError:
-                        # Best-effort cleanup; the proxy may already be shutting down.
-                        pass
-                if lease["etag"]:
+            if len(processes) == 2 and processes[1].poll() is None and lease["etag"]:
+                # Clean up only while still holding the lease: a run that lost
+                # it would delete the keys of the run that took over.
+                try:
+                    held = not lease["lost"] and renew_once()
+                except OSError:
+                    held = False
+                if held:
+                    for target in keys:
+                        try:
+                            request(1, "DELETE", target)
+                        except OSError:
+                            # Best-effort cleanup; the proxy may already be shutting down.
+                            pass
                     try:
                         release_lease()
                     except OSError:
