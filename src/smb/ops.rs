@@ -708,7 +708,7 @@ impl ShareSession {
         if self.is_strict(key) {
             let (client, tree_id) = self.pick_live().await;
             let guard = self.strict_lock(&client, tree_id, &smb_path).await?;
-            let result = Self::delete_object_path_on(&client, tree_id, &smb_path).await;
+            let result = Self::delete_object_checked_on(&client, tree_id, &smb_path).await;
             guard.release().await?;
             return result;
         }
@@ -1518,6 +1518,33 @@ impl ShareSession {
                 CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await?;
+        Ok(())
+    }
+
+    /// Delete where the result must be exact (strict prefixes). DELETE_ON_CLOSE
+    /// deletes at CLOSE, and the compound `create_close` only logs a failed
+    /// CLOSE, so close separately and let its status decide.
+    async fn delete_object_checked_on(
+        client: &SmbClient,
+        tree_id: u32,
+        smb_path: &str,
+    ) -> io::Result<()> {
+        let file = client
+            .create(
+                tree_id,
+                smb_path,
+                DesiredAccess::Delete as u32,
+                ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
+            )
+            .await?;
+        if let Err(e) = client.close(tree_id, &file.file_id).await {
+            // The handle and its pending delete are in an unknown state;
+            // ending the session is the only cleanup.
+            client.poison().await;
+            return Err(e);
+        }
         Ok(())
     }
 

@@ -35,6 +35,7 @@ struct Nas {
     fail_rename: bool,
     fail_destination_stat: bool,
     disconnect_on_rename: bool,
+    fail_delete_close: bool,
 }
 fn u32_at(b: &[u8], n: usize) -> u32 {
     u32::from_le_bytes(b[n..n + 4].try_into().unwrap())
@@ -161,6 +162,9 @@ impl Nas {
         assert_eq!(h.session, session, "a handle crossed SMB sessions");
         let file = h.file;
         if command == Command::Close as u16 {
+            if h.delete && self.fail_delete_close {
+                return Err(0xC0000001);
+            }
             let h = self.handles.remove(&handle).unwrap();
             if h.delete {
                 self.names.retain(|_, id| *id != file);
@@ -615,6 +619,19 @@ async fn unlocked_read_miss_rechecks_for_a_peer_first_strict_publication() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn strict_delete_fails_when_its_close_fails() {
+    let nas = Arc::new(Mutex::new(Nas::default()));
+    let a = instance(nas.clone(), 1).await;
+    a.share
+        .put_object_conditional("strict/key", b"data", &WriteCondition::Absent)
+        .await
+        .unwrap();
+    nas.lock().unwrap().fail_delete_close = true;
+    assert!(a.share.delete_object("strict/key").await.is_err());
+    assert!(nas.lock().unwrap().names.contains_key("STRICT\\KEY"));
 }
 
 #[tokio::test]
