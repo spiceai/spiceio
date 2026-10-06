@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Live conditional-write gate: independent proxies, one NAS, no SDK dependencies."""
 import concurrent.futures
+import contextlib
 import http.client
 import os
 from pathlib import Path
@@ -69,13 +70,14 @@ def main():
         assert expect(request(1, "GET", target), 200)[2] == winners[0][0]
         return winners[0][1][1]["etag"]
 
-    with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory:
+    # ExitStack closes the logs (after the finally below) before the directory is removed.
+    with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory, contextlib.ExitStack() as log_files:
         try:
             for i in range(2):
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))
                     ports.append(listener.getsockname()[1])
-                log = open(Path(directory) / f"proxy-{i}.log", "w+")
+                log = log_files.enter_context(open(Path(directory) / f"proxy-{i}.log", "w+"))
                 logs.append(log)
                 processes.append(subprocess.Popen(
                     ["./target/debug/spiceio"],
@@ -88,6 +90,7 @@ def main():
                         if request(i, "GET")[0] == 200:
                             break
                     except OSError:
+                        # Connection refused/reset is expected until the proxy listens.
                         pass
                     time.sleep(0.5)
                 else:
@@ -149,6 +152,7 @@ def main():
                     try:
                         request(1, "DELETE", target)
                     except OSError:
+                        # Best-effort cleanup; the proxy may already be shutting down.
                         pass
             for process in processes:
                 if process.poll() is None:
@@ -158,8 +162,6 @@ def main():
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
-            for log in logs:
-                log.close()
 
 
 if __name__ == "__main__":
