@@ -458,6 +458,12 @@ impl ShareSession {
         }
         let smb_path = to_smb_path(prefix);
         let (dir_path, pattern) = split_dir_pattern(&smb_path);
+        // A parent alias in the directory part lets the server resolve the
+        // listing outside the prefix, including into the reserved namespace.
+        // (The pattern part cannot: `.` and `..` entries are never returned.)
+        if dir_path.split('\\').any(Self::is_parent_alias) {
+            return Ok((Vec::new(), Vec::new()));
+        }
 
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
@@ -3862,6 +3868,28 @@ mod regression_publication {
             0,
             "rename needs DELETE"
         );
+    }
+
+    #[tokio::test]
+    async fn listing_never_opens_a_directory_through_a_parent_alias() {
+        // `safe/../.spiceio-locks/` passes the reserved-namespace check by its
+        // first segment, and a server resolves the `..`. The fake server never
+        // answers, so a listing that sent any request would time out.
+        let (client, _server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+        for prefix in [
+            "safe/../.spiceio-locks/",
+            "safe/.../x/",
+            "a/.. /b/c",
+            "a\\..\\b\\",
+        ] {
+            let listing =
+                tokio::time::timeout(Duration::from_secs(5), share.list_objects(prefix, None))
+                    .await
+                    .unwrap_or_else(|_| panic!("{prefix}: listing reached the server"))
+                    .unwrap();
+            assert!(listing.0.is_empty() && listing.1.is_empty(), "{prefix}");
+        }
     }
 
     #[tokio::test]

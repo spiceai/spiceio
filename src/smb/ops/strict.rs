@@ -50,9 +50,11 @@ impl ShareSession {
         if !prefixes.is_empty() {
             for prefix in prefixes.split(',') {
                 let prefix = prefix.trim();
+                // Reject every alias of `..`, not just the literal: `...` or
+                // `.. ` canonicalize to nothing and would select another prefix.
                 if prefix.is_empty()
                     || prefix.contains([':', '\0'])
-                    || prefix.split(['/', '\\']).any(|s| s == "..")
+                    || prefix.split(['/', '\\']).any(Self::is_parent_alias)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -173,6 +175,16 @@ impl ShareSession {
             .map(canonical_component)
             .find(|s| !s.is_empty())
             .is_some_and(|first| first.eq_ignore_ascii_case(LOCK_DIR))
+    }
+
+    /// `..`, plus the names a server can reduce to it by trimming trailing dots
+    /// and spaces (`.. `, `...`) or dropping a stream suffix (`..:x`). Strict
+    /// prefix matching and lock names already assume that trimming.
+    pub fn is_parent_alias(segment: &str) -> bool {
+        let name = segment.split(':').next().unwrap_or_default();
+        name.len() >= 2
+            && name.bytes().all(|b| b == b'.' || b == b' ')
+            && name.bytes().filter(|&b| b == b'.').count() >= 2
     }
 
     pub(super) async fn strict_lock(
@@ -541,5 +553,31 @@ mod tests {
         }
         let share = (*state.share).clone().with_strict_prefixes("*").unwrap();
         assert!(share.is_strict("anything"));
+    }
+
+    #[tokio::test]
+    async fn strict_prefixes_reject_every_parent_alias() {
+        // `...` and `.. ` canonicalize to nothing, so `safe/.../metadata/`
+        // would silently become `safe/metadata/`.
+        let (state, _server) = crate::test_support::state().await;
+        for prefixes in [
+            "safe/.../metadata/",
+            "safe/.. /metadata/",
+            "a\\. .\\b/",
+            "metadata/,x/../y/",
+        ] {
+            assert!(
+                (*state.share)
+                    .clone()
+                    .with_strict_prefixes(prefixes)
+                    .is_err(),
+                "{prefixes:?}"
+            );
+        }
+        let share = (*state.share)
+            .clone()
+            .with_strict_prefixes("safe/./metadata/")
+            .unwrap();
+        assert!(share.is_strict("safe/metadata/key"));
     }
 }
