@@ -146,6 +146,15 @@ jobs:
           SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/extended.log
         run: ./scripts/test-extended.sh
 
+      - name: Run two-instance conditional-write test
+        if: ${{ env.HAS_SMB_PASS == 'true' }}
+        env:
+          SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
+          SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
+          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
+        run: python3 scripts/test-conditional.py
+
       - name: Run write-back and disk-spill test
         # Asynchronous PUT acknowledgement (SPICEIO_WRITE_BACK) and the
         # machine-wide disk spill. Starts a second instance to read the objects

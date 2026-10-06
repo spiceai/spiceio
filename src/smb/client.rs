@@ -667,7 +667,7 @@ impl SmbClient {
     /// queued in the stream; closing the socket lets the server release the
     /// session promptly and ensures the leftover bytes can never be misread as a
     /// later reply (the poisoned flag already blocks reuse until the pool heals).
-    async fn poison(&self) {
+    pub(crate) async fn poison(&self) {
         self.poisoned.store(true, Ordering::Relaxed);
         let _ = self.stream.lock().await.shutdown().await;
     }
@@ -1691,6 +1691,53 @@ impl SmbClient {
             }
         }
         Ok(contiguous)
+    }
+
+    /// Force acknowledged writes to stable storage. Used only by strict commits.
+    pub(crate) async fn flush_file(&self, tree_id: u32, file_id: &[u8; 16]) -> io::Result<()> {
+        let mut hdr = Header::new(Command::Flush, self.next_message_id());
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+        let packet = build_request(&hdr, |buf| encode_flush_request(buf, file_id));
+        let (reply, _) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(reply.status).is_error() {
+            return Err(smb_status_to_io_error(reply.status, "flush"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn set_write_time(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        time: u64,
+    ) -> io::Result<()> {
+        let mut hdr = Header::new(Command::SetInfo, self.next_message_id());
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+        let packet = build_request(&hdr, |buf| encode_set_write_time(buf, file_id, time));
+        let (reply, _) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(reply.status).is_error() {
+            return Err(smb_status_to_io_error(reply.status, "set write time"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn query_file_metadata(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+    ) -> io::Result<CloseResponse> {
+        let mut hdr = Header::new(Command::QueryInfo, self.next_message_id());
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+        let packet = build_request(&hdr, |buf| encode_query_file_metadata(buf, file_id));
+        let (reply, body) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(reply.status).is_error() {
+            return Err(smb_status_to_io_error(reply.status, "query metadata"));
+        }
+        decode_query_file_metadata(&body)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid file metadata"))
     }
 
     /// Rename a file using SET_INFO with FileRenameInformation.

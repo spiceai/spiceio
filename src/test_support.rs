@@ -370,16 +370,16 @@ async fn failed_write_through_put_preserves_an_acknowledged_predecessor() {
 }
 
 #[tokio::test]
-async fn conditional_put_does_not_treat_a_failed_stat_as_absence() {
+async fn conditional_put_outside_strict_scope_never_writes() {
     let (state, mut server) = state().await;
     let state = Arc::new(state);
-    let backend = tokio::spawn(async move {
-        let request = read_frame(&mut server).await;
-        error_reply(&mut server, &request, 0xC0000022).await;
-    });
     let response = http_request(Arc::clone(&state),
         b"PUT /audit/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n").await;
-    backend.await.unwrap();
-    assert!(response.starts_with(b"HTTP/1.1 403"));
+    assert!(response.starts_with(b"HTTP/1.1 400"));
     assert!(state.writeback.pending_object("key").await.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), server.read_u8())
+            .await
+            .is_err()
+    );
 }

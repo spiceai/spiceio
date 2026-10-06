@@ -147,6 +147,7 @@ All configuration is via environment variables:
 | `SPICEIO_SPILL_BYTES`         | no       | `68719476736` (64 GiB) | Disk budget for the whole spill directory, across all instances. Clamped so at least 10 GiB stays free, and to half the space above that |
 | `SPICEIO_WRITE_BACK`          | no       | **on**              | Acknowledge PutObject from memory and write to the NAS in the background. `0`/`false`/`off` disables. **Trades durability for latency** — see [Write-back](#write-back) |
 | `SPICEIO_WRITE_BACK_BYTES`    | no       | `1073741824` (1 GiB) | Ceiling on un-flushed bytes; past it PutObject writes through synchronously, applying backpressure |
+| `SPICEIO_STRICT_PREFIXES`     | no       | disabled            | Comma-separated key prefixes with synchronous, server-coordinated writes and atomic write preconditions. `*` selects the whole bucket. Overrides write-back, immutable cache shortcuts, and the existence index for matching keys. Configure identically on every instance; see [Conditional writes](#conditional-writes) |
 
 ## OTEL metrics (Spice Cloud)
 
@@ -318,7 +319,60 @@ ListObjects without a `delimiter` walks subdirectories recursively (full S3
 semantics — `aws s3 ls --recursive` and `aws s3 sync` see every key); with
 `delimiter=/` it lists one level and reports subdirectories as common
 prefixes. spiceio's internal bookkeeping directories (`.spiceio-wal/`,
-`.spiceio-uploads/`) are hidden from listings.
+`.spiceio-uploads/`, `.spiceio-locks/`) are hidden from listings.
+
+## Conditional writes
+
+Enable a strict namespace before using write preconditions:
+
+```bash
+# Coordinate metadata updates while keeping the normal sccache fast path.
+export SPICEIO_STRICT_PREFIXES='metadata/,locks/'
+# Or use '*' for every key in the bucket.
+```
+
+For matching keys, `PutObject`, `CompleteMultipartUpload`, and destination
+`CopyObject` support `If-None-Match: *` (create only if absent) and
+`If-Match: "<etag>"` (replace only the version read). Conditions are evaluated
+at publication, after the entire body or copy has been staged and verified.
+Competing creates have exactly one winner; competing updates against an ETag
+cannot both replace that version. A failed condition returns `412
+PreconditionFailed`; a missing `If-Match` destination returns `404 NoSuchKey`.
+An uncertain rename can return `409 ConditionalRequestConflict`: read the
+current state before retrying. Invalid or duplicate validators fail with 400.
+Write conditions outside the configured prefixes also fail with 400
+`InvalidRequest`; they are never silently ignored or treated as a best-effort
+existence check. Conditional GET/HEAD remain available everywhere.
+
+All mutations in a strict prefix, **including unconditional PUT, COPY,
+multipart completion, and DELETE**, coordinate through exclusive SMB opens
+on per-key files in `.spiceio-locks/`. Publication stays on the connection
+holding that lock; a lost connection cannot reconnect and resume an unfenced
+commit. Strict writes flush the data and version reservation to the NAS and
+publish before acknowledging, even when write-back is enabled. Reads revalidate
+against the NAS even in immutable mode; the body cache can still serve a body
+whose ETag matches. Ordinary keys retain memory acknowledgment and the existing
+backend request sequence. No extra dependencies are required.
+
+ETags remain opaque size/timestamp validators. Strict writes reserve increasing
+timestamps in checksummed, durable per-key records, including across deletion,
+so equal-size writes cannot reuse an ETag on a coarse clock. A server that
+rounds timestamps may require advancing `LastModified` to the next second;
+rapid updates on such a server can put it ahead of wall-clock time. A server
+that cannot preserve the requested timestamp fails the write. A damaged
+version record fails closed. Do not remove `.spiceio-locks/`, including records
+for deleted objects, or write directly into strict prefixes through SMB.
+
+**Deployment:** drain and stop all instances before enabling or changing strict
+prefixes, then start every writer with the same configuration and this version
+of spiceio. Existing dirty spill entries must be drained first; startup refuses
+strict mode if it finds any in its spill namespace. Older instances and direct
+SMB writers do not participate in this protocol. Durability depends on the NAS
+honoring SMB FLUSH and its underlying storage guarantees.
+
+`make test-conditional` runs the two-instance NAS races, copy/multipart checks,
+and an immediate-process-death durability check. It is also part of `make ci`
+when NAS credentials are present. Stateful SMB wire tests run without a NAS.
 
 ## Crash reports & graceful shutdown
 

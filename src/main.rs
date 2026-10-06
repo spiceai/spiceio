@@ -201,7 +201,15 @@ async fn connect_share(
     let admission = pool.admission_limit();
     // Shared with the pool so capacity shrinks reduce available permits.
     let smb_slots = pool.admission();
-    let share = ShareSession::connect(pool, smb_share, cleanup_grace_secs).await?;
+    let strict_prefixes = env::var("SPICEIO_STRICT_PREFIXES").unwrap_or_default();
+    let share = ShareSession::connect(pool, smb_share, cleanup_grace_secs)
+        .await?
+        .with_strict_prefixes(&strict_prefixes)?;
+    if share.has_strict_prefixes() {
+        slog!(
+            "[spiceio] strict prefixes: {strict_prefixes} (synchronous, server-coordinated mutations)"
+        );
+    }
     let share = Arc::new(share);
     // Clean up orphaned WAL temps / stale multipart dirs from prior crashes
     // (the in-memory upload map does not survive a restart).
@@ -247,6 +255,16 @@ async fn connect_share(
         }
     }
     let object_cache = Arc::new(object_cache);
+
+    if share.has_strict_prefixes() {
+        let (dirty, _) = object_cache.spill_scan_dirty(Duration::ZERO).await;
+        if dirty.iter().any(|d| share.is_strict(&d.key)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strict prefixes contain pending spill writes; drain them with the previous configuration before enabling strict mode",
+            ));
+        }
+    }
 
     let writeback = Arc::new(WriteBack::from_env());
     if writeback.enabled() {
@@ -631,7 +649,7 @@ async fn main() {
                         let (dirty, young) = state.object_cache.spill_scan_dirty(min_age).await;
                         let dirty: Vec<_> = dirty
                             .into_iter()
-                            .filter(|d| !owned.contains(&d.key))
+                            .filter(|d| !owned.contains(&d.key) && !state.share.is_strict(&d.key))
                             .collect();
                         if !dirty.is_empty() {
                             slog!(

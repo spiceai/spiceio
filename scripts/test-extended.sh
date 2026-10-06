@@ -125,6 +125,7 @@ SPICEIO_BUCKET="$BUCKET" \
 SPICEIO_REGION="$REGION" \
 SPICEIO_SMB_CONNECTIONS="$SMB_CONNECTIONS" \
 SPICEIO_LOG_FILE="${SPICEIO_LOG_FILE:-}" \
+SPICEIO_STRICT_PREFIXES="${PREFIX}/cond-,${PREFIX}/race-" \
 "$SPICEIO_BIN" 2> >(tee "$SPICEIO_STDERR" >&2) &
 SPICEIO_PID=$!
 
@@ -341,11 +342,7 @@ assert_eq "conditional write preserved first value" "first" "$GOT"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 7. Race: N concurrent If-None-Match: * writes to the same key.
-#    Required guarantees: at least one writer wins, no request hangs (curl
-#    "000"), and every request returns *some* HTTP status. Unexpected non-
-#    {200,412} responses are tolerated up to a small budget — under heavy
-#    SMB contention a brief sharing violation can surface as a 5xx, which
-#    is observable but not a correctness regression.
+#    Exactly one writer wins; every other request must fail its precondition.
 # ════════════════════════════════════════════════════════════════════════════
 
 echo ""
@@ -379,9 +376,9 @@ if (( OTHER > 0 )); then
     printf "  other-status lines:\n%s\n" "$OTHER_LINES" | sed 's/^/    /'
 fi
 
-# Required guarantees: ≥1 winner, no hangs, every request returned a status.
-if (( WINS >= 1 && HUNG == 0 && TOTAL == CONCURRENCY )); then
-    echo "  PASS: ≥1 winner, no hangs, all ${CONCURRENCY} requests terminated"
+# Multiple successful creates are a correctness failure, even with intact data.
+if (( WINS == 1 && LOSSES == CONCURRENCY - 1 && HUNG == 0 && OTHER == 0 && TOTAL == CONCURRENCY )); then
+    echo "  PASS: exactly one winner and $LOSSES precondition failures"
     PASS=$((PASS + 1))
 else
     echo "  FAIL: invalid race outcome (wins=$WINS losses=$LOSSES hung=$HUNG other=$OTHER total=$TOTAL)"
