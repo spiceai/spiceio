@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Live conditional-write gate: independent proxies, one NAS, no SDK dependencies."""
 import concurrent.futures
-import contextlib
 import http.client
 import os
 from pathlib import Path
@@ -70,14 +69,16 @@ def main():
         assert expect(request(1, "GET", target), 200)[2] == winners[0][0]
         return winners[0][1][1]["etag"]
 
-    # ExitStack closes the logs (after the finally below) before the directory is removed.
-    with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory, contextlib.ExitStack() as log_files:
+    # The logs close (after the finally below) before the directory is removed.
+    with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory, \
+            open(Path(directory) / "proxy-0.log", "w+") as log0, \
+            open(Path(directory) / "proxy-1.log", "w+") as log1:
         try:
             for i in range(2):
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))
                     ports.append(listener.getsockname()[1])
-                log = log_files.enter_context(open(Path(directory) / f"proxy-{i}.log", "w+"))
+                log = (log0, log1)[i]
                 logs.append(log)
                 processes.append(subprocess.Popen(
                     ["./target/debug/spiceio"],
