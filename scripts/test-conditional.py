@@ -2,6 +2,7 @@
 """Live conditional-write gate: independent proxies, one NAS, no SDK dependencies."""
 import concurrent.futures
 import http.client
+import json
 import os
 from pathlib import Path
 import socket
@@ -12,12 +13,20 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
+# Strict version records are permanent, so every run reuses this fixed set of
+# keys rather than minting new ones, and a lease (taken with the strict CAS this
+# suite tests) serializes runs that share the NAS so they never interleave.
+PREFIX = "conditional-ci/"
+NAMES = ("race-0", "race-1", "race-2", "missing", "copy-source", "copy-dest", "multipart", "crash")
+LEASE_TTL = 300  # seconds a run that died without releasing keeps the keys
+LEASE_WAIT = 900  # seconds to wait for another run before failing
+
 
 def main():
     for name in ("SPICEIO_SMB_USER", "SPICEIO_SMB_PASS"):
         if not os.environ.get(name):
             raise SystemExit(f"{name} is required")
-    prefix = f"conditional-{uuid.uuid4().hex}/"
+    prefix = PREFIX
     processes, logs, ports, keys = [], [], [], set()
     bucket = "conditional"
     env = os.environ.copy()
@@ -53,6 +62,33 @@ def main():
         assert response[0] == status, (response[0], status, response[2][:1000])
         return response
 
+    def acquire_lease():
+        lease, owner = prefix + "lease", uuid.uuid4().hex
+        deadline = time.monotonic() + LEASE_WAIT
+        while True:
+            body = json.dumps({"owner": owner, "expires": time.time() + LEASE_TTL}).encode()
+            status, headers, current = request(1, "GET", lease)
+            if status == 404:
+                result = request(1, "PUT", lease, body, {"If-None-Match": "*"})
+            elif status == 200:
+                try:
+                    expires = json.loads(current).get("expires", 0)
+                except ValueError:
+                    expires = 0
+                held = expires > time.time()
+                result = (409,) if held else request(1, "PUT", lease, body, {"If-Match": headers["etag"]})
+            else:
+                result = (status,)
+            if result[0] == 200:
+                return result[1]["etag"]
+            assert time.monotonic() < deadline, f"another run still holds {lease} after {LEASE_WAIT}s"
+            time.sleep(2)
+
+    def release_lease(etag):
+        # If-Match: a run that outlived its lease must not clear the new holder's.
+        body = json.dumps({"owner": None, "expires": 0}).encode()
+        request(1, "PUT", prefix + "lease", body, {"If-Match": etag})
+
     def race(target, headers):
         barrier = threading.Barrier(16)
 
@@ -73,6 +109,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory, \
             open(Path(directory) / "proxy-0.log", "w+") as log0, \
             open(Path(directory) / "proxy-1.log", "w+") as log1:
+        lease = None
         try:
             for i in range(2):
                 with socket.socket() as listener:
@@ -96,6 +133,11 @@ def main():
                     time.sleep(0.5)
                 else:
                     raise AssertionError("proxy never became ready")
+
+            lease = acquire_lease()
+            # A run that died part way may have left objects behind.
+            for name in NAMES:
+                assert request(1, "DELETE", key(name))[0] in (204, 404), name
 
             for repetition in range(3):
                 target = key(f"race-{repetition}")
@@ -154,6 +196,12 @@ def main():
                         request(1, "DELETE", target)
                     except OSError:
                         # Best-effort cleanup; the proxy may already be shutting down.
+                        pass
+                if lease:
+                    try:
+                        release_lease(lease)
+                    except OSError:
+                        # Unreleased, the lease expires after LEASE_TTL.
                         pass
             for process in processes:
                 if process.poll() is None:
