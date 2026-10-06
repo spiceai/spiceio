@@ -1381,6 +1381,7 @@ impl ShareSession {
         let cr = self.open_copy_source_on(&client, tree_id, src_path).await?;
         let mut file_id = cr.file_id;
         let file_size = cr.file_size;
+        let last_write_time = cr.last_write_time;
 
         if let Some(expected) = expected_size
             && file_size != expected
@@ -1448,10 +1449,15 @@ impl ShareSession {
                     let _ = client.close(tree_id, &file_id).await;
                     let (c, t) = self.pick_live().await;
                     match self.open_copy_source_on(&c, t, src_path).await {
-                        // Refuse to splice if the part changed underneath us
-                        // (size differs) — we must not assemble bytes from a
-                        // different version of the file.
-                        Ok(ncr) if ncr.file_size == file_size => {
+                        // Refuse to splice if the source changed underneath
+                        // us — we must not assemble bytes from a different
+                        // version. Size alone cannot tell: an equal-size
+                        // replacement moves only LastWriteTime, the other
+                        // half of the ETag (and strict writes always move it).
+                        Ok(ncr)
+                            if ncr.file_size == file_size
+                                && ncr.last_write_time == last_write_time =>
+                        {
                             client = c;
                             tree_id = t;
                             file_id = ncr.file_id;
@@ -1459,8 +1465,9 @@ impl ShareSession {
                         Ok(ncr) => {
                             let _ = c.close(t, &ncr.file_id).await;
                             break 'read Err(io::Error::other(format!(
-                                "source '{src_path}' changed mid-stream: size {file_size} -> {}",
-                                ncr.file_size
+                                "source '{src_path}' changed mid-stream: version {} -> {}",
+                                etag_for(file_size, last_write_time),
+                                etag_for(ncr.file_size, ncr.last_write_time)
                             )));
                         }
                         Err(ce) => break 'read Err(ce),
