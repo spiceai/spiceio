@@ -7,6 +7,10 @@ pub enum WriteCondition {
     #[default]
     None,
     Absent,
+    /// `If-Match: *`: any current version. Only the unquoted wildcard.
+    Exists,
+    /// `If-Match: "<etag>"`: exactly this version. A quoted `"*"` is an
+    /// ordinary entity tag here, not the wildcard.
     Match(String),
 }
 
@@ -38,12 +42,10 @@ impl From<ConditionFailure> for io::Error {
 impl WriteCondition {
     pub fn check(&self, etag: Option<&str>) -> io::Result<()> {
         match (self, etag) {
-            (Self::None | Self::Absent, None) | (Self::None, Some(_)) => Ok(()),
+            (Self::None | Self::Absent, None) | (Self::None | Self::Exists, Some(_)) => Ok(()),
             (Self::Absent, Some(_)) => Err(ConditionFailure::PreconditionFailed.into()),
-            (Self::Match(_), None) => Err(ConditionFailure::NoSuchKey.into()),
-            (Self::Match(expected), Some(actual)) if expected == "*" || expected == actual => {
-                Ok(())
-            }
+            (Self::Exists | Self::Match(_), None) => Err(ConditionFailure::NoSuchKey.into()),
+            (Self::Match(expected), Some(actual)) if expected == actual => Ok(()),
             (Self::Match(_), Some(_)) => Err(ConditionFailure::PreconditionFailed.into()),
         }
     }
@@ -64,6 +66,20 @@ mod tests {
         assert_eq!(
             e.get_ref().unwrap().downcast_ref(),
             Some(&ConditionFailure::NoSuchKey)
+        );
+    }
+
+    #[test]
+    fn only_the_unquoted_wildcard_matches_any_version() {
+        assert!(WriteCondition::Exists.check(Some("v1")).is_ok());
+        assert!(WriteCondition::Exists.check(None).is_err());
+        // A quoted "*" is an entity tag that no real version carries.
+        let e = WriteCondition::Match("*".into())
+            .check(Some("v1"))
+            .unwrap_err();
+        assert_eq!(
+            e.get_ref().unwrap().downcast_ref(),
+            Some(&ConditionFailure::PreconditionFailed)
         );
     }
 }

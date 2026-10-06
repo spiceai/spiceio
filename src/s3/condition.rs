@@ -22,6 +22,7 @@ pub(super) fn parse(headers: &http::HeaderMap) -> Result<WriteCondition, &'stati
         (None, Some("*")) => Ok(WriteCondition::Absent),
         (None, Some(_)) => Err("If-None-Match must be * for a write"),
         (Some(_), Some(_)) => Err("Specify only one write precondition"),
+        (Some("*"), None) => Ok(WriteCondition::Exists),
         (Some(tag), None) => {
             if tag.starts_with("W/") || tag.contains(',') || tag.is_empty() {
                 return Err("If-Match requires one strong ETag");
@@ -56,6 +57,11 @@ mod tests {
         }
         headers.insert("if-match", HeaderValue::from_static("\"v1\""));
         assert_eq!(parse(&headers).unwrap(), WriteCondition::Match("v1".into()));
+        // Only the bare `*` is the wildcard; a quoted "*" is an exact tag.
+        headers.insert("if-match", HeaderValue::from_static("*"));
+        assert_eq!(parse(&headers).unwrap(), WriteCondition::Exists);
+        headers.insert("if-match", HeaderValue::from_static("\"*\""));
+        assert_eq!(parse(&headers).unwrap(), WriteCondition::Match("*".into()));
         headers.append("if-match", HeaderValue::from_static("\"v2\""));
         assert!(parse(&headers).is_err());
         headers.clear();

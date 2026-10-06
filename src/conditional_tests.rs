@@ -743,7 +743,7 @@ async fn lost_lock_connection_never_retries_publication_on_a_new_session() {
     nas.lock().unwrap().disconnect_on_rename = true;
     let error = a
         .share
-        .put_object_conditional("strict/key", b"new", &WriteCondition::Match("*".into()))
+        .put_object_conditional("strict/key", b"new", &WriteCondition::Exists)
         .await
         .unwrap_err();
     assert_eq!(
