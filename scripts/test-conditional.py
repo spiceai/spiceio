@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 # suite tests) serializes runs that share the NAS so they never interleave.
 PREFIX = "conditional-ci/"
 NAMES = ("race-0", "race-1", "race-2", "missing", "copy-source", "copy-dest", "multipart", "crash")
-LEASE_TTL = 300  # seconds a run that died without releasing keeps the keys
+LEASE_TTL = 300  # seconds an unrenewed lease lasts, e.g. after its run died
 LEASE_WAIT = 900  # seconds to wait for another run before failing
 
 
@@ -58,36 +58,58 @@ def main():
         keys.add(value)
         return value
 
+    lease_key, owner = prefix + "lease", uuid.uuid4().hex
+    lease = {"etag": None, "lost": False}
+    stop_renewing = threading.Event()
+
     def expect(response, status):
+        # Every step also proves the keys are still this run's alone.
+        assert not lease["lost"], f"lost {lease_key}; another run may be using the keys"
         assert response[0] == status, (response[0], status, response[2][:1000])
         return response
 
+    def lease_body(expires):
+        return json.dumps({"owner": owner, "expires": expires}).encode()
+
     def acquire_lease():
-        lease, owner = prefix + "lease", uuid.uuid4().hex
         deadline = time.monotonic() + LEASE_WAIT
         while True:
-            body = json.dumps({"owner": owner, "expires": time.time() + LEASE_TTL}).encode()
-            status, headers, current = request(1, "GET", lease)
+            body = lease_body(time.time() + LEASE_TTL)
+            status, headers, current = request(1, "GET", lease_key)
             if status == 404:
-                result = request(1, "PUT", lease, body, {"If-None-Match": "*"})
+                result = request(1, "PUT", lease_key, body, {"If-None-Match": "*"})
             elif status == 200:
                 try:
                     expires = json.loads(current).get("expires", 0)
                 except ValueError:
                     expires = 0
                 held = expires > time.time()
-                result = (409,) if held else request(1, "PUT", lease, body, {"If-Match": headers["etag"]})
+                result = (409,) if held else request(1, "PUT", lease_key, body, {"If-Match": headers["etag"]})
             else:
                 result = (status,)
             if result[0] == 200:
-                return result[1]["etag"]
-            assert time.monotonic() < deadline, f"another run still holds {lease} after {LEASE_WAIT}s"
+                lease["etag"] = result[1]["etag"]
+                return
+            assert time.monotonic() < deadline, f"another run still holds {lease_key} after {LEASE_WAIT}s"
             time.sleep(2)
 
-    def release_lease(etag):
+    def renew_lease():
+        # Renew well inside the TTL: a step may wait out a whole HTTP timeout,
+        # and a slow but healthy run must not lose its keys to the next one.
+        while not stop_renewing.wait(LEASE_TTL / 5):
+            try:
+                result = request(1, "PUT", lease_key, lease_body(time.time() + LEASE_TTL),
+                                 {"If-Match": lease["etag"]})
+            except OSError:
+                continue  # Retried at the next interval, long before the lease lapses.
+            if result[0] != 200:
+                lease["lost"] = True
+                return
+            lease["etag"] = result[1]["etag"]
+
+    def release_lease():
         # If-Match: a run that outlived its lease must not clear the new holder's.
-        body = json.dumps({"owner": None, "expires": 0}).encode()
-        request(1, "PUT", prefix + "lease", body, {"If-Match": etag})
+        request(1, "PUT", lease_key, lease_body(0), {"If-Match": lease["etag"]})
 
     def race(target, headers):
         barrier = threading.Barrier(16)
@@ -109,7 +131,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory, \
             open(Path(directory) / "proxy-0.log", "w+") as log0, \
             open(Path(directory) / "proxy-1.log", "w+") as log1:
-        lease = None
+        renewer = threading.Thread(target=renew_lease, daemon=True)
         try:
             for i in range(2):
                 with socket.socket() as listener:
@@ -134,7 +156,8 @@ def main():
                 else:
                     raise AssertionError("proxy never became ready")
 
-            lease = acquire_lease()
+            acquire_lease()
+            renewer.start()
             # A run that died part way may have left objects behind.
             for name in NAMES:
                 assert request(1, "DELETE", key(name))[0] in (204, 404), name
@@ -190,6 +213,9 @@ def main():
                 print(log.read()[-16000:])
             raise
         finally:
+            stop_renewing.set()
+            if renewer.is_alive():
+                renewer.join(timeout=70)
             if len(processes) == 2 and processes[1].poll() is None:
                 for target in keys:
                     try:
@@ -197,9 +223,9 @@ def main():
                     except OSError:
                         # Best-effort cleanup; the proxy may already be shutting down.
                         pass
-                if lease:
+                if lease["etag"]:
                     try:
-                        release_lease(lease)
+                        release_lease()
                     except OSError:
                         # Unreleased, the lease expires after LEASE_TTL.
                         pass
