@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod condition;
 pub mod ops;
 pub mod pool;
 pub mod protocol;

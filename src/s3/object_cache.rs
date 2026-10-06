@@ -240,12 +240,23 @@ impl ObjectCache {
         if size == 0 || size > self.max_object_bytes {
             return None;
         }
-        self.fill_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(size)
-                    .filter(|&total| total <= self.max_bytes)
-            })
-            .ok()?;
+        // Explicit CAS loop: `fetch_update` is deprecated on current stable
+        // and its `try_update` replacement is not available on older ones.
+        let mut used = self.fill_bytes.load(Ordering::Relaxed);
+        loop {
+            let total = used
+                .checked_add(size)
+                .filter(|&total| total <= self.max_bytes)?;
+            match self.fill_bytes.compare_exchange_weak(
+                used,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
         Some(CacheFill {
             bytes: Arc::clone(&self.fill_bytes),
             size,
@@ -520,6 +531,17 @@ impl ObjectCache {
         tokio::task::spawn_blocking(move || spill.scan_dirty(min_age))
             .await
             .unwrap_or_default()
+    }
+
+    /// Every pending write's key, whatever its size (`Spill::audit_dirty_keys`).
+    pub async fn spill_audit_dirty_keys(&self) -> std::io::Result<Vec<String>> {
+        let Some(spill) = self.spill.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let spill = Arc::clone(spill);
+        tokio::task::spawn_blocking(move || spill.audit_dirty_keys())
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     /// Load at most one recovery body, after excluding entries owned by live

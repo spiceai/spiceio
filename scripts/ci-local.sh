@@ -29,7 +29,7 @@ for arg in "$@"; do
         -h|--help)
             echo "Usage: $0 [--live-only]"
             echo "  (default)  lint + unit + build + live SMB suites"
-            echo "  --live-only  only the three CI live scripts (assumes binary built)"
+            echo "  --live-only  only the five CI live suites (assumes binary built)"
             exit 0
             ;;
         *)
@@ -82,6 +82,9 @@ run_live_suites() {
         ./scripts/test-extended.sh
     )
 
+    step "two-instance conditional writes (scripts/test-conditional.py)"
+    python3 scripts/test-conditional.py
+
     step "write-back + disk spill (scripts/test-writeback.sh)"
     (
         export SPICEIO_BUCKET=writeback
@@ -123,7 +126,7 @@ elif [[ "$CI_REQUIRE_LIVE" == "1" || "$LIVE_ONLY" -eq 1 ]]; then
     echo ""
     echo "ci-local: FAIL — live suites required but SPICEIO_SMB_USER/PASS are not set."
     echo "  Export credentials (or source /tmp/spiceio-bench-env.sh) and re-run."
-    echo "  Live suites (test-sccache / test-extended / test-writeback / stress-concurrent) are what"
+    echo "  Live suites (test-sccache / test-extended / test-conditional / test-writeback / stress-concurrent) are what"
     echo "  CI runs; skipping them is how sccache write-error failures ship."
     exit 1
 else

@@ -79,8 +79,8 @@ client and the network. Off by default and free when off.
 ### PR / agent verification gate (do not skip)
 
 **`make lint` alone is not enough** to claim CI will pass. CI also runs unit tests
-and four live SMB suites (`test-sccache.sh`, `test-extended.sh`,
-`test-writeback.sh`, `stress-concurrent.sh`) against the shared NAS.
+and five live SMB suites (`test-sccache.sh`, `test-extended.sh`,
+`test-conditional.py`, `test-writeback.sh`, `stress-concurrent.sh`) against the shared NAS.
 
 Before declaring a PR green when NAS credentials are available:
 
@@ -141,6 +141,7 @@ The binary requires these environment variables:
 - `SPICEIO_SPILL_BYTES` — disk budget for the whole spill directory, across all instances (default `68719476736` = **64 GiB**)
 - `SPICEIO_WRITE_BACK` — acknowledge PutObject from memory and write to the NAS in the background (**on by default**; `0`/`false`/`off` disables). **Trades durability for latency**: a crash between the 200 and the background write loses that object (recoverable once it reaches the spill, which is where the flusher puts it first). Measured 2.6–6.7× end to end on a put-then-read sweep. Right for a cache backend, wrong for a system of record
 - `SPICEIO_WRITE_BACK_BYTES` — ceiling on un-flushed bytes before PutObject writes through synchronously (default `1073741824` = 1 GiB). This is the backpressure a backlogged NAS applies to clients
+- `SPICEIO_STRICT_PREFIXES` — comma-separated key prefixes for atomic conditional writes; `*` selects the whole bucket, unset disables. All writes and deletes in these prefixes coordinate through exclusive SMB opens, and writes commit synchronously with SMB FLUSH. GET/HEAD bypass immutable/existence shortcuts. Configure identically on every writer after draining the previous configuration. Conditions outside these prefixes fail explicitly. See README.md, Conditional writes.
 - `SPICEIO_IMMUTABLE_OBJECTS` — when `1`/`true`, serve a cached body by key with **no backend round trip at all** (content-addressed stores like sccache, where the key is a hash of the bytes). Default off (etag-revalidated, which still costs one SMB open per hit). Trades noticing a backend-side delete for the round trip — harmless for a cache, wrong for a mutable namespace. Also enables the existence index unless `SPICEIO_EXISTENCE_INDEX` overrides
 - `SPICEIO_EXISTENCE_INDEX` — lazy per-directory name set for fast 404s (one SMB list of the parent, then missing leaves 404 with no open). Default follows immutable. A peer PUT of an unlisted name 404s until the next list or a local PUT — same cache contract as immutable
 - `SPICEIO_EXISTENCE_INDEX_TTL_SECS` — completeness TTL for a listed directory (default `0` = until local PUT/DELETE)
@@ -166,6 +167,8 @@ The codebase has these modules:
 **Request flow:** HTTP request → `s3::router::handle_request` → S3 operation → `smb::ops::ShareSession` method → `smb::client::SmbClient` wire operations → TCP to SMB server.
 
 ## Key design decisions
+
+- Conditional writes use a separate strict path so cache traffic keeps its existing backend request sequence. Strict PUT, destination COPY, and multipart completion check conditions under a server-held per-key lock immediately before publication; unconditional mutations in those prefixes use the same lock. Never reconnect and resume a commit after losing that lock's connection. Permanent, checksummed `.spiceio-locks/` records reserve increasing ETag timestamps before publication, including across deletion. Do not delete these records or expose their namespace through S3. `scripts/test-conditional.py` requires exactly one successful competing create/CAS across two instances and verifies success survives immediate process death.
 
 - Zero external crypto dependencies — all crypto goes through `crypto::ffi` to CommonCrypto.
 - No `async-trait` — the SMB client uses `tokio::sync::Mutex` around the TCP stream with manual `async` methods.

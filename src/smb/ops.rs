@@ -10,8 +10,11 @@ use bytes::Bytes;
 use tokio::sync::RwLock;
 
 use super::client::{SmbClient, is_missing_name};
+use super::condition::WriteCondition;
 use super::pool::SmbPool;
 use super::protocol::*;
+
+mod strict;
 
 /// Max times a single op rides the back-off ladder on transient resets before
 /// giving up — enough halving steps (4 MiB → 64 KiB) plus headroom, while still
@@ -83,6 +86,7 @@ pub struct ShareSession {
     /// processes have independent locks; `PublicationRetry` covers their
     /// transient missing-name responses.
     publications: Arc<Mutex<HashMap<String, Weak<RwLock<()>>>>>,
+    strict_prefixes: Arc<Vec<String>>,
 }
 
 /// An open file handle for streaming reads or writes.
@@ -116,6 +120,7 @@ impl ShareSession {
             cleanup_grace_ft: cleanup_grace_secs.saturating_mul(FILETIME_TICKS_PER_SEC),
             ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
             publications: Arc::default(),
+            strict_prefixes: Arc::default(),
         })
     }
 
@@ -198,9 +203,11 @@ impl ShareSession {
         let smb_path = to_smb_path(key);
         let _publication = self.publication(&smb_path).read_owned().await;
         let (cr, data) = self
-            .retry_read_open(|client, tree_id| {
-                let smb_path = smb_path.clone();
-                async move { client.create_read_close(tree_id, &smb_path, max_read).await }
+            .strict_read(&smb_path, || {
+                self.retry_read_open(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    async move { client.create_read_close(tree_id, &smb_path, max_read).await }
+                })
             })
             .await?;
 
@@ -225,21 +232,23 @@ impl ShareSession {
         // initial open of a streaming GET isn't lost (the client may not retry).
         // Missing leaf names have a separate, bounded publication retry.
         let (client, tree_id, file) = self
-            .retry_read_open(|client, tree_id| {
-                let smb_path = smb_path.clone();
-                async move {
-                    let file = client
-                        .create(
-                            tree_id,
-                            &smb_path,
-                            DesiredAccess::GenericRead as u32,
-                            ShareAccess::All as u32,
-                            CreateDisposition::Open as u32,
-                            CreateOptions::NonDirectoryFile as u32,
-                        )
-                        .await?;
-                    Ok((client, tree_id, file))
-                }
+            .strict_read(&smb_path, || {
+                self.retry_read_open(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    async move {
+                        let file = client
+                            .create(
+                                tree_id,
+                                &smb_path,
+                                DesiredAccess::GenericRead as u32,
+                                ShareAccess::All as u32,
+                                CreateDisposition::Open as u32,
+                                CreateOptions::NonDirectoryFile as u32,
+                            )
+                            .await?;
+                        Ok((client, tree_id, file))
+                    }
+                })
             })
             .await?;
 
@@ -392,6 +401,9 @@ impl ShareSession {
     /// to answer later missing-leaf GETs/HEADs without an SMB open. A missing
     /// directory is an empty complete listing, not an error.
     pub async fn list_dir_file_names(&self, dir_key: &str) -> io::Result<HashSet<String>> {
+        if Self::reserved_key(dir_key) {
+            return Ok(HashSet::new());
+        }
         let (client, tree_id) = self.pick();
         let dir_path = to_smb_path(dir_key.trim_end_matches('/'));
         let dir = match client
@@ -417,8 +429,7 @@ impl ShareSession {
             if entry.is_directory() {
                 continue;
             }
-            if dir_path.is_empty() && (entry.file_name == WAL_DIR || entry.file_name == UPLOADS_DIR)
-            {
+            if dir_path.is_empty() && is_bookkeeping_dir(&entry.file_name) {
                 continue;
             }
             names.insert(entry.file_name);
@@ -438,8 +449,17 @@ impl ShareSession {
         const MAX_LIST_ENTRIES: usize = 1_000_000;
 
         let (client, tree_id) = self.pick();
+        if Self::reserved_key(prefix) {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let smb_path = to_smb_path(prefix);
         let (dir_path, pattern) = split_dir_pattern(&smb_path);
+        // A parent alias in the directory part lets the server resolve the
+        // listing outside the prefix, including into the reserved namespace.
+        // (The pattern part cannot: `.` and `..` entries are never returned.)
+        if dir_path.split('\\').any(Self::is_parent_alias) {
+            return Ok((Vec::new(), Vec::new()));
+        }
 
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
@@ -506,7 +526,7 @@ impl ShareSession {
                 // part files as objects.
                 if dir_path.is_empty()
                     && entry.is_directory()
-                    && (entry.file_name == WAL_DIR || entry.file_name == UPLOADS_DIR)
+                    && is_bookkeeping_dir(&entry.file_name)
                 {
                     continue;
                 }
@@ -553,16 +573,26 @@ impl ShareSession {
     /// fails, which is defensible while a client is still waiting on the
     /// result and is not once the client has already been told it succeeded.
     pub async fn put_object_atomic(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
+        self.put_object_conditional(key, data, &WriteCondition::None)
+            .await
+    }
+
+    pub async fn put_object_conditional(
+        &self,
+        key: &str,
+        data: &[u8],
+        condition: &WriteCondition,
+    ) -> io::Result<ObjectMeta> {
         if data.len() <= self.pool.compound_max_write_size as usize {
             let (wal, meta) = self.open_wal_write_initial(key, Some(data)).await?;
-            return wal.commit_with_meta(self, meta).await;
+            return wal.commit_with_meta(self, meta, condition).await;
         }
         let mut wal = self.open_wal_write(key).await?;
         if let Err(e) = wal.write(data).await {
             wal.abort().await;
             return Err(e);
         }
-        wal.commit(self).await
+        wal.commit_conditional(self, condition).await
     }
 
     /// Put object (write file). Uses compound Create+Write+Close for small
@@ -573,6 +603,9 @@ impl ShareSession {
     /// many small artifact PUTs of a multi-client build must not burn the
     /// client's thin retry budget on a single dropped NAS session.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> io::Result<ObjectMeta> {
+        if self.is_strict(key) {
+            return self.put_object_atomic(key, data).await;
+        }
         let smb_path = to_smb_path(key);
         let compound_max = self.pool.compound_max_write_size as usize;
         let content_type = guess_content_type(key);
@@ -672,6 +705,17 @@ impl ShareSession {
     /// surface as a hard failure to the client.
     pub async fn delete_object(&self, key: &str) -> io::Result<()> {
         let smb_path = to_smb_path(key);
+        if self.is_strict(key) {
+            let (client, tree_id) = self.pick_live().await;
+            let guard = self.strict_lock(&client, tree_id, &smb_path).await?;
+            let result = async {
+                guard.reserve_current(&smb_path).await?;
+                Self::delete_object_checked_on(&client, tree_id, &smb_path).await
+            }
+            .await;
+            guard.release().await?;
+            return result;
+        }
         self.retry_write_op(&[], |client, tree_id| {
             let smb_path = smb_path.clone();
             async move {
@@ -701,20 +745,22 @@ impl ShareSession {
         let smb_path = to_smb_path(key);
         let _publication = self.publication(&smb_path).read_owned().await;
         let (cr, _) = self
-            .retry_read_open(|client, tree_id| {
-                let smb_path = smb_path.clone();
-                async move {
-                    client
-                        .create_close(
-                            tree_id,
-                            &smb_path,
-                            DesiredAccess::ReadAttributes as u32,
-                            ShareAccess::All as u32,
-                            CreateDisposition::Open as u32,
-                            CreateOptions::NonDirectoryFile as u32,
-                        )
-                        .await
-                }
+            .strict_read(&smb_path, || {
+                self.retry_read_open(|client, tree_id| {
+                    let smb_path = smb_path.clone();
+                    async move {
+                        client
+                            .create_close(
+                                tree_id,
+                                &smb_path,
+                                DesiredAccess::ReadAttributes as u32,
+                                ShareAccess::All as u32,
+                                CreateDisposition::Open as u32,
+                                CreateOptions::NonDirectoryFile as u32,
+                            )
+                            .await
+                    }
+                })
             })
             .await?;
 
@@ -735,6 +781,16 @@ impl ShareSession {
     /// copy leaves an existing destination object untouched instead of
     /// truncated or deleted.
     pub async fn copy_object(&self, src_key: &str, dst_key: &str) -> io::Result<ObjectMeta> {
+        self.copy_object_conditional(src_key, dst_key, &WriteCondition::None)
+            .await
+    }
+
+    pub async fn copy_object_conditional(
+        &self,
+        src_key: &str,
+        dst_key: &str,
+        condition: &WriteCondition,
+    ) -> io::Result<ObjectMeta> {
         let src_path = to_smb_path(src_key);
         let mut wal = self.open_wal_write(dst_key).await?;
 
@@ -768,7 +824,7 @@ impl ShareSession {
             }
         }
 
-        let meta = wal.commit(self).await?;
+        let meta = wal.commit_conditional(self, condition).await?;
         Ok(ObjectMeta {
             content_type: guess_content_type(dst_key),
             ..meta
@@ -1014,6 +1070,16 @@ impl ShareSession {
     /// client's key, and "delete it again" is both racy against a concurrent
     /// writer and not a rollback.
     pub async fn assemble_parts(&self, key: &str, parts: &[(&str, u64)]) -> io::Result<ObjectMeta> {
+        self.assemble_parts_conditional(key, parts, &WriteCondition::None)
+            .await
+    }
+
+    pub async fn assemble_parts_conditional(
+        &self,
+        key: &str,
+        parts: &[(&str, u64)],
+        condition: &WriteCondition,
+    ) -> io::Result<ObjectMeta> {
         let mut wal = self.open_wal_write(key).await?;
 
         // Guard before the per-part `remaining.div_ceil(max_read as u64)` in
@@ -1056,7 +1122,7 @@ impl ShareSession {
             }
         }
 
-        wal.commit(self).await
+        wal.commit_conditional(self, condition).await
     }
 
     /// Stream one source file (a multipart part, or a copy source) into the
@@ -1309,6 +1375,7 @@ impl ShareSession {
         let cr = self.open_copy_source_on(&client, tree_id, src_path).await?;
         let mut file_id = cr.file_id;
         let file_size = cr.file_size;
+        let last_write_time = cr.last_write_time;
 
         if let Some(expected) = expected_size
             && file_size != expected
@@ -1376,10 +1443,15 @@ impl ShareSession {
                     let _ = client.close(tree_id, &file_id).await;
                     let (c, t) = self.pick_live().await;
                     match self.open_copy_source_on(&c, t, src_path).await {
-                        // Refuse to splice if the part changed underneath us
-                        // (size differs) — we must not assemble bytes from a
-                        // different version of the file.
-                        Ok(ncr) if ncr.file_size == file_size => {
+                        // Refuse to splice if the source changed underneath
+                        // us — we must not assemble bytes from a different
+                        // version. Size alone cannot tell: an equal-size
+                        // replacement moves only LastWriteTime, the other
+                        // half of the ETag (and strict writes always move it).
+                        Ok(ncr)
+                            if ncr.file_size == file_size
+                                && ncr.last_write_time == last_write_time =>
+                        {
                             client = c;
                             tree_id = t;
                             file_id = ncr.file_id;
@@ -1387,8 +1459,9 @@ impl ShareSession {
                         Ok(ncr) => {
                             let _ = c.close(t, &ncr.file_id).await;
                             break 'read Err(io::Error::other(format!(
-                                "source '{src_path}' changed mid-stream: size {file_size} -> {}",
-                                ncr.file_size
+                                "source '{src_path}' changed mid-stream: version {} -> {}",
+                                etag_for(file_size, last_write_time),
+                                etag_for(ncr.file_size, ncr.last_write_time)
                             )));
                         }
                         Err(ce) => break 'read Err(ce),
@@ -1412,23 +1485,26 @@ impl ShareSession {
         smb_path: &str,
     ) -> io::Result<CreateResponse> {
         let _publication = self.publication(smb_path).read_owned().await;
-        let mut publication = PublicationRetry::default();
-        loop {
-            let result = client
-                .create(
-                    tree_id,
-                    smb_path,
-                    DesiredAccess::GenericRead as u32,
-                    ShareAccess::All as u32,
-                    CreateDisposition::Open as u32,
-                    CreateOptions::NonDirectoryFile as u32,
-                )
-                .await;
-            match result {
-                Err(e) if publication.retry(&e).await => continue,
-                result => return result,
+        self.strict_read(smb_path, || async move {
+            let mut publication = PublicationRetry::default();
+            loop {
+                let result = client
+                    .create(
+                        tree_id,
+                        smb_path,
+                        DesiredAccess::GenericRead as u32,
+                        ShareAccess::All as u32,
+                        CreateDisposition::Open as u32,
+                        CreateOptions::NonDirectoryFile as u32,
+                    )
+                    .await;
+                match result {
+                    Err(e) if publication.retry(&e).await => continue,
+                    result => return result,
+                }
             }
-        }
+        })
+        .await
     }
 
     /// Delete a temp file (best effort).
@@ -1454,6 +1530,27 @@ impl ShareSession {
             )
             .await?;
         Ok(())
+    }
+
+    /// Delete where the result must be exact (strict prefixes). DELETE_ON_CLOSE
+    /// deletes at CLOSE, so the CLOSE status decides. CREATE and CLOSE stay
+    /// in one compound: cancellation cannot strand an open delete handle.
+    async fn delete_object_checked_on(
+        client: &SmbClient,
+        tree_id: u32,
+        smb_path: &str,
+    ) -> io::Result<()> {
+        client
+            .create_close_checked(
+                tree_id,
+                smb_path,
+                DesiredAccess::Delete as u32,
+                ShareAccess::Delete as u32,
+                CreateDisposition::Open as u32,
+                CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Try to remove an empty directory (best effort). Compound Create+Close.
@@ -1526,7 +1623,7 @@ impl ShareSession {
                     .create(
                         tree_id,
                         &wal_path,
-                        DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                        WAL_TEMP_ACCESS,
                         ShareAccess::Read as u32,
                         CreateDisposition::OverwriteIf as u32,
                         CreateOptions::NonDirectoryFile as u32,
@@ -2095,8 +2192,24 @@ impl FileHandle {
 /// Directory on the SMB share where WAL temp files are stored.
 const WAL_DIR: &str = ".spiceio-wal";
 
+/// Desired access for a WAL temp handle, on its first open and on every reopen
+/// after a reset. Read attributes: strict commits query the temp's metadata
+/// through whichever handle the writer holds at publication, and GENERIC_WRITE
+/// does not grant it.
+const WAL_TEMP_ACCESS: u32 = DesiredAccess::GenericWrite as u32
+    | DesiredAccess::Delete as u32
+    | DesiredAccess::ReadAttributes as u32;
+
 /// Directory on the SMB share where multipart upload parts are stored.
 const UPLOADS_DIR: &str = ".spiceio-uploads";
+
+/// spiceio's own directories at the share root. SMB lookups ignore case and
+/// keep the creator's casing, so `.SPICEIO-LOCKS` is the lock directory too.
+fn is_bookkeeping_dir(name: &str) -> bool {
+    [WAL_DIR, UPLOADS_DIR, strict::LOCK_DIR]
+        .iter()
+        .any(|dir| name.eq_ignore_ascii_case(dir))
+}
 
 /// Default grace period, in seconds, before startup cleanup will remove a WAL
 /// temp file or a multipart upload directory. Overridable via
@@ -2524,7 +2637,7 @@ impl WalWriter {
             .create(
                 tree_id,
                 &self.wal_path,
-                DesiredAccess::GenericWrite as u32 | DesiredAccess::Delete as u32,
+                WAL_TEMP_ACCESS,
                 // Same share mode as the original open (see `open_wal_write`).
                 ShareAccess::Read as u32,
                 CreateDisposition::Open as u32,
@@ -2540,13 +2653,23 @@ impl WalWriter {
     /// Flush remaining data, verify the temp, then rename it to the final path.
     /// Returns the object's metadata.
     pub async fn commit(self, share: &ShareSession) -> io::Result<ObjectMeta> {
-        self.commit_with_meta(share, None).await
+        self.commit_with_meta(share, None, &WriteCondition::None)
+            .await
+    }
+
+    pub async fn commit_conditional(
+        self,
+        share: &ShareSession,
+        condition: &WriteCondition,
+    ) -> io::Result<ObjectMeta> {
+        self.commit_with_meta(share, None, condition).await
     }
 
     async fn commit_with_meta(
         mut self,
         share: &ShareSession,
         verified_meta: Option<ObjectMeta>,
+        condition: &WriteCondition,
     ) -> io::Result<ObjectMeta> {
         // Flush all buffered data (windowed retry inside flush). On
         // unrecoverable failure, close the handle and best-effort delete the
@@ -2603,6 +2726,18 @@ impl WalWriter {
         // Keep opens/stats out of the server's replacement interval, including
         // the final close. Existing streaming handles remain free to drain.
         let _publication = share.publication(&self.final_path).write_owned().await;
+
+        if share.is_strict(&self.final_path) {
+            return self.commit_strict(share, meta, condition).await;
+        }
+        // Never downgrade a requested precondition, even for non-HTTP callers.
+        if *condition != WriteCondition::None {
+            self.discard_temp().await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "conditional writes require a strict prefix",
+            ));
+        }
 
         // The temp is verified — publish it. The rename retries on a transient
         // reset by reconnecting and re-opening the temp file (which still
@@ -2680,8 +2815,9 @@ impl WalWriter {
     }
 
     /// Close the current handle and best-effort delete the WAL temp file.
-    async fn discard_temp(&self) {
-        let _ = self.client.close(self.tree_id, &self.file_id).await;
+    /// Close and delete the temp. Returns whether the CLOSE succeeded.
+    async fn discard_temp(&self) -> bool {
+        let closed = self.client.close(self.tree_id, &self.file_id).await.is_ok();
         let _ = self
             .client
             .create_close(
@@ -2693,6 +2829,7 @@ impl WalWriter {
                 CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
             .await;
+        closed
     }
 
     /// Abort the WAL write — close and delete the temp file.
@@ -2836,6 +2973,7 @@ impl ShareSession {
             cleanup_grace_ft: 0,
             ensured_dirs: Arc::new(Mutex::new(HashSet::new())),
             publications: Arc::default(),
+            strict_prefixes: Arc::default(),
         }
     }
 }
@@ -3710,6 +3848,108 @@ mod regression_publication {
         drop(writer);
         copy.await.unwrap();
         backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reopened_wal_temp_can_still_query_its_metadata() {
+        // A strict commit queries the temp's metadata through whichever handle
+        // the writer holds, including one reopened after a mid-stream reset. A
+        // real server denies that QUERY_INFO without read-attributes access.
+        let (client, mut server) = pair().await;
+        let pool = SmbPool::test_from_client(client.clone());
+        let mut wal = verified_wal(client, pool);
+        let backend = tokio::spawn(async move {
+            let close = read_frame(&mut server).await;
+            assert_eq!(
+                Header::decode(&close).unwrap().command,
+                Command::Close as u16
+            );
+            error_reply(&mut server, &close, 0).await;
+            let open = read_frame(&mut server).await;
+            let parts = parse_compound_response(&Bytes::copy_from_slice(&open));
+            assert_eq!(parts[0].0.command, Command::Create as u16);
+            compound_reply(&mut server, &open, &[(0, create_body(4))]).await;
+            u32::from_le_bytes(parts[0].1[24..28].try_into().unwrap())
+        });
+        wal.reopen().await.unwrap();
+        let access = backend.await.unwrap();
+        assert_ne!(access & DesiredAccess::ReadAttributes as u32, 0);
+        assert_ne!(
+            access & DesiredAccess::Delete as u32,
+            0,
+            "rename needs DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_never_opens_a_directory_through_a_parent_alias() {
+        // `safe/../.spiceio-locks/` passes the reserved-namespace check by its
+        // first segment, and a server resolves the `..`. The fake server never
+        // answers, so a listing that sent any request would time out.
+        let (client, _server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+        for prefix in [
+            "safe/../.spiceio-locks/",
+            "safe/.../x/",
+            "a/.. /b/c",
+            "a\\..\\b\\",
+        ] {
+            let listing =
+                tokio::time::timeout(Duration::from_secs(5), share.list_objects(prefix, None))
+                    .await
+                    .unwrap_or_else(|_| panic!("{prefix}: listing reached the server"))
+                    .unwrap();
+            assert!(listing.0.is_empty() && listing.1.is_empty(), "{prefix}");
+        }
+    }
+
+    fn directory_entry(name: &str, last: bool) -> Vec<u8> {
+        // FileIdBothDirectoryInformation, flagged as a directory.
+        let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let len = (104 + name.len()).next_multiple_of(8);
+        let mut entry = vec![0u8; len];
+        if !last {
+            entry[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        }
+        entry[56..60].copy_from_slice(&0x10u32.to_le_bytes());
+        entry[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        entry[104..104 + name.len()].copy_from_slice(&name);
+        entry
+    }
+
+    #[tokio::test]
+    async fn root_listing_hides_bookkeeping_directories_in_any_case() {
+        // SMB lookups ignore case and keep the creator's casing, so a
+        // `.SPICEIO-LOCKS` an older instance created is the lock directory.
+        // The fake server answers only the root listing: descending into any
+        // of these would send a CREATE that never gets a reply.
+        let (client, mut server) = pair().await;
+        let share = ShareSession::test_from_pool(SmbPool::test_from_client(client));
+        let backend = tokio::spawn(async move {
+            let open = read_frame(&mut server).await;
+            compound_reply(&mut server, &open, &[(0, create_body(0))]).await;
+            let query = read_frame(&mut server).await;
+            let mut entries = directory_entry(".SPICEIO-LOCKS", false);
+            entries.extend(directory_entry(".Spiceio-Wal", false));
+            entries.extend(directory_entry(".SPICEIO-UPLOADS", true));
+            let mut body = vec![0u8; 8];
+            body[..2].copy_from_slice(&9u16.to_le_bytes());
+            body[2..4].copy_from_slice(&((SMB2_HEADER_SIZE + 8) as u16).to_le_bytes());
+            body[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+            body.extend_from_slice(&entries);
+            compound_reply(&mut server, &query, &[(0, body)]).await;
+            let next_page = read_frame(&mut server).await;
+            error_reply(&mut server, &next_page, 0x8000_0006).await; // STATUS_NO_MORE_FILES
+            let close = read_frame(&mut server).await;
+            error_reply(&mut server, &close, 0).await;
+            server
+        });
+        let listing = tokio::time::timeout(Duration::from_secs(5), share.list_objects("", None))
+            .await
+            .expect("the listing descended into a bookkeeping directory")
+            .unwrap();
+        assert!(listing.0.is_empty() && listing.1.is_empty());
+        drop(backend.await.unwrap());
     }
 
     #[tokio::test]

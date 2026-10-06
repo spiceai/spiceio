@@ -355,6 +355,13 @@ impl SmbClient {
         Duration::from_millis(now_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed)))
     }
 
+    /// Test hook: hold the stream so later operations queue behind it, without
+    /// the poisoning a dropped `StreamGuard` implies.
+    #[cfg(test)]
+    pub(crate) async fn hold_stream(&self) -> tokio::sync::MutexGuard<'_, TcpStream> {
+        self.stream.lock().await
+    }
+
     /// Take exclusive use of the stream for one operation, counting it against
     /// this connection's queue depth until the guard drops. This is the only
     /// way to reach the stream, so the accounting cannot be skipped.
@@ -667,7 +674,7 @@ impl SmbClient {
     /// queued in the stream; closing the socket lets the server release the
     /// session promptly and ensures the leftover bytes can never be misread as a
     /// later reply (the poisoned flag already blocks reuse until the pool heals).
-    async fn poison(&self) {
+    pub(crate) async fn poison(&self) {
         self.poisoned.store(true, Ordering::Relaxed);
         let _ = self.stream.lock().await.shutdown().await;
     }
@@ -1693,6 +1700,53 @@ impl SmbClient {
         Ok(contiguous)
     }
 
+    /// Force acknowledged writes to stable storage. Used only by strict commits.
+    pub(crate) async fn flush_file(&self, tree_id: u32, file_id: &[u8; 16]) -> io::Result<()> {
+        let mut hdr = Header::new(Command::Flush, self.next_message_id());
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+        let packet = build_request(&hdr, |buf| encode_flush_request(buf, file_id));
+        let (reply, _) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(reply.status).is_error() {
+            return Err(smb_status_to_io_error(reply.status, "flush"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn set_write_time(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+        time: u64,
+    ) -> io::Result<()> {
+        let mut hdr = Header::new(Command::SetInfo, self.next_message_id());
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+        let packet = build_request(&hdr, |buf| encode_set_write_time(buf, file_id, time));
+        let (reply, _) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(reply.status).is_error() {
+            return Err(smb_status_to_io_error(reply.status, "set write time"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn query_file_metadata(
+        &self,
+        tree_id: u32,
+        file_id: &[u8; 16],
+    ) -> io::Result<CloseResponse> {
+        let mut hdr = Header::new(Command::QueryInfo, self.next_message_id());
+        hdr.session_id = self.session_id;
+        hdr.tree_id = tree_id;
+        let packet = build_request(&hdr, |buf| encode_query_file_metadata(buf, file_id));
+        let (reply, body) = self.send_recv(&packet).await?;
+        if NtStatus::from_u32(reply.status).is_error() {
+            return Err(smb_status_to_io_error(reply.status, "query metadata"));
+        }
+        decode_query_file_metadata(&body)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid file metadata"))
+    }
+
     /// Rename a file using SET_INFO with FileRenameInformation.
     pub async fn rename(
         &self,
@@ -1964,7 +2018,8 @@ impl SmbClient {
     }
 
     /// Compound Create + Close (1 round trip). Returns create and close
-    /// metadata. Used for head_object and delete_object.
+    /// metadata. Used for head_object and delete_object. A failed CLOSE is
+    /// only logged; use `create_close_checked` when it decides the result.
     pub async fn create_close(
         &self,
         tree_id: u32,
@@ -1973,6 +2028,55 @@ impl SmbClient {
         share_access: u32,
         create_disposition: u32,
         create_options: u32,
+    ) -> io::Result<(CreateResponse, CloseResponse)> {
+        self.create_close_inner(
+            tree_id,
+            path,
+            desired_access,
+            share_access,
+            create_disposition,
+            create_options,
+            false,
+        )
+        .await
+    }
+
+    /// `create_close` that fails when the CLOSE fails, for operations that
+    /// take effect at CLOSE (DELETE_ON_CLOSE). Both requests still travel in
+    /// one compound, so cancellation cannot separate them. A failed CLOSE
+    /// leaves the handle in an unknown state, so it also poisons the session:
+    /// ending it is the only cleanup.
+    pub async fn create_close_checked(
+        &self,
+        tree_id: u32,
+        path: &str,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> io::Result<(CreateResponse, CloseResponse)> {
+        self.create_close_inner(
+            tree_id,
+            path,
+            desired_access,
+            share_access,
+            create_disposition,
+            create_options,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_close_inner(
+        &self,
+        tree_id: u32,
+        path: &str,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        check_close: bool,
     ) -> io::Result<(CreateResponse, CloseResponse)> {
         // Compound ops are ≤ 64 KiB (effective_io_sizes clamps the compound
         // caps), so every chained request charges exactly 1 credit and the
@@ -2014,6 +2118,13 @@ impl SmbClient {
                 "[spiceio] smb compound close failed: 0x{:08X}",
                 resp[1].0.status
             );
+            if check_close {
+                self.poison().await;
+                return Err(io::Error::other(format!(
+                    "close failed: 0x{:08X}",
+                    resp[1].0.status
+                )));
+            }
         }
         let cl = decode_close_response(&resp[1].1).unwrap_or(CloseResponse {
             last_write_time: cr.last_write_time,

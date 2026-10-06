@@ -54,7 +54,7 @@ test-sccache-clean:
 test: build
 	./scripts/test-sccache.sh
 
-# All live SMB suites CI runs (sccache + extended + write-back + stress).
+# All live SMB suites CI runs (sccache + extended + conditional + write-back + stress).
 test-live: build
 	./scripts/ci-local.sh --live-only
 
@@ -64,6 +64,10 @@ test-extended: build test
 # Write-back acknowledgement + machine-wide disk spill, on their own.
 test-writeback: build
 	./scripts/test-writeback.sh
+
+.PHONY: test-conditional
+test-conditional: build
+	python3 scripts/test-conditional.py
 
 # Full parity with .github/workflows/ci.yml. Use this before declaring a PR
 # green when NAS credentials are available. Fails if live suites are skipped

@@ -60,7 +60,7 @@ struct Timespec {
 unsafe extern "C" {
     fn sigaction(signum: i32, act: *const Sigaction, oldact: *mut Sigaction) -> i32;
     fn raise(signum: i32) -> i32;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
     /// POSIX-guaranteed async-signal-safe; used for uptime in the handler.
     fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
     /// ASLR slide of image `index` (0 = main executable).
@@ -176,7 +176,7 @@ fn write_fd(fd: i32, mut bytes: &[u8]) {
     }
     while !bytes.is_empty() {
         // SAFETY: `bytes` is a valid readable buffer of the given length.
-        let n = unsafe { write(fd, bytes.as_ptr(), bytes.len()) };
+        let n = unsafe { write(fd, bytes.as_ptr().cast(), bytes.len()) };
         if n <= 0 {
             return;
         }

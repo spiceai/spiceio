@@ -631,6 +631,63 @@ impl Spill {
         (out, young)
     }
 
+    /// Keys of every pending write in this namespace, for the check that runs
+    /// before strict prefixes are enabled. Unlike `scan_dirty`, which feeds
+    /// replay, this ignores the current body-size limit (an entry journalled
+    /// under a larger budget is still an acknowledged write a peer or a later
+    /// restart will replay) and fails rather than skipping what it cannot
+    /// read: an unreadable entry may be a pending write for a strict key.
+    pub fn audit_dirty_keys(&self) -> io::Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for shard in fs::read_dir(&self.tree)? {
+            let shard = shard?;
+            if shard.file_name().as_bytes() == TMP.as_bytes() || !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path())? {
+                let path = entry?.path();
+                if path.extension().map(|e| e.as_bytes()) != Some(DIRTY_EXT.as_bytes()) {
+                    continue;
+                }
+                match self.dirty_key(&path) {
+                    Ok(Some(key)) => keys.push(key),
+                    Ok(None) => {}
+                    // Flushed or promoted by a peer since the directory read.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display())));
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The key a dirty entry was journalled for, from its stored id alone;
+    /// `None` for another namespace's entry.
+    fn dirty_key(&self, path: &Path) -> io::Result<Option<String>> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "unreadable pending write");
+        let mut f = File::open(path)?;
+        let mut header = [0u8; HEADER_LEN];
+        f.read_exact(&mut header)?;
+        if &header[..4] != MAGIC || u16::from_le_bytes([header[4], header[5]]) != FORMAT_VERSION {
+            return Err(invalid());
+        }
+        let id_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        if id_len > 64 * 1024 {
+            return Err(invalid());
+        }
+        let mut id = vec![0; id_len];
+        f.read_exact(&mut id)?;
+        let prefix = self.namespace.as_bytes();
+        if !id.starts_with(prefix) || id.get(prefix.len()) != Some(&0) {
+            return Ok(None);
+        }
+        String::from_utf8(id[prefix.len() + 1..].to_vec())
+            .map(Some)
+            .map_err(|_| invalid())
+    }
+
     fn dirty_identity(&self, path: &Path) -> Option<(String, [u8; 32])> {
         let mut f = File::open(path).ok()?;
         let mut header = [0u8; HEADER_LEN];
@@ -1057,6 +1114,33 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].key, "pending/k");
         assert_eq!(&s.load_dirty(&dirty[0]).unwrap().body[..], b"body");
+    }
+
+    #[test]
+    fn strict_audit_sees_entries_larger_than_the_current_budget() {
+        // Journalled under a 256 KiB max object, then reopened at 64 KiB: replay
+        // skips the entry, but it is still a pending write for its key.
+        let d = TempDir::new("audit-size");
+        let large = spill("audit-size", &d);
+        large.put("k", "e", 1, &[7; 200_000], true).unwrap();
+        let small = Spill::open(&d.0, "test-ns".into(), 1 << 20, 1 << 16).unwrap();
+        assert!(small.scan_dirty(Duration::ZERO).0.is_empty());
+        assert_eq!(small.audit_dirty_keys().unwrap(), ["k"]);
+    }
+
+    #[test]
+    fn strict_audit_fails_closed_on_an_unreadable_pending_write() {
+        let d = TempDir::new("audit-bad");
+        let s = spill("audit-bad", &d);
+        s.put("k", "e", 1, b"body", true).unwrap();
+        let other = Spill::open(&d.0, "other-ns".into(), 1 << 20, 1 << 18).unwrap();
+        assert!(
+            other.audit_dirty_keys().unwrap().is_empty(),
+            "another namespace's write is not ours"
+        );
+        fs::write(s.path_for("k", DIRTY_EXT), b"SPIO").unwrap();
+        assert!(s.scan_dirty(Duration::ZERO).0.is_empty());
+        assert!(s.audit_dirty_keys().is_err());
     }
 
     #[test]

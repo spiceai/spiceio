@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Live conditional-write gate: independent proxies, one NAS, no SDK dependencies."""
+import concurrent.futures
+import http.client
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+import xml.etree.ElementTree as ET
+
+# Strict version records are permanent, so every run reuses this fixed set of
+# keys rather than minting new ones, and a lease (taken with the strict CAS this
+# suite tests) serializes runs that share the NAS so they never interleave.
+PREFIX = "conditional-ci/"
+NAMES = ("race-0", "race-1", "race-2", "missing", "copy-source", "copy-dest", "multipart", "crash")
+LEASE_TTL = 300  # seconds an unrenewed lease lasts, e.g. after its run died
+LEASE_WAIT = 900  # seconds to wait for another run before failing
+
+
+def main():
+    for name in ("SPICEIO_SMB_USER", "SPICEIO_SMB_PASS"):
+        if not os.environ.get(name):
+            raise SystemExit(f"{name} is required")
+    prefix = PREFIX
+    processes, logs, ports, keys = [], [], [], set()
+    bucket = "conditional"
+    env = os.environ.copy()
+    env.update(
+        SPICEIO_SMB_SERVER=env.get("SPICEIO_SMB_SERVER", "192.168.3.148"),
+        SPICEIO_SMB_SHARE=env.get("SPICEIO_SMB_SHARE", "ai_platform_dev"),
+        SPICEIO_BUCKET=bucket,
+        SPICEIO_STRICT_PREFIXES=prefix,
+        SPICEIO_WRITE_BACK="1",
+        SPICEIO_IMMUTABLE_OBJECTS="1",
+        SPICEIO_EXISTENCE_INDEX="1",
+        SPICEIO_OBJECT_CACHE_BYTES="16777216",
+        SPICEIO_SPILL_DIR="off",
+        SPICEIO_SMB_CONNECTIONS="4",
+    )
+
+    def request(instance, method, key="", body=None, headers=None, query=""):
+        path = f"/{bucket}/{key}" if key else "/"
+        connection = http.client.HTTPConnection("127.0.0.1", ports[instance], timeout=60)
+        try:
+            connection.request(method, path + query, body, headers or {})
+            response = connection.getresponse()
+            return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+        finally:
+            connection.close()
+
+    def key(name):
+        value = prefix + name
+        keys.add(value)
+        return value
+
+    lease_key, owner = prefix + "lease", uuid.uuid4().hex
+    lease = {"etag": None, "lost": False}
+    stop_renewing = threading.Event()
+
+    def expect(response, status):
+        # Every step also proves the keys are still this run's alone.
+        assert not lease["lost"], f"lost {lease_key}; another run may be using the keys"
+        assert response[0] == status, (response[0], status, response[2][:1000])
+        return response
+
+    def lease_body(expires):
+        return json.dumps({"owner": owner, "expires": expires}).encode()
+
+    def acquire_lease():
+        deadline = time.monotonic() + LEASE_WAIT
+        while True:
+            body = lease_body(time.time() + LEASE_TTL)
+            status, headers, current = request(1, "GET", lease_key)
+            if status == 404:
+                result = request(1, "PUT", lease_key, body, {"If-None-Match": "*"})
+            elif status == 200:
+                try:
+                    expires = json.loads(current).get("expires", 0)
+                except ValueError:
+                    expires = 0
+                held = expires > time.time()
+                result = (409,) if held else request(1, "PUT", lease_key, body, {"If-Match": headers["etag"]})
+            else:
+                result = (status,)
+            if result[0] == 200:
+                lease["etag"] = result[1]["etag"]
+                return
+            assert time.monotonic() < deadline, f"another run still holds {lease_key} after {LEASE_WAIT}s"
+            time.sleep(2)
+
+    def renew_once():
+        # Owner-checked: succeeds only if no other run has taken the lease over.
+        result = request(1, "PUT", lease_key, lease_body(time.time() + LEASE_TTL),
+                         {"If-Match": lease["etag"]})
+        if result[0] != 200:
+            lease["lost"] = True
+            return False
+        lease["etag"] = result[1]["etag"]
+        return True
+
+    def renew_lease():
+        # Renew well inside the TTL: a step may wait out a whole HTTP timeout,
+        # and a slow but healthy run must not lose its keys to the next one.
+        while not stop_renewing.wait(LEASE_TTL / 5):
+            try:
+                if not renew_once():
+                    return
+            except OSError:
+                continue  # Retried at the next interval, long before the lease lapses.
+
+    def release_lease():
+        # If-Match: a run that outlived its lease must not clear the new holder's.
+        request(1, "PUT", lease_key, lease_body(0), {"If-Match": lease["etag"]})
+
+    def race(target, headers):
+        barrier = threading.Barrier(16)
+
+        def put(i):
+            body = f"writer-{i:02d}".encode()
+            barrier.wait()
+            return body, request(i % 2, "PUT", target, body, headers)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(executor.map(put, range(16)))
+        winners = [(body, result) for body, result in results if result[0] == 200]
+        assert len(winners) == 1, [(body, result[0]) for body, result in results]
+        assert sum(result[0] == 412 for _, result in results) == 15, results
+        assert expect(request(1, "GET", target), 200)[2] == winners[0][0]
+        return winners[0][1][1]["etag"]
+
+    # The logs close (after the finally below) before the directory is removed.
+    with tempfile.TemporaryDirectory(prefix="spiceio-conditional-") as directory, \
+            open(Path(directory) / "proxy-0.log", "w+") as log0, \
+            open(Path(directory) / "proxy-1.log", "w+") as log1:
+        renewer = threading.Thread(target=renew_lease, daemon=True)
+        try:
+            for i in range(2):
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    ports.append(listener.getsockname()[1])
+                log = (log0, log1)[i]
+                logs.append(log)
+                processes.append(subprocess.Popen(
+                    ["./target/debug/spiceio"],
+                    env={**env, "SPICEIO_BIND": f"127.0.0.1:{ports[i]}"},
+                    stdout=log, stderr=subprocess.STDOUT,
+                ))
+                for _ in range(120):
+                    assert processes[i].poll() is None, "proxy exited during startup"
+                    try:
+                        if request(i, "GET")[0] == 200:
+                            break
+                    except OSError:
+                        # Connection refused/reset is expected until the proxy listens.
+                        pass
+                    time.sleep(0.5)
+                else:
+                    raise AssertionError("proxy never became ready")
+
+            acquire_lease()
+            renewer.start()
+            # A run that died part way may have left objects behind.
+            for name in NAMES:
+                assert request(1, "DELETE", key(name))[0] in (204, 404), name
+
+            for repetition in range(3):
+                target = key(f"race-{repetition}")
+                original = race(target, {"If-None-Match": "*"})
+                changed = race(target, {"If-Match": original})
+                assert changed != original
+                expect(request(0, "PUT", target, b"stale", {"If-Match": original}), 412)
+                expect(request(0, "DELETE", target), 204)
+                recreated = expect(request(1, "PUT", target, b"recreated", {"If-None-Match": "*"}), 200)
+                assert recreated[1]["etag"] != changed
+                expect(request(0, "PUT", target, b"stale", {"If-Match": changed}), 412)
+            print("PASS: two-instance create/CAS races have exactly one winner; DELETE does not reuse ETags")
+
+            missing = key("missing")
+            expect(request(0, "PUT", missing, b"no", {"If-Match": '"missing"'}), 404)
+            source, dest = key("copy-source"), key("copy-dest")
+            expect(request(0, "PUT", source, b"copy bytes"), 200)
+            copy = {"x-amz-copy-source": f"/{bucket}/{source}", "If-None-Match": "*"}
+            expect(request(1, "PUT", dest, b"", copy), 200)
+            expect(request(0, "PUT", dest, b"", copy), 412)
+            current = expect(request(0, "HEAD", dest), 200)[1]["etag"]
+            expect(request(1, "PUT", dest, b"", {"x-amz-copy-source": f"/{bucket}/{source}", "If-Match": current}), 200)
+            expect(request(0, "PUT", dest, b"", {"x-amz-copy-source": f"/{bucket}/{source}", "If-Match": current}), 412)
+            print("PASS: destination copy conditions")
+
+            multipart = key("multipart")
+            initiated = expect(request(0, "POST", multipart, b"", query="?uploads"), 200)
+            upload = ET.fromstring(initiated[2]).findtext(".//{*}UploadId")
+            assert upload
+            part = expect(request(0, "PUT", multipart, b"multipart bytes", query=f"?partNumber=1&uploadId={upload}"), 200)
+            completion = f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{part[1]['etag']}</ETag></Part></CompleteMultipartUpload>".encode()
+            predecessor = expect(request(1, "PUT", multipart, b"predecessor"), 200)[1]["etag"]
+            expect(request(0, "POST", multipart, completion, {"If-None-Match": "*"}, f"?uploadId={upload}"), 412)
+            expect(request(0, "POST", multipart, completion, {"If-Match": predecessor}, f"?uploadId={upload}"), 200)
+            assert expect(request(1, "GET", multipart), 200)[2] == b"multipart bytes"
+            print("PASS: multipart completion checks destination and preserves upload after 412")
+
+            crash = key("crash")
+            body = b"committed before success" * 8192
+            expect(request(0, "PUT", crash, body, {"If-None-Match": "*"}), 200)
+            processes[0].kill()
+            processes[0].wait(timeout=10)
+            assert expect(request(1, "GET", crash), 200)[2] == body
+            expect(request(1, "PUT", crash, b"duplicate", {"If-None-Match": "*"}), 412)
+            print("PASS: conditional success survives immediate process death, read through peer with immutable cache enabled")
+        except BaseException:
+            for log in logs:
+                log.flush()
+                log.seek(0)
+                print(log.read()[-16000:])
+            raise
+        finally:
+            stop_renewing.set()
+            if renewer.is_alive():
+                renewer.join(timeout=70)
+            if len(processes) == 2 and processes[1].poll() is None and lease["etag"]:
+                # Clean up only while still holding the lease, renewing before
+                # each step since a DELETE can wait out a whole HTTP timeout: a
+                # run that lost it would delete the keys of the run that took over.
+                try:
+                    held = not lease["lost"]
+                    for target in keys:
+                        held = held and renew_once()
+                        if not held:
+                            break
+                        request(1, "DELETE", target)
+                    if held:
+                        release_lease()
+                except OSError:
+                    # Best-effort cleanup; the proxy may already be shutting down,
+                    # and an unreleased lease expires after LEASE_TTL.
+                    pass
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=40)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+
+if __name__ == "__main__":
+    main()

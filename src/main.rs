@@ -201,7 +201,15 @@ async fn connect_share(
     let admission = pool.admission_limit();
     // Shared with the pool so capacity shrinks reduce available permits.
     let smb_slots = pool.admission();
-    let share = ShareSession::connect(pool, smb_share, cleanup_grace_secs).await?;
+    let strict_prefixes = env::var("SPICEIO_STRICT_PREFIXES").unwrap_or_default();
+    let share = ShareSession::connect(pool, smb_share, cleanup_grace_secs)
+        .await?
+        .with_strict_prefixes(&strict_prefixes)?;
+    if share.has_strict_prefixes() {
+        slog!(
+            "[spiceio] strict prefixes: {strict_prefixes} (synchronous, server-coordinated mutations)"
+        );
+    }
     let share = Arc::new(share);
     // Clean up orphaned WAL temps / stale multipart dirs from prior crashes
     // (the in-memory upload map does not survive a restart).
@@ -224,6 +232,7 @@ async fn connect_share(
     // L2: the machine-wide disk tier. Namespaced by backend identity so
     // instances fronting *different* shares can share one directory without
     // ever serving each other's objects.
+    let mut spill_failed = false;
     if let Some(dir) = spill_dir.as_deref() {
         let namespace = format!("{}:{}/{}", smb_config.server, smb_config.port, smb_share);
         let max_object = s3::object_cache::default_max_object_bytes(spill_bytes);
@@ -243,10 +252,42 @@ async fn connect_share(
             }
             // A cache tier that cannot be opened is a missing optimization, not
             // a reason to refuse to serve.
-            Err(e) => serr!("[spiceio] disk spill disabled: cannot use {dir}: {e}"),
+            Err(e) => {
+                serr!("[spiceio] disk spill disabled: cannot use {dir}: {e}");
+                spill_failed = true;
+            }
         }
     }
     let object_cache = Arc::new(object_cache);
+
+    if share.has_strict_prefixes() {
+        // Fail closed: an unreadable spill may hold acknowledged writes for
+        // strict keys that a later replay would publish outside the lock.
+        if spill_failed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strict prefixes need the configured disk spill to be readable so pending writes can be checked; fix SPICEIO_SPILL_DIR or drain it first",
+            ));
+        }
+        // Every journalled key, not just the ones the current budget would
+        // replay: an entry written under a larger SPICEIO_SPILL_BYTES is still
+        // a pending write that a peer or a later restart publishes.
+        let pending = object_cache.spill_audit_dirty_keys().await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("strict prefixes need every pending spill write checked, but the spill could not be audited: {e}"),
+            )
+        })?;
+        if pending
+            .iter()
+            .any(|key| share.replay_reaches_strict_state(key))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the disk spill holds pending writes for strict, reserved, or parent-alias keys; drain them with the previous configuration before enabling strict mode",
+            ));
+        }
+    }
 
     let writeback = Arc::new(WriteBack::from_env());
     if writeback.enabled() {
@@ -398,6 +439,14 @@ async fn main() {
     }
 
     let config = Config::from_env();
+
+    // A malformed value never becomes valid, so reject it here: inside the
+    // SMB connect loop below it would be retried forever behind a 503.
+    let strict_prefixes = env::var("SPICEIO_STRICT_PREFIXES").unwrap_or_default();
+    if let Err(e) = ShareSession::parse_strict_prefixes(&strict_prefixes) {
+        serr!("[spiceio] SPICEIO_STRICT_PREFIXES={strict_prefixes:?}: {e}");
+        flush_and_exit(1);
+    }
 
     // Bind TCP listener early (before SMB setup). If the port is taken,
     // auto-increment until an available port is found.
@@ -631,7 +680,7 @@ async fn main() {
                         let (dirty, young) = state.object_cache.spill_scan_dirty(min_age).await;
                         let dirty: Vec<_> = dirty
                             .into_iter()
-                            .filter(|d| !owned.contains(&d.key))
+                            .filter(|d| !owned.contains(&d.key) && !state.share.is_strict(&d.key))
                             .collect();
                         if !dirty.is_empty() {
                             slog!(

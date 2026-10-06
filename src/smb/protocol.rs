@@ -21,6 +21,7 @@ pub enum Command {
     TreeConnect = 0x0003,
     Create = 0x0005,
     Close = 0x0006,
+    Flush = 0x0007,
     Read = 0x0008,
     Write = 0x0009,
     Ioctl = 0x000B,
@@ -975,6 +976,32 @@ pub fn encode_query_file_metadata(buf: &mut BytesMut, file_id: &[u8; 16]) {
     buf.put_u32_le(0); // AdditionalInformation
     buf.put_u32_le(0); // Flags
     buf.put_slice(file_id);
+}
+
+/// SMB2 FLUSH (MS-SMB2 2.2.17): commit file data and metadata to stable storage.
+pub fn encode_flush_request(buf: &mut BytesMut, file_id: &[u8; 16]) {
+    buf.put_u16_le(24);
+    buf.put_u16_le(0);
+    buf.put_u32_le(0);
+    buf.put_slice(file_id);
+}
+
+/// Set only LastWriteTime using FileBasicInformation (MS-FSCC 2.4.7).
+pub fn encode_set_write_time(buf: &mut BytesMut, file_id: &[u8; 16], time: u64) {
+    buf.put_u16_le(33);
+    buf.put_u8(1);
+    buf.put_u8(4);
+    buf.put_u32_le(40);
+    buf.put_u16_le((SMB2_HEADER_SIZE + 32) as u16);
+    buf.put_u16_le(0);
+    buf.put_u32_le(0);
+    buf.put_slice(file_id);
+    buf.put_u64_le(0); // CreationTime: unchanged
+    buf.put_u64_le(0); // LastAccessTime: unchanged
+    buf.put_u64_le(time);
+    buf.put_u64_le(0); // ChangeTime: unchanged
+    buf.put_u32_le(0); // FileAttributes: unchanged
+    buf.put_u32_le(0);
 }
 
 /// Decode QUERY_INFO's bounded output buffer and FileNetworkOpenInformation

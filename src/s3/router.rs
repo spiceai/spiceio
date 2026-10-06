@@ -26,6 +26,7 @@ use super::multipart::MultipartStore;
 use super::object_cache::ObjectCache;
 use super::writeback::WriteBack;
 use super::xml::{self, XmlWriter};
+use crate::smb::condition::{ConditionFailure, WriteCondition};
 use crate::smb::ops::{ShareSession, guess_content_type};
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -242,7 +243,7 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         {
             return with_common_headers(resp, &request_id, &state.region);
         }
-        if state.existence.probe(key) == Probe::Absent {
+        if !state.share.is_strict(key) && state.existence.probe(key) == Probe::Absent {
             let resp = if *method == Method::HEAD {
                 existence_miss_head(state)
             } else {
@@ -320,7 +321,13 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
             handle_create_multipart_upload(hdrs, state, key).await
         } else if let Some(upload_id) = extract_query_param(query, "uploadId") {
             match collect_body(body, declared_len).await {
-                Ok(body) => handle_complete_multipart_upload(body, state, key, &upload_id).await,
+                Ok(body) => match write_condition(hdrs, state, key) {
+                    Ok(condition) => {
+                        handle_complete_multipart_upload(body, state, key, &upload_id, &condition)
+                            .await
+                    }
+                    Err(resp) => *resp,
+                },
                 Err(resp) => *resp,
             }
         } else {
@@ -850,6 +857,9 @@ async fn try_backendless_get(
     state: &AppState,
     key: &str,
 ) -> Option<Response<SpiceioBody>> {
+    if state.share.is_strict(key) {
+        return None;
+    }
     let cache = &state.object_cache;
     let hit = if let Some(pending) = state.writeback.pending_object(key).await {
         pending
@@ -911,6 +921,9 @@ async fn try_backendless_head(
     state: &AppState,
     key: &str,
 ) -> Option<Response<SpiceioBody>> {
+    if state.share.is_strict(key) {
+        return None;
+    }
     let (etag, last_modified, size, cache_hit) =
         if let Some((etag, last_modified, size)) = state.writeback.pending_meta(key).await {
             (etag, last_modified, size, false)
@@ -968,7 +981,7 @@ fn existence_miss_head(state: &AppState) -> Response<SpiceioBody> {
 }
 
 async fn existence_confirm_absent(state: &AppState, key: &str) -> bool {
-    if !state.existence.enabled() {
+    if !state.existence.enabled() || state.share.is_strict(key) {
         return false;
     }
     let share = Arc::clone(&state.share);
@@ -1584,51 +1597,30 @@ fn writeback_memory_ack_eligible(state: &AppState, content_length: Option<u64>) 
         })
 }
 
-/// If-None-Match: * — fail if the key already exists.
-///
-/// The existence index is a local listing and can disagree with a peer's
-/// create or delete, so it must not decide this precondition. Pending
-/// write-back metadata is this instance's own ack and is authoritative.
-/// `need_slot` is the memory-ack path, which does not already hold an SMB
-/// permit: take one for the stat and drop it before the caller acks.
-async fn put_if_none_match_star(
+/// Conditions are supported only where all mutations share the strict protocol.
+fn write_condition(
+    hdrs: &http::HeaderMap,
     state: &AppState,
-    share: &ShareSession,
     key: &str,
-    need_slot: bool,
-) -> Option<Response<SpiceioBody>> {
-    let precondition = || {
-        error_response(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
-            "At least one of the preconditions you specified did not hold.",
-        )
-    };
-    // A write acknowledged from memory is an object that exists, even though
-    // the NAS cannot see it yet — a stat would miss it and let the write through.
-    if state.writeback.pending_meta(key).await.is_some() {
-        return Some(precondition());
+) -> Result<WriteCondition, Box<Response<SpiceioBody>>> {
+    let condition = super::condition::parse(hdrs).map_err(|message| {
+        Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            message,
+        ))
+    })?;
+    if condition != WriteCondition::None && !state.share.is_strict(key) {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Conditional writes require SPICEIO_STRICT_PREFIXES on every instance serving this share.",
+        )));
     }
-    let _stat = if need_slot {
-        match acquire_smb_slot(state).await {
-            Ok(p) => Some(p),
-            Err(()) => {
-                return Some(service_unavailable(
-                    "spiceio is at capacity waiting on the SMB backend; please retry.",
-                ));
-            }
-        }
-    } else {
-        None
-    };
-    match share.head_object(key).await {
-        Ok(_) => Some(precondition()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => Some(io_to_s3_error(&e)),
-    }
+    Ok(condition)
 }
 
-// ── PutObject (streaming, with conditional-write via If-None-Match) ─────────
+// ── PutObject (streaming, with atomic destination preconditions) ─────────
 
 async fn handle_put_object(
     mut body: Incoming,
@@ -1637,25 +1629,23 @@ async fn handle_put_object(
     state: &AppState,
     key: &str,
 ) -> Response<SpiceioBody> {
+    let condition = match write_condition(hdrs, state, key) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
     let Ok(_mutation) = state.writeback.begin_mutation(key).await else {
         return service_unavailable("A previous write is still in progress; please retry.");
     };
 
     let share = &state.share;
-    let if_none_match = get_header(hdrs, IF_NONE_MATCH).map(String::from);
     let content_type = get_header(hdrs, "content-type").map(String::from);
-    let writeback_ack = writeback_memory_ack_eligible(state, content_length);
+    let writeback_ack =
+        !share.is_strict(key) && writeback_memory_ack_eligible(state, content_length);
 
     // Memory-ack PUTs must not take an SMB slot: they are not backend demand,
     // and holding one queued GET/HEAD behind a write that never touches the
     // NAS (and made flushers yield to a client that was not waiting on SMB).
     if writeback_ack {
-        if let Some(ref inm) = if_none_match
-            && inm.trim() == "*"
-            && let Some(resp) = put_if_none_match_star(state, share, key, true).await
-        {
-            return resp;
-        }
         let cl = content_length.expect("writeback_ack requires Content-Length");
         let Some(_collect) = state.writeback.try_begin_collect(cl) else {
             return service_unavailable(
@@ -1688,7 +1678,7 @@ async fn handle_put_object(
                 "spiceio is at capacity waiting on the SMB backend; please retry.",
             );
         };
-        return match share.put_object_atomic(key, &data).await {
+        return match share.put_object_conditional(key, &data, &condition).await {
             Ok(meta) => {
                 state.writeback.cancel(key).await;
                 state.object_cache.forget(key).await;
@@ -1713,13 +1703,6 @@ async fn handle_put_object(
             "spiceio is at capacity waiting on the SMB backend; please retry.",
         );
     };
-    if let Some(ref inm) = if_none_match
-        && inm.trim() == "*"
-        && let Some(resp) = put_if_none_match_star(state, share, key, false).await
-    {
-        return resp;
-    }
-
     // ── Buffered path: publish small bodies through the WAL ─────────
     let max_write = share.compound_max_write_size() as u64;
 
@@ -1732,7 +1715,7 @@ async fn handle_put_object(
             Ok(b) => b,
             Err(resp) => return *resp,
         };
-        match share.put_object_atomic(key, &data).await {
+        match share.put_object_conditional(key, &data, &condition).await {
             Ok(meta) => {
                 state.writeback.cancel(key).await;
                 state.object_cache.forget(key).await;
@@ -1827,7 +1810,7 @@ async fn handle_put_object(
     }
 
     // Commit: flush remaining buffer, rename WAL temp → final path
-    let meta = match wal.commit(share).await {
+    let meta = match wal.commit_conditional(share, &condition).await {
         Ok(m) => m,
         Err(e) => return io_to_s3_write_error(&e),
     };
@@ -1878,6 +1861,10 @@ async fn handle_copy_object(
     state: &AppState,
     dest_key: &str,
 ) -> Response<SpiceioBody> {
+    let condition = match write_condition(hdrs, state, dest_key) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
     let share = &state.share;
     let copy_source = match get_header(hdrs, X_AMZ_COPY_SOURCE) {
         Some(s) => s.to_string(),
@@ -1979,7 +1966,10 @@ async fn handle_copy_object(
         return error_response(StatusCode::PRECONDITION_FAILED, "PreconditionFailed", "");
     }
 
-    match share.copy_object(&src_key, dest_key).await {
+    match share
+        .copy_object_conditional(&src_key, dest_key, &condition)
+        .await
+    {
         Ok(meta) => {
             state.writeback.cancel(dest_key).await;
             state.object_cache.forget(dest_key).await;
@@ -2658,6 +2648,7 @@ async fn handle_complete_multipart_upload(
     state: &AppState,
     key: &str,
     upload_id: &str,
+    condition: &WriteCondition,
 ) -> Response<SpiceioBody> {
     let Some(lock) = state.multipart.operation_lock(upload_id).await else {
         return error_response(StatusCode::NOT_FOUND, "NoSuchUpload", "");
@@ -2776,7 +2767,11 @@ async fn handle_complete_multipart_upload(
             "spiceio is at capacity waiting on the SMB backend; please retry.",
         );
     };
-    let meta = match state.share.assemble_parts(key, &parts).await {
+    let meta = match state
+        .share
+        .assemble_parts_conditional(key, &parts, condition)
+        .await
+    {
         Ok(m) => m,
         Err(e) => return io_to_s3_write_error(&e),
     };
@@ -3237,6 +3232,19 @@ fn io_to_s3_error(e: &io::Error) -> Response<SpiceioBody> {
 /// Only for the destination of a write. CopyObject's *source* lookup keeps
 /// [`io_to_s3_error`], where a missing key really is 404.
 fn io_to_s3_write_error(e: &io::Error) -> Response<SpiceioBody> {
+    if let Some(failure) = e
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<ConditionFailure>())
+    {
+        let (status, code) = match failure {
+            ConditionFailure::PreconditionFailed => {
+                (StatusCode::PRECONDITION_FAILED, "PreconditionFailed")
+            }
+            ConditionFailure::NoSuchKey => (StatusCode::NOT_FOUND, "NoSuchKey"),
+            ConditionFailure::Conflict => (StatusCode::CONFLICT, "ConditionalRequestConflict"),
+        };
+        return error_response(status, code, &failure.to_string());
+    }
     if e.kind() == io::ErrorKind::NotFound {
         crate::slog!("[spiceio] write path not found (reporting retryable): {e}");
         return service_unavailable("The write could not be completed; please retry.");
@@ -3275,7 +3283,7 @@ fn has_query_flag(query: &str, key: &str) -> bool {
 /// Splits on both `/` (S3 separator) and `\` (SMB separator — `to_smb_path`
 /// maps one to the other) so neither form slips through.
 fn key_has_traversal(key: &str) -> bool {
-    key.split(['/', '\\']).any(|seg| seg == "..")
+    ShareSession::reserved_key(key) || key.split(['/', '\\']).any(ShareSession::is_parent_alias)
 }
 
 fn extract_query_param(query: &str, key: &str) -> Option<String> {
@@ -3576,6 +3584,17 @@ mod tests {
         assert!(!key_has_traversal("a/b/c.txt"));
         // ".." only as a full path segment, not a prefix.
         assert!(!key_has_traversal("..foo/bar"));
+        assert!(!key_has_traversal("a../b"));
+        assert!(!key_has_traversal("./a/. /b"));
+        // Server-equivalent aliases of "..".
+        for key in [
+            "safe/.. /.spiceio-locks/x",
+            "a/.../b",
+            "a/..:s/b",
+            "a\\. ./b",
+        ] {
+            assert!(key_has_traversal(key), "{key}");
+        }
     }
 
     #[test]
@@ -3791,7 +3810,9 @@ mod regression_router {
             error_reply(&mut server, &r, 0xC0000022).await;
         });
         let payload=Bytes::from_static(b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>wrong-part-etag</ETag></Part></CompleteMultipartUpload>");
-        let response = handle_complete_multipart_upload(payload, &state, "dest", &id).await;
+        let response =
+            handle_complete_multipart_upload(payload, &state, "dest", &id, &WriteCondition::None)
+                .await;
         backend.abort();
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -4218,7 +4239,7 @@ mod replacement_regressions {
             async move {
                 handle_complete_multipart_upload(Bytes::from_static(
                 b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>old</ETag></Part></CompleteMultipartUpload>"),
-                &state, "key", &id).await
+                &state, "key", &id, &WriteCondition::None).await
             }
         });
         tokio::task::yield_now().await;
@@ -4255,19 +4276,11 @@ mod replacement_regressions {
     }
 
     #[tokio::test]
-    async fn if_none_match_star_does_not_trust_existence_absent() {
-        let (mut state, _server) = state().await;
-        state.existence = Arc::new(ExistenceIndex::new(true, None));
-        state.existence.seed_listed("pre", &[]);
-        let share = Arc::clone(&state.share);
-        let timed = tokio::time::timeout(
-            Duration::from_millis(80),
-            put_if_none_match_star(&state, share.as_ref(), "pre/x", true),
-        )
-        .await;
-        assert!(
-            timed.is_err(),
-            "If-None-Match:* must stat the NAS even when the local listing says absent"
-        );
+    async fn conditional_write_outside_strict_scope_fails_closed() {
+        let (state, _server) = state().await;
+        let mut hdrs = http::HeaderMap::new();
+        hdrs.insert(IF_NONE_MATCH, http::HeaderValue::from_static("*"));
+        let response = write_condition(&hdrs, &state, "pre/x").unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -32,8 +32,15 @@ pub(crate) async fn pair() -> (Arc<SmbClient>, TcpStream) {
     (SmbClient::test_from_stream(c.unwrap()), s.unwrap().0)
 }
 pub(crate) async fn state() -> (AppState, TcpStream) {
+    let (state, server, _) = state_and_client().await;
+    (state, server)
+}
+/// `state()`, plus the instance's one SMB connection for tests that drive it.
+pub(crate) async fn state_and_client() -> (AppState, TcpStream, Arc<SmbClient>) {
     let (c, s) = pair().await;
-    let share = Arc::new(ShareSession::test_from_pool(SmbPool::test_from_client(c)));
+    let share = Arc::new(ShareSession::test_from_pool(SmbPool::test_from_client(
+        c.clone(),
+    )));
     (
         AppState {
             smb_slots: share.admission(),
@@ -48,6 +55,7 @@ pub(crate) async fn state() -> (AppState, TcpStream) {
             existence: Arc::new(crate::s3::existence::ExistenceIndex::disabled()),
         },
         s,
+        c,
     )
 }
 pub(crate) async fn read_frame(s: &mut TcpStream) -> Vec<u8> {
@@ -370,16 +378,16 @@ async fn failed_write_through_put_preserves_an_acknowledged_predecessor() {
 }
 
 #[tokio::test]
-async fn conditional_put_does_not_treat_a_failed_stat_as_absence() {
+async fn conditional_put_outside_strict_scope_never_writes() {
     let (state, mut server) = state().await;
     let state = Arc::new(state);
-    let backend = tokio::spawn(async move {
-        let request = read_frame(&mut server).await;
-        error_reply(&mut server, &request, 0xC0000022).await;
-    });
     let response = http_request(Arc::clone(&state),
         b"PUT /audit/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n").await;
-    backend.await.unwrap();
-    assert!(response.starts_with(b"HTTP/1.1 403"));
+    assert!(response.starts_with(b"HTTP/1.1 400"));
     assert!(state.writeback.pending_object("key").await.is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), server.read_u8())
+            .await
+            .is_err()
+    );
 }
