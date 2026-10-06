@@ -3283,7 +3283,17 @@ fn has_query_flag(query: &str, key: &str) -> bool {
 /// Splits on both `/` (S3 separator) and `\` (SMB separator — `to_smb_path`
 /// maps one to the other) so neither form slips through.
 fn key_has_traversal(key: &str) -> bool {
-    ShareSession::reserved_key(key) || key.split(['/', '\\']).any(|seg| seg == "..")
+    ShareSession::reserved_key(key) || key.split(['/', '\\']).any(is_parent_alias)
+}
+
+/// `..`, plus the names a server can reduce to it by trimming trailing dots
+/// and spaces (`.. `, `...`) or dropping a stream suffix (`..:x`). Strict
+/// prefix matching and lock names already assume that trimming.
+fn is_parent_alias(segment: &str) -> bool {
+    let name = segment.split(':').next().unwrap_or_default();
+    name.len() >= 2
+        && name.bytes().all(|b| b == b'.' || b == b' ')
+        && name.bytes().filter(|&b| b == b'.').count() >= 2
 }
 
 fn extract_query_param(query: &str, key: &str) -> Option<String> {
@@ -3584,6 +3594,17 @@ mod tests {
         assert!(!key_has_traversal("a/b/c.txt"));
         // ".." only as a full path segment, not a prefix.
         assert!(!key_has_traversal("..foo/bar"));
+        assert!(!key_has_traversal("a../b"));
+        assert!(!key_has_traversal("./a/. /b"));
+        // Server-equivalent aliases of "..".
+        for key in [
+            "safe/.. /.spiceio-locks/x",
+            "a/.../b",
+            "a/..:s/b",
+            "a\\. ./b",
+        ] {
+            assert!(key_has_traversal(key), "{key}");
+        }
     }
 
     #[test]
