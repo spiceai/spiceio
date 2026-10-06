@@ -1522,15 +1522,15 @@ impl ShareSession {
     }
 
     /// Delete where the result must be exact (strict prefixes). DELETE_ON_CLOSE
-    /// deletes at CLOSE, and the compound `create_close` only logs a failed
-    /// CLOSE, so close separately and let its status decide.
+    /// deletes at CLOSE, so the CLOSE status decides. CREATE and CLOSE stay
+    /// in one compound: cancellation cannot strand an open delete handle.
     async fn delete_object_checked_on(
         client: &SmbClient,
         tree_id: u32,
         smb_path: &str,
     ) -> io::Result<()> {
-        let file = client
-            .create(
+        client
+            .create_close_checked(
                 tree_id,
                 smb_path,
                 DesiredAccess::Delete as u32,
@@ -1538,14 +1538,8 @@ impl ShareSession {
                 CreateDisposition::Open as u32,
                 CreateOptions::NonDirectoryFile as u32 | CreateOptions::DeleteOnClose as u32,
             )
-            .await?;
-        if let Err(e) = client.close(tree_id, &file.file_id).await {
-            // The handle and its pending delete are in an unknown state;
-            // ending the session is the only cleanup.
-            client.poison().await;
-            return Err(e);
-        }
-        Ok(())
+            .await
+            .map(|_| ())
     }
 
     /// Try to remove an empty directory (best effort). Compound Create+Close.

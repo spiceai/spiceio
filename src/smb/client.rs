@@ -2011,7 +2011,8 @@ impl SmbClient {
     }
 
     /// Compound Create + Close (1 round trip). Returns create and close
-    /// metadata. Used for head_object and delete_object.
+    /// metadata. Used for head_object and delete_object. A failed CLOSE is
+    /// only logged; use `create_close_checked` when it decides the result.
     pub async fn create_close(
         &self,
         tree_id: u32,
@@ -2020,6 +2021,55 @@ impl SmbClient {
         share_access: u32,
         create_disposition: u32,
         create_options: u32,
+    ) -> io::Result<(CreateResponse, CloseResponse)> {
+        self.create_close_inner(
+            tree_id,
+            path,
+            desired_access,
+            share_access,
+            create_disposition,
+            create_options,
+            false,
+        )
+        .await
+    }
+
+    /// `create_close` that fails when the CLOSE fails, for operations that
+    /// take effect at CLOSE (DELETE_ON_CLOSE). Both requests still travel in
+    /// one compound, so cancellation cannot separate them. A failed CLOSE
+    /// leaves the handle in an unknown state, so it also poisons the session:
+    /// ending it is the only cleanup.
+    pub async fn create_close_checked(
+        &self,
+        tree_id: u32,
+        path: &str,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> io::Result<(CreateResponse, CloseResponse)> {
+        self.create_close_inner(
+            tree_id,
+            path,
+            desired_access,
+            share_access,
+            create_disposition,
+            create_options,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_close_inner(
+        &self,
+        tree_id: u32,
+        path: &str,
+        desired_access: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        check_close: bool,
     ) -> io::Result<(CreateResponse, CloseResponse)> {
         // Compound ops are ≤ 64 KiB (effective_io_sizes clamps the compound
         // caps), so every chained request charges exactly 1 credit and the
@@ -2061,6 +2111,13 @@ impl SmbClient {
                 "[spiceio] smb compound close failed: 0x{:08X}",
                 resp[1].0.status
             );
+            if check_close {
+                self.poison().await;
+                return Err(io::Error::other(format!(
+                    "close failed: 0x{:08X}",
+                    resp[1].0.status
+                )));
+            }
         }
         let cl = decode_close_response(&resp[1].1).unwrap_or(CloseResponse {
             last_write_time: cr.last_write_time,
