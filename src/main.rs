@@ -3,7 +3,7 @@
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -85,6 +85,27 @@ fn require_env(name: &str) -> String {
     }
 }
 
+/// Default S3 listen address: **loopback only**.
+///
+/// spiceio does not authenticate S3 requests. Any client that can reach the
+/// port can read, overwrite and delete everything on the share using the
+/// proxy's SMB credentials. Listening beyond this host therefore has to be an
+/// explicit `SPICEIO_BIND` choice, never a default.
+const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+
+/// Parse `SPICEIO_BIND`: any socket address (`10.0.0.5:8333`, `[::1]:8333`,
+/// `0.0.0.0:8333`), plus `*:PORT` as shorthand for every IPv4 interface.
+fn parse_bind(raw: &str) -> Option<SocketAddr> {
+    let raw = raw.trim();
+    match raw.strip_prefix("*:") {
+        Some(port) => port
+            .parse()
+            .ok()
+            .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)),
+        None => raw.parse().ok(),
+    }
+}
+
 /// Parse an optional env var, warning (instead of silently defaulting) when a
 /// value is present but unparsable — a misconfiguration worth surfacing.
 fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -103,15 +124,18 @@ fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 impl Config {
     fn from_env() -> Self {
         Self {
-            bind_addr: {
-                let raw = env::var("SPICEIO_BIND").unwrap_or_else(|_| "0.0.0.0:8333".into());
-                match raw.parse() {
-                    Ok(addr) => addr,
-                    Err(_) => {
-                        serr!("[spiceio] SPICEIO_BIND is not a valid socket address: {raw}");
+            bind_addr: match env::var("SPICEIO_BIND") {
+                Err(_) => DEFAULT_BIND,
+                Ok(raw) => match parse_bind(&raw) {
+                    Some(addr) => addr,
+                    None => {
+                        serr!(
+                            "[spiceio] SPICEIO_BIND is not a valid socket address: {raw} \
+                             (expected HOST:PORT, e.g. 127.0.0.1:8333, [::1]:8333 or *:8333)"
+                        );
                         flush_and_exit(1);
                     }
-                }
+                },
             },
             smb_server: require_env("SPICEIO_SMB_SERVER"),
             smb_port: parse_env_or("SPICEIO_SMB_PORT", 445),
@@ -514,6 +538,13 @@ async fn main() {
     }
 
     slog!("[spiceio] accepting connections on http://{bind_addr} (connecting to SMB…)");
+    if !bind_addr.ip().is_loopback() {
+        serr!(
+            "[spiceio] warning: listening on {bind_addr}, reachable beyond this host. \
+             S3 requests are not authenticated: any client that can reach this \
+             address can read, overwrite and delete the whole share"
+        );
+    }
     slog!(
         "[spiceio] connecting to smb://****@{}:{}/{} ({}x)",
         config.smb_server,
@@ -1039,5 +1070,42 @@ mod tests {
         assert_eq!(pool_size_for(64), 32);
         // A pathological core count must clamp, not wrap.
         assert_eq!(pool_size_for(usize::MAX), 32);
+    }
+
+    #[test]
+    fn default_bind_is_loopback_only() {
+        // The S3 endpoint is unauthenticated and fronts the whole share, so
+        // anything wider than loopback must be asked for.
+        assert!(DEFAULT_BIND.ip().is_loopback());
+        assert_eq!(DEFAULT_BIND.to_string(), "127.0.0.1:8333");
+    }
+
+    #[test]
+    fn parse_bind_accepts_explicit_addresses_and_star() {
+        let p = |s: &str| parse_bind(s).map(|a| a.to_string());
+        assert_eq!(p("127.0.0.1:9000").as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(p("0.0.0.0:8333").as_deref(), Some("0.0.0.0:8333"));
+        assert_eq!(p("[::1]:8333").as_deref(), Some("[::1]:8333"));
+        assert_eq!(p("[::]:8333").as_deref(), Some("[::]:8333"));
+        assert_eq!(p("*:8333").as_deref(), Some("0.0.0.0:8333"));
+        assert_eq!(p(" 10.0.0.5:80 ").as_deref(), Some("10.0.0.5:80"));
+    }
+
+    #[test]
+    fn parse_bind_rejects_what_it_cannot_bind() {
+        // Rejected rather than defaulted: a typo must not silently change the
+        // listen address.
+        for bad in [
+            "",
+            "*",
+            "*:",
+            "*:http",
+            "*:70000",
+            "localhost:8333",
+            "8333",
+            "::1:8333",
+        ] {
+            assert_eq!(parse_bind(bad), None, "{bad:?} should be rejected");
+        }
     }
 }

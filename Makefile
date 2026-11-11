@@ -121,6 +121,11 @@ RESTART_AGENT ?= 1
 # leaves the previous one intact rather than nothing at all. `cp -RL` because
 # cargo leaves target/release/spiceio.dSYM as a *symlink* into deps/ — copying
 # it verbatim installs a dangling link that symbolizes nothing.
+#
+# install never writes the agent's config, so it never picks a listen address
+# either. It reports the one the agent actually bound, and warns when that is
+# reachable beyond this host: the binary's default is loopback only, and
+# anything wider is the agent's own SPICEIO_BIND.
 install: release
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/spiceio "$(BINDIR)/spiceio"
@@ -141,6 +146,7 @@ install: release
 	    echo "note: $(LAUNCHD_LABEL) still runs the previous binary; restart it with"; \
 	    echo "      launchctl kickstart -k gui/$$(id -u)/$(LAUNCHD_LABEL)"; \
 	  fi; \
+	  ./scripts/agent-bind-report.sh "$(LAUNCHD_LABEL)"; \
 	fi
 
 # Removes what `install` wrote. Leaves the launchd agent, its config and its
