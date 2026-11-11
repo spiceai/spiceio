@@ -62,6 +62,12 @@ step() {
 }
 
 run_live_suites() {
+    # CI never configures S3 access keys, and the other suites' clients send
+    # unsigned requests. An ambient key (say, from sourcing the launchd env
+    # file for NAS credentials) would turn every one of them into a 403.
+    # test-auth.sh configures its own keys.
+    unset SPICEIO_S3_AUTH SPICEIO_S3_ACCESS_KEY_ID SPICEIO_S3_SECRET_ACCESS_KEY \
+        SPICEIO_S3_CREDENTIALS_FILE
     # Match CI job-level pool pin so local and CI see the same concurrency.
     export SPICEIO_SMB_CONNECTIONS="${SPICEIO_SMB_CONNECTIONS:-8}"
     # CI defaults when repo vars are unset.
@@ -101,6 +107,14 @@ run_live_suites() {
         export AWS_DEFAULT_REGION="${SPICEIO_REGION}"
         ./scripts/stress-concurrent.sh
     )
+
+    step "S3 auth modes + aws-chunked (scripts/test-auth.sh)"
+    (
+        export SPICEIO_BUCKET=auth
+        export SPICEIO_BIND=127.0.0.1:18339
+        export AWS_DEFAULT_REGION="${SPICEIO_REGION}"
+        ./scripts/test-auth.sh
+    )
 }
 
 if [[ "$LIVE_ONLY" -eq 0 ]]; then
@@ -126,7 +140,7 @@ elif [[ "$CI_REQUIRE_LIVE" == "1" || "$LIVE_ONLY" -eq 1 ]]; then
     echo ""
     echo "ci-local: FAIL — live suites required but SPICEIO_SMB_USER/PASS are not set."
     echo "  Export credentials (or source /tmp/spiceio-bench-env.sh) and re-run."
-    echo "  Live suites (test-sccache / test-extended / test-conditional / test-writeback / stress-concurrent) are what"
+    echo "  Live suites (test-sccache / test-extended / test-conditional / test-writeback / stress-concurrent / test-auth) are what"
     echo "  CI runs; skipping them is how sccache write-error failures ship."
     exit 1
 else

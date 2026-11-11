@@ -54,7 +54,8 @@ test-sccache-clean:
 test: build
 	./scripts/test-sccache.sh
 
-# All live SMB suites CI runs (sccache + extended + conditional + write-back + stress).
+# All live SMB suites CI runs (sccache + extended + conditional + write-back +
+# stress + auth).
 test-live: build
 	./scripts/ci-local.sh --live-only
 
@@ -64,6 +65,11 @@ test-extended: build test
 # Write-back acknowledgement + machine-wide disk spill, on their own.
 test-writeback: build
 	./scripts/test-writeback.sh
+
+# SigV4 enforce/log/off against real signers, and aws-chunked decoding.
+.PHONY: test-auth
+test-auth: build
+	./scripts/test-auth.sh
 
 .PHONY: test-conditional
 test-conditional: build

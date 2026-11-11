@@ -19,11 +19,13 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::auth::{AuthFailure, Authenticator};
 use super::body::SpiceioBody;
 use super::existence::{ExistenceIndex, Probe};
 use super::headers::*;
 use super::multipart::MultipartStore;
 use super::object_cache::ObjectCache;
+use super::request_body::{self, BodyError, Framing, FramingError, RequestBody};
 use super::writeback::WriteBack;
 use super::xml::{self, XmlWriter};
 use crate::smb::condition::{ConditionFailure, WriteCondition};
@@ -59,6 +61,9 @@ pub struct AppState {
     /// Lazy per-directory name set. Fast 404s for missing leaves after one
     /// list of the parent; default on with immutable objects.
     pub existence: Arc<ExistenceIndex>,
+    /// S3 request authentication (`SPICEIO_S3_AUTH`). Off unless access keys
+    /// are configured, in which case one branch per request is all it costs.
+    pub auth: Arc<Authenticator>,
 }
 
 /// How long an operation that needs an object *on the backend* — a range read,
@@ -142,7 +147,9 @@ impl ClientSlot {
 ///
 /// Accepts the raw `Incoming` body — GetObject and PutObject stream without
 /// buffering the entire payload. Operations that need the full body (multipart,
-/// multi-delete, copy) collect it internally.
+/// multi-delete, copy) collect it internally. Handlers see it through
+/// [`RequestBody`]: aws-chunked framing removed, and the payload verified when
+/// the request was signed.
 pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Response<SpiceioBody> {
     // Split the request once, up front. The handlers below need the headers
     // and the body independently, and the only way to have both from an intact
@@ -154,13 +161,36 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     let query = parts.uri.query().unwrap_or("");
     let method = &parts.method;
     let hdrs = &parts.headers;
-    let declared_len: Option<u64> = get_header(hdrs, "content-length").and_then(|v| v.parse().ok());
     let request_id = generate_request_id();
 
-    // CORS preflight — no SMB, no admission slot.
+    // CORS preflight — no SMB, no admission slot. Browsers never send
+    // credentials on a preflight, so it is answered before authentication.
     if *method == Method::OPTIONS {
         return cors_preflight(&request_id, &state.region);
     }
+
+    // Authenticate before anything else can answer — the cache-hit and
+    // existence-index paths below, and ListBuckets, never reach SMB and would
+    // otherwise serve an unauthenticated client.
+    let plan = match state.auth.check(&parts, crate::smb::ops::now_epoch_secs()) {
+        Ok(plan) => plan,
+        Err(failure) => {
+            return with_common_headers(auth_error_response(&failure), &request_id, &state.region);
+        }
+    };
+    let framing = match request_body::framing(hdrs) {
+        Ok(f) => f,
+        Err(e) => {
+            return with_common_headers(framing_error_response(e), &request_id, &state.region);
+        }
+    };
+    // For aws-chunked, Content-Length counts the framing; every handler wants
+    // the length of what it will actually receive.
+    let declared_len: Option<u64> = match framing {
+        Framing::AwsChunked { decoded_len } => Some(decoded_len),
+        Framing::Plain => get_header(hdrs, "content-length").and_then(|v| v.parse().ok()),
+    };
+    let body = RequestBody::new(body, framing, plan);
 
     // Parse bucket and key from path-style: /{bucket}/{key...}
     // Percent-decode the key so encoded characters (spaces, Unicode, `%`, …)
@@ -1623,7 +1653,7 @@ fn write_condition(
 // ── PutObject (streaming, with atomic destination preconditions) ─────────
 
 async fn handle_put_object(
-    mut body: Incoming,
+    mut body: RequestBody,
     content_length: Option<u64>,
     hdrs: &http::HeaderMap,
     state: &AppState,
@@ -1777,9 +1807,9 @@ async fn handle_put_object(
                 }
             }
             Err(e) => {
-                crate::serr!("[spiceio] putobject body read error: {e}");
+                log_body_error(&e, "putobject");
                 wal.abort().await;
-                return io_to_s3_error(&io::Error::other(format!("body read error: {e}")));
+                return body_error_response(&e);
             }
         }
     }
@@ -2248,7 +2278,7 @@ async fn handle_create_multipart_upload(
 }
 
 async fn handle_upload_part(
-    req_body: Incoming,
+    req_body: RequestBody,
     declared_len: Option<u64>,
     state: &AppState,
     key: &str,
@@ -3144,6 +3174,82 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response<Spi
     xml_response(status, w.finish())
 }
 
+/// S3 error for a failed authentication. Carries S3's diagnostic extras: the
+/// key id, unsigned header names, and for a signature mismatch the canonical
+/// request and string to sign spiceio computed — the only practical way to
+/// see where a client's canonicalization differs.
+fn auth_error_response(f: &AuthFailure) -> Response<SpiceioBody> {
+    let mut w = XmlWriter::new();
+    w.declaration();
+    w.open("Error");
+    w.element("Code", f.code);
+    w.element("Message", &f.message);
+    if let Some(id) = f.access_key_id() {
+        w.element("AWSAccessKeyId", id);
+    }
+    if let Some(h) = f.headers_not_signed() {
+        w.element("HeadersNotSigned", h);
+    }
+    if let Some(s) = f.string_to_sign() {
+        w.element("StringToSign", s);
+    }
+    if let Some(c) = f.canonical_request() {
+        w.element("CanonicalRequest", c);
+    }
+    w.element("RequestId", "");
+    w.close("Error");
+    xml_response(f.status, w.finish())
+}
+
+fn framing_error_response(e: FramingError) -> Response<SpiceioBody> {
+    match e {
+        FramingError::MissingDecodedLength => error_response(
+            StatusCode::LENGTH_REQUIRED,
+            "MissingContentLength",
+            "aws-chunked uploads must send x-amz-decoded-content-length.",
+        ),
+        FramingError::DigestWithChunked => error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "aws-chunked uploads must use a STREAMING-* x-amz-content-sha256.",
+        ),
+    }
+}
+
+/// S3 error for a request body that could not be delivered intact.
+fn body_error_response(e: &BodyError) -> Response<SpiceioBody> {
+    match e {
+        BodyError::Transport(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            "The request body could not be read completely.",
+        ),
+        BodyError::DigestMismatch => error_response(
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "The provided 'x-amz-content-sha256' header does not match what was computed.",
+        ),
+        BodyError::ChunkSignature => error_response(
+            StatusCode::FORBIDDEN,
+            "SignatureDoesNotMatch",
+            "The aws-chunked signature we calculated does not match the signature you provided.",
+        ),
+        BodyError::Framing(_) | BodyError::DecodedLength { .. } => {
+            error_response(StatusCode::BAD_REQUEST, "IncompleteBody", &e.to_string())
+        }
+    }
+}
+
+/// Transport failures are logged as before; client-caused ones (bad framing,
+/// a failed payload check) go through the rate limiter, since a hostile or
+/// misconfigured client can produce one per request.
+fn log_body_error(e: &BodyError, context: &str) {
+    match e {
+        BodyError::Transport(_) => crate::serr!("[spiceio] {context} error: {e}"),
+        _ => super::auth::log_event(format_args!("{context}: rejected request body: {e}")),
+    }
+}
+
 fn ok_empty() -> Response<SpiceioBody> {
     Response::builder()
         .status(StatusCode::OK)
@@ -3338,7 +3444,7 @@ const MAX_BUFFERED_BODY: usize = 256 * 1024 * 1024;
 /// short body as if it were whole — an UploadPart in particular would
 /// acknowledge a part size that no later completion can reproduce.
 async fn collect_body(
-    mut body: Incoming,
+    mut body: RequestBody,
     declared_len: Option<u64>,
 ) -> Result<Bytes, Box<Response<SpiceioBody>>> {
     if let Some(declared) = declared_len
@@ -3374,13 +3480,11 @@ async fn collect_body(
                 // A failed body read must not be treated as an empty body —
                 // that would let mutating ops (UploadPart, CompleteMultipartUpload,
                 // multi-delete) silently proceed on a truncated request and
-                // return success. Surface it as an incomplete-body error.
-                crate::serr!("[spiceio] body collect error: {e}");
-                return Err(Box::new(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "IncompleteBody",
-                    "The request body could not be read completely.",
-                )));
+                // return success. Payload verification failures arrive here
+                // too, in place of end-of-stream, so nothing unverified is
+                // ever handed to a handler as a complete body.
+                log_body_error(&e, "body collect");
+                return Err(Box::new(body_error_response(&e)));
             }
         }
     }

@@ -190,6 +190,23 @@ jobs:
           SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/stress.log
         run: ./scripts/stress-concurrent.sh
 
+      - name: Run S3 auth + aws-chunked test
+        # SigV4 in enforce / log / off modes against real signers (curl,
+        # aws-cli, sccache, and mc when installed), plus aws-chunked uploads
+        # decoded on the way to the NAS in every mode. Port 18339.
+        if: ${{ env.HAS_SMB_PASS == 'true' }}
+        env:
+          SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
+          SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
+          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
+          SPICEIO_BUCKET: auth
+          SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_BIND: 127.0.0.1:18339
+          AWS_DEFAULT_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
+          SPICEIO_LOG_FILE: ${{ github.workspace }}/crash-logs/auth.log
+        run: ./scripts/test-auth.sh
+
       - name: Upload crash logs
         # Always run, even when a prior step failed (a crash fails the step):
         # this is exactly when the report matters. The debug binary under test

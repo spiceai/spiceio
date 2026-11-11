@@ -1,0 +1,19 @@
+PUT /bkt/x%20y.txt HTTP/1.1
+Content-Type: text/plain
+host: 127.0.0.1:18999
+Content-Encoding: aws-chunked
+x-amz-trailer: x-amz-checksum-crc64nvme
+x-amz-decoded-content-length: 11
+Content-Length: 60
+User-Agent: aws-cli/2.39.7 md/awscrt#0.38.1 ua/2.1 os/macos#27.2.0 md/arch#arm64 lang/python#3.15.2 md/pyimpl#CPython cfg/retry-mode#standard md/installer#source sid/b062b7a1b434 md/prompt#off md/command#s3.cp CRTS3NativeClient/1.5.2 platform/unknown m/N,W,Z,G,AN,Ag,b,E,AY,Ab,Al
+amz-sdk-invocation-id: 895a369e-bfee-e116-3b12-c17dcede50f2
+amz-sdk-request: attempt=1; max=3
+X-Amz-Date: 20261111T194142Z
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261111/us-east-1/s3/aws4_request, SignedHeaders=amz-sdk-invocation-id;amz-sdk-request;content-encoding;content-length;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-trailer, Signature=aaa9f0c3b99b91926d2342d0ae306caf5ecd156f648fff7474f1ff762ce91359
+x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+
+B
+hello world
+0
+x-amz-checksum-crc64nvme:jSnVw/bqjr4=
+

@@ -196,6 +196,7 @@ async fn connect_share(
     region: String,
     spill_dir: Option<String>,
     spill_bytes: u64,
+    auth: Arc<s3::auth::Authenticator>,
 ) -> Result<Arc<AppState>, std::io::Error> {
     let pool = SmbPool::connect(smb_config.clone(), smb_connections).await?;
     let admission = pool.admission_limit();
@@ -333,6 +334,7 @@ async fn connect_share(
         object_cache,
         writeback,
         existence,
+        auth,
     }))
 }
 
@@ -439,6 +441,33 @@ async fn main() {
     }
 
     let config = Config::from_env();
+
+    // S3 authentication. Validated before binding, like the strict prefixes:
+    // a key typo must stop startup, not leave the share open behind it.
+    let auth = match s3::auth::Authenticator::from_env() {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            serr!("[spiceio] S3 auth configuration: {e}");
+            flush_and_exit(1);
+        }
+    };
+    match auth.mode() {
+        s3::auth::Mode::Off => {
+            slog!("[spiceio] S3 auth: off (requests are not authenticated)");
+            if !config.bind_addr.ip().is_loopback() {
+                serr!(
+                    "[spiceio] warning: S3 auth is off and {} is not a loopback address; \
+                     anyone who can reach it can read, write and delete the whole share. \
+                     Configure SPICEIO_S3_ACCESS_KEY_ID/SPICEIO_S3_SECRET_ACCESS_KEY to require SigV4.",
+                    config.bind_addr
+                );
+            }
+        }
+        mode => slog!(
+            "[spiceio] S3 auth: {mode} (SigV4; access keys: {})",
+            auth.access_key_ids().join(", ")
+        ),
+    }
 
     // A malformed value never becomes valid, so reject it here: inside the
     // SMB connect loop below it would be retried forever behind a 503.
@@ -550,6 +579,7 @@ async fn main() {
         let spill_dir = config.spill_dir.clone();
         let spill_bytes = config.spill_bytes;
         let bind_addr_log = bind_addr;
+        let auth = Arc::clone(&auth);
 
         tokio::spawn(async move {
             let mut delay = Duration::from_secs(1);
@@ -563,6 +593,7 @@ async fn main() {
                     region.clone(),
                     spill_dir.clone(),
                     spill_bytes,
+                    Arc::clone(&auth),
                 )
                 .await
                 {

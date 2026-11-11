@@ -53,6 +53,7 @@ pub(crate) async fn state_and_client() -> (AppState, TcpStream, Arc<SmbClient>) 
             object_cache: Arc::new(ObjectCache::new(false, 1024, 1024, 64)),
             writeback: Arc::new(WriteBack::new(true, 1024)),
             existence: Arc::new(crate::s3::existence::ExistenceIndex::disabled()),
+            auth: Arc::new(crate::s3::auth::Authenticator::disabled()),
         },
         s,
         c,
@@ -390,4 +391,71 @@ async fn conditional_put_outside_strict_scope_never_writes() {
             .await
             .is_err()
     );
+}
+
+/// Parse a captured HTTP/1.1 request (`testdata/sigv4/*.http`) into its head
+/// and body, the way hyper would hand them to the router.
+pub(crate) fn parse_raw_request(raw: &[u8]) -> (http::request::Parts, Bytes) {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("request has a header terminator");
+    let head = std::str::from_utf8(&raw[..split]).expect("ASCII request head");
+    let body = Bytes::copy_from_slice(&raw[split + 4..]);
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap().split(' ');
+    let mut builder = http::Request::builder()
+        .method(request_line.next().unwrap())
+        .uri(request_line.next().unwrap());
+    for line in lines {
+        let (name, value) = line.split_once(':').expect("header line has a colon");
+        builder = builder.header(name.trim(), value.trim());
+    }
+    let (parts, ()) = builder.body(()).unwrap().into_parts();
+    (parts, body)
+}
+
+/// An in-memory request body delivered in the given pieces, so the body
+/// pipeline can be exercised at every frame boundary without a socket.
+pub(crate) struct PiecewiseBody(pub std::collections::VecDeque<Bytes>);
+
+impl PiecewiseBody {
+    /// `body` cut into `piece`-byte frames (the last one shorter).
+    pub(crate) fn split(body: &[u8], piece: usize) -> Self {
+        Self(
+            body.chunks(piece.max(1))
+                .map(Bytes::copy_from_slice)
+                .collect(),
+        )
+    }
+}
+
+impl http_body::Body for PiecewiseBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(http_body::Frame::data(b))))
+    }
+}
+
+/// Drain a body pipeline to bytes, or the first error it reports.
+pub(crate) async fn drain_request_body<B>(
+    mut body: crate::s3::request_body::RequestBody<B>,
+) -> Result<Vec<u8>, crate::s3::request_body::BodyError>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    use http_body_util::BodyExt;
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out)
 }

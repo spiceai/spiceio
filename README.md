@@ -26,6 +26,7 @@ S3 client  --->  spiceio (HTTP :8333)  --->  SMB server (TCP :445)
 - **Verified before publish** -- every streamed write (PutObject, CopyObject, multipart assembly) is size-checked *before* it replaces the destination, so a failed check leaves the existing object untouched
 - **Non-blocking logging** -- timestamped stdout/stderr with optional file tee via `SPICEIO_LOG_FILE`; dedicated writer thread, never stalls the proxy
 - **Crash reporting built in** -- panics and fatal signals (SIGSEGV/SIGBUS/...) always leave a diagnosable report on stderr and in the log file: version, uptime, panic location, registers, fault address, and a backtrace with the info needed to symbolize stripped release builds offline
+- **Optional SigV4 authentication** -- require every request to be signed with a configured access key (header or presigned URL, signed payloads and signed aws-chunked uploads included), or run in a log-only mode while clients are moved onto keys. Off by default; see [Authentication](#authentication)
 - **Simple config** -- everything via environment variables, single binary, `--version` flag
 - **Zero external crypto** -- NTLMv2 auth and AES-CMAC signing via macOS CommonCrypto FFI
 
@@ -58,6 +59,11 @@ aws s3 ls s3://files/ --endpoint-url http://localhost:8333
 aws s3 cp myfile.txt s3://files/remote.txt --endpoint-url http://localhost:8333
 ```
 
+Without access keys configured, spiceio does not authenticate requests: anyone
+who can reach the port can read, write and delete the whole share with the SMB
+account's rights. Bind to loopback, or configure keys to require signed
+requests ([Authentication](#authentication)).
+
 ### sccache example
 
 Start spiceio with immutable-object caching on — sccache keys are content
@@ -78,6 +84,7 @@ export SCCACHE_ENDPOINT=http://localhost:8333
 export SCCACHE_REGION=us-east-1
 export SCCACHE_S3_USE_SSL=false
 export SCCACHE_S3_KEY_PREFIX=sccache
+# Any values work while spiceio's auth is off; with it on, use a configured key.
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 export RUSTC_WRAPPER=sccache
@@ -148,6 +155,82 @@ All configuration is via environment variables:
 | `SPICEIO_WRITE_BACK`          | no       | **on**              | Acknowledge PutObject from memory and write to the NAS in the background. `0`/`false`/`off` disables. **Trades durability for latency** — see [Write-back](#write-back) |
 | `SPICEIO_WRITE_BACK_BYTES`    | no       | `1073741824` (1 GiB) | Ceiling on un-flushed bytes; past it PutObject writes through synchronously, applying backpressure |
 | `SPICEIO_STRICT_PREFIXES`     | no       | disabled            | Comma-separated key prefixes with synchronous, server-coordinated writes and atomic write preconditions. `*` selects the whole bucket. Overrides write-back, immutable cache shortcuts, and the existence index for matching keys. Configure identically on every instance; see [Conditional writes](#conditional-writes) |
+| `SPICEIO_S3_ACCESS_KEY_ID`    | no       | *(none)*            | Access key id clients sign with. Set together with `SPICEIO_S3_SECRET_ACCESS_KEY`; see [Authentication](#authentication) |
+| `SPICEIO_S3_SECRET_ACCESS_KEY`| no       | *(none)*            | Its secret (at least 16 characters) |
+| `SPICEIO_S3_CREDENTIALS_FILE` | no       | *(none)*            | File of `ACCESS_KEY_ID SECRET` lines, for several keys or a rotation. Must not be group/other accessible (`chmod 600`) |
+| `SPICEIO_S3_AUTH`             | no       | `enforce` if a key is configured, else `off` | `off` (no authentication), `log` (verify and log failures, serve anyway), `enforce` (reject unsigned and badly signed requests) |
+
+## Authentication
+
+spiceio can require that every request be signed with AWS Signature Version 4
+by an access key you configure. Clients sign exactly as they would for S3, with
+the key as their AWS credentials. The keys authenticate clients *to spiceio*;
+spiceio still connects to the NAS with its own SMB account, so no client ever
+holds the SMB password.
+
+```bash
+export SPICEIO_S3_ACCESS_KEY_ID=ci-cache
+export SPICEIO_S3_SECRET_ACCESS_KEY="$(openssl rand -base64 30)"
+./target/release/spiceio   # S3 auth: enforce (SigV4; access keys: ci-cache)
+```
+
+```bash
+# Any S3 client, with that key as its AWS credentials:
+export AWS_ACCESS_KEY_ID=ci-cache
+export AWS_SECRET_ACCESS_KEY=...   # the same secret
+aws s3 ls s3://files/ --endpoint-url http://localhost:8333
+```
+
+Three modes, set with `SPICEIO_S3_AUTH`:
+
+- **`off`** — no authentication. The default when no key is configured, so
+  existing deployments behave exactly as before.
+- **`enforce`** — every request except a CORS preflight must carry a valid
+  signature from a configured key. This is the default once any key is
+  configured: a key that is configured but not required would be a trap.
+  Checked before anything else answers, including cache hits that never touch
+  the NAS.
+- **`log`** — verify exactly as `enforce` does, but serve the request anyway
+  and log what would have been rejected. Use it to move clients onto keys
+  without an outage, then switch to `enforce` once the log is quiet.
+
+What is verified:
+
+- `Authorization` header signatures and presigned URLs (`aws s3 presign`),
+  with a 15-minute clock-skew window and presigned expiry up to 7 days.
+- Signed payloads: a body that does not hash to its signed
+  `x-amz-content-sha256` is rejected (`XAmzContentSHA256Mismatch`) before it
+  is stored or acknowledged, write-back included.
+- Signed aws-chunked uploads (minio-go/mc), chunk by chunk, including signed
+  trailers. Unsigned aws-chunked uploads (`aws s3 cp` in aws-cli v2) are
+  accepted when the request headers are signed, as S3 does.
+- Every `x-amz-*` header must be signed, so a header such as
+  `x-amz-copy-source` cannot be added to a signed request in transit.
+
+Session tokens are refused rather than ignored: only long-term keys are
+supported. A rejected request returns the standard S3 error code; for
+`SignatureDoesNotMatch` the response includes the canonical request and string
+to sign that spiceio computed, which is the quickest way to find where a
+client's signing differs. Failures are logged at most once a second, with a
+count of what was suppressed.
+
+To rotate a key without downtime, list old and new together in a credentials
+file, move clients over, then remove the old line and restart:
+
+```bash
+cat > ~/.config/spiceio/keys <<'KEYS'
+# ACCESS_KEY_ID  SECRET_ACCESS_KEY
+ci-cache-2025    old-secret...
+ci-cache-2026    new-secret...
+KEYS
+chmod 600 ~/.config/spiceio/keys
+export SPICEIO_S3_CREDENTIALS_FILE=~/.config/spiceio/keys
+```
+
+Over plain HTTP, SigV4 keeps the secret off the wire and stops a request from
+being altered, but a captured request can be replayed within the 15-minute
+window and the data itself is not encrypted. Keep spiceio on a trusted network
+or loopback.
 
 ## OTEL metrics (Spice Cloud)
 
@@ -315,6 +398,11 @@ prefix isolation, dry runs, and partial deletion errors without a NAS.
 
 Path-style addressing only (no virtual-hosted-style), over HTTP/1.1.
 
+Uploads sent with `Content-Encoding: aws-chunked` (aws-cli v2's `aws s3 cp`,
+minio-go/mc, and other SDKs that stream with a trailing checksum) are decoded
+before they are stored, in every authentication mode. The trailing checksum is
+parsed but not verified.
+
 ListObjects without a `delimiter` walks subdirectories recursively (full S3
 semantics — `aws s3 ls --recursive` and `aws s3 sync` see every key); with
 `delimiter=/` it lists one level and reports subdirectories as common
@@ -425,7 +513,8 @@ make install           # install the release build (+ dSYM) into ~/.local/bin
 make lint              # static only — not sufficient to claim CI will pass
 make test-unit         # cargo test (no SMB)
 make test              # sccache integration (requires SPICEIO_SMB_USER/PASS)
-make test-live         # sccache + extended + concurrent stress (CI live steps)
+make test-live         # every live SMB suite CI runs
+make test-auth         # S3 auth modes + aws-chunked, against real clients
 make test-extended     # also builds spiceai repo through sccache/spiceio
 make clean             # cargo clean
 ```

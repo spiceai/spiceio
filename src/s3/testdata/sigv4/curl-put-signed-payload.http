@@ -1,0 +1,11 @@
+PUT /bkt/put.txt HTTP/1.1
+Host: 127.0.0.1:18999
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261111/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=e109583ad71ab9fcf842adc6c20e1695e69639878f883040e3ae82ff7ed4c26b
+X-Amz-Date: 20261111T194154Z
+x-amz-content-sha256: b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+User-Agent: curl/8.7.1
+Accept: */*
+Content-Length: 11
+Content-Type: application/x-www-form-urlencoded
+
+hello world
