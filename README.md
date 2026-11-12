@@ -214,13 +214,17 @@ What is verified:
   `x-amz-copy-source` cannot be added to a signed request in transit. In a
   presigned request this includes `x-amz-content-sha256` and `x-amz-date`,
   which its signature covers only when they are listed.
-- The request is read exactly as it was signed. Query parameter names are
-  decoded the way the signature decodes them. A signed request that repeats a
-  query parameter or a signed header is refused (`InvalidArgument`), because
-  a signature does not cover their order. One that lacks a header it signed
-  is refused too (`AccessDenied`), because an absent header signs like an
-  empty one. Either could otherwise be rewritten in transit into a different
-  request, such as dropping a signed empty `If-Match`.
+- The request is read exactly as it was signed. The path is split into
+  bucket and key after decoding, and query parameter names are decoded, the
+  way the signature decodes them: `/bucket%2Fkey` is `/bucket/key`. A signed
+  request that repeats a query parameter or a signed header is refused
+  (`InvalidArgument`), because a signature does not cover their order. So is
+  raw whitespace in `x-amz-copy-source`, because header values sign with
+  whitespace runs collapsed; percent-encode it, as S3 clients do. One that
+  lacks a header it signed is refused too (`AccessDenied`), because an absent
+  header signs like an empty one. Any of these could otherwise be rewritten
+  in transit into a different request, such as dropping a signed empty
+  `If-Match` or copying a different object.
 
 Session tokens are refused rather than ignored: only long-term keys are
 supported. A rejected request returns the standard S3 error code; for

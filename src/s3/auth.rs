@@ -823,8 +823,24 @@ fn reject_session_token(headers: &HeaderMap, query: &str) -> Result<(), AuthFail
 ///   and two `X` lines sign alike, and readers take the first;
 /// - an absent signed header: it canonicalizes like an empty one (`name:`),
 ///   so a signed empty `If-Match` could be dropped to make the write
-///   unconditional.
+///   unconditional;
+/// - raw whitespace in `x-amz-copy-source`: header values sign with runs of
+///   spaces and tabs collapsed, so `/b/a b` and `/b/a  b` sign alike while
+///   naming different objects. S3 clients percent-encode the copy source.
+///   The other headers spiceio interprets read the same either way (dates
+///   split on any whitespace, ETag lists are trimmed per item).
 fn reject_rewritable(parts: &Parts, signed: &str) -> Result<(), AuthFailure> {
+    if parts
+        .headers
+        .get("x-amz-copy-source")
+        .is_some_and(|v| v.as_bytes().iter().any(|b| matches!(b, b' ' | b'\t')))
+    {
+        return Err(AuthFailure::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-copy-source must percent-encode spaces and tabs in a signed request.",
+        ));
+    }
     if let Some(name) = sigv4::repeated_query_param(parts.uri.query().unwrap_or("")) {
         return Err(AuthFailure::new(
             StatusCode::BAD_REQUEST,
