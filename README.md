@@ -200,12 +200,18 @@ What is verified:
   with a 15-minute clock-skew window and presigned expiry up to 7 days.
 - Signed payloads: a body that does not hash to its signed
   `x-amz-content-sha256` is rejected (`XAmzContentSHA256Mismatch`) before it
-  is stored or acknowledged, write-back included.
+  is stored or acknowledged, write-back included, and before operations that
+  ignore their body (DELETE, CopyObject, multipart initiate/abort) act.
 - Signed aws-chunked uploads (minio-go/mc), chunk by chunk, including signed
   trailers. Unsigned aws-chunked uploads (`aws s3 cp` in aws-cli v2) are
   accepted when the request headers are signed, as S3 does.
 - Every `x-amz-*` header must be signed, so a header such as
   `x-amz-copy-source` cannot be added to a signed request in transit.
+- The request is read exactly as it was signed. Query parameter names are
+  decoded the way the signature decodes them, and a signed request that
+  repeats a query parameter or a signed header is refused
+  (`InvalidArgument`): a signature does not cover their order, so it could
+  be rearranged in transit into a different operation.
 
 Session tokens are refused rather than ignored: only long-term keys are
 supported. A rejected request returns the standard S3 error code; for

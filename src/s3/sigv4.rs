@@ -121,6 +121,51 @@ pub fn canonical_uri_into(out: &mut Vec<u8>, raw_path: &str) {
     uri_encode_into(out, &percent_decode(raw_path), true);
 }
 
+/// The query's `name=value` pieces, still encoded: split on `&`, empty pieces
+/// skipped, a piece without `=` has an empty value.
+fn raw_query_pairs(raw_query: &str) -> impl Iterator<Item = (&str, &str)> {
+    raw_query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+}
+
+fn percent_decode_lossy(s: &str) -> Cow<'_, str> {
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy()
+}
+
+/// The query's parameters, names and values percent-decoded, split by the
+/// same rules as the canonical query. Everything that reads a parameter of a
+/// request reads it through this. The signature covers the canonical query,
+/// so raw queries that canonicalize alike carry one signature, and any reader
+/// that tells them apart lets whoever is in the path rewrite one into the
+/// other: compare names raw, and `?%75ploadId=A` would turn a signed
+/// AbortMultipartUpload into a DeleteObject. Borrows when nothing is encoded.
+pub fn query_pairs(raw_query: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+    raw_query_pairs(raw_query).map(|(k, v)| (percent_decode_lossy(k), percent_decode_lossy(v)))
+}
+
+/// A parameter name that occurs more than once, if any. The canonical query
+/// is sorted, so the order of a repeated parameter is not signed, while
+/// readers take the first.
+pub fn repeated_query_param(raw_query: &str) -> Option<String> {
+    let mut names: Vec<Cow<'_, str>> = query_pairs(raw_query).map(|(k, _)| k).collect();
+    names.sort_unstable();
+    names
+        .windows(2)
+        .find(|w| w[0] == w[1])
+        .map(|w| w[0].clone().into_owned())
+}
+
+/// A signed header that occurs more than once, if any. Repeated values are
+/// joined with `,` for signing, so `X: a,b` and `X: a` + `X: b` sign alike,
+/// while readers take the first value.
+pub fn repeated_signed_header<'a>(headers: &HeaderMap, signed_headers: &'a str) -> Option<&'a str> {
+    signed_headers
+        .split(';')
+        .find(|name| headers.get_all(*name).iter().nth(1).is_some())
+}
+
 /// Canonical query string: every parameter decoded and re-encoded (`/`
 /// included), sorted by name then value, `name=value` joined with `&`. A
 /// parameter without `=` canonicalizes as `name=`. `exclude` drops one
@@ -130,11 +175,7 @@ pub fn canonical_query_into(out: &mut Vec<u8>, raw_query: &str, exclude: Option<
         return;
     }
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for pair in raw_query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+    for (k, v) in raw_query_pairs(raw_query) {
         let k = percent_decode(k);
         if exclude.is_some_and(|x| x.as_bytes() == &*k) {
             continue;

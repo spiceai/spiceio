@@ -26,6 +26,7 @@ use super::headers::*;
 use super::multipart::MultipartStore;
 use super::object_cache::ObjectCache;
 use super::request_body::{self, BodyError, Framing, FramingError, RequestBody};
+use super::sigv4;
 use super::writeback::WriteBack;
 use super::xml::{self, XmlWriter};
 use crate::smb::condition::{ConditionFailure, WriteCondition};
@@ -190,7 +191,17 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         Framing::AwsChunked { decoded_len } => Some(decoded_len),
         Framing::Plain => get_header(hdrs, "content-length").and_then(|v| v.parse().ok()),
     };
-    let body = RequestBody::new(body, framing, plan);
+    let mut body = RequestBody::new(body, framing, plan);
+
+    // No GET, HEAD or DELETE handler reads a body, and two of them mutate
+    // (DeleteObject, AbortMultipartUpload). A signed payload must match before
+    // any of them answers, as it must for the operations that read it — and
+    // before the cache-hit and existence-index paths below can answer either.
+    if matches!(*method, Method::GET | Method::HEAD | Method::DELETE)
+        && let Err(resp) = verify_unused_body(&mut body, declared_len).await
+    {
+        return with_common_headers(*resp, &request_id, &state.region);
+    }
 
     // Parse bucket and key from path-style: /{bucket}/{key...}
     // Percent-decode the key so encoded characters (spaces, Unicode, `%`, …)
@@ -348,7 +359,10 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     // Multipart: POST with ?uploads (initiate) or ?uploadId=... (complete)
     if *method == Method::POST {
         let resp = if has_query_flag(query, "uploads") && !has_query_flag(query, "uploadId") {
-            handle_create_multipart_upload(hdrs, state, key).await
+            match verify_unused_body(&mut body, declared_len).await {
+                Ok(()) => handle_create_multipart_upload(hdrs, state, key).await,
+                Err(resp) => *resp,
+            }
         } else if let Some(upload_id) = extract_query_param(query, "uploadId") {
             match collect_body(body, declared_len).await {
                 Ok(body) => match write_condition(hdrs, state, key) {
@@ -385,7 +399,10 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         // branch the copy-source PUT falls through to a normal UploadPart,
         // which reads an empty body and returns the wrong response shape.
         let resp = if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-            handle_upload_part_copy(hdrs, state, key, &upload_id, part_number).await
+            match verify_unused_body(&mut body, declared_len).await {
+                Ok(()) => handle_upload_part_copy(hdrs, state, key, &upload_id, part_number).await,
+                Err(resp) => *resp,
+            }
         } else {
             handle_upload_part(body, declared_len, state, key, &upload_id, part_number).await
         };
@@ -477,7 +494,10 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         Method::PUT => {
             // CopyObject: PUT with x-amz-copy-source header
             if hdrs.contains_key(X_AMZ_COPY_SOURCE) {
-                handle_copy_object(hdrs, state, key).await
+                match verify_unused_body(&mut body, declared_len).await {
+                    Ok(()) => handle_copy_object(hdrs, state, key).await,
+                    Err(resp) => *resp,
+                }
             } else {
                 handle_put_object(body, declared_len, hdrs, state, key).await
             }
@@ -3379,10 +3399,12 @@ pub fn service_unavailable(message: &str) -> Response<SpiceioBody> {
 /// `&` boundary) — not merely a substring of some value. Used for sub-resource
 /// routing so e.g. `?response-content-disposition=acl.txt` doesn't route to the
 /// ACL handler.
+///
+/// Names are percent-decoded, as the signature reads them
+/// ([`sigv4::query_pairs`]): routing on the raw name would let a signed
+/// request be re-encoded into a different operation.
 fn has_query_flag(query: &str, key: &str) -> bool {
-    query
-        .split('&')
-        .any(|pair| pair.split('=').next() == Some(key))
+    sigv4::query_pairs(query).any(|(k, _)| k == key)
 }
 
 /// Reject object keys that could escape the share via `..` path traversal.
@@ -3392,15 +3414,11 @@ fn key_has_traversal(key: &str) -> bool {
     ShareSession::reserved_key(key) || key.split(['/', '\\']).any(ShareSession::is_parent_alias)
 }
 
+/// The first value of query parameter `key`, decoded; a bare `?key` reads as
+/// empty, the same as `?key=`, because both sign alike. A signed request
+/// cannot repeat a parameter (`auth` refuses it), so "first" is the only one.
 fn extract_query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == key
-        {
-            return Some(percent_decode(v));
-        }
-    }
-    None
+    sigv4::query_pairs(query).find_map(|(k, v)| (k == key).then(|| v.into_owned()))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -3502,6 +3520,52 @@ async fn collect_body(
         )));
     }
     Ok(Bytes::from(buf))
+}
+
+/// Read the body of an operation that has no use for it, when that body is
+/// checked against the signature (a signed digest or signed chunks), so the
+/// operation runs only for a request that matches what was signed — the same
+/// guarantee [`collect_body`] and the streaming PUT give the operations that
+/// do read their body. Nothing is buffered. A body nothing checks (unsigned,
+/// or auth off) is left unread, as it always was.
+async fn verify_unused_body(
+    body: &mut RequestBody,
+    declared_len: Option<u64>,
+) -> Result<(), Box<Response<SpiceioBody>>> {
+    if !body.verifies_payload() {
+        return Ok(());
+    }
+    let mut read: u64 = 0;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    read = read.saturating_add(data.len() as u64);
+                    if read > MAX_BUFFERED_BODY as u64 {
+                        return Err(Box::new(error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "EntityTooLarge",
+                            "Request body exceeds the maximum size for this operation",
+                        )));
+                    }
+                }
+            }
+            Err(e) => {
+                log_body_error(&e, "body verify");
+                return Err(Box::new(body_error_response(&e)));
+            }
+        }
+    }
+    if let Some(declared) = declared_len
+        && read != declared
+    {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            "The request body did not match the declared Content-Length.",
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3678,6 +3742,54 @@ mod tests {
             "response-content-disposition=acl.txt",
             "acl"
         ));
+    }
+
+    /// A signature covers the canonical query, so raw queries that
+    /// canonicalize alike are one signed request. If dispatch told them apart,
+    /// anyone in the path could rewrite a signed AbortMultipartUpload
+    /// (`?uploadId=A`) into a DeleteObject (`?%75ploadId=A`) without touching
+    /// the signature.
+    #[test]
+    fn dispatch_reads_every_form_of_one_canonical_query_alike() {
+        let groups: &[&[&str]] = &[
+            &[
+                "uploadId=A",
+                "%75ploadId=A",
+                "upload%49d=%41",
+                "uploadId=%41",
+            ],
+            &["uploads", "uploads=", "%75ploads", "%75ploads="],
+            &[
+                "partNumber=1&uploadId=A",
+                "uploadId=A&partNumber=1",
+                "partNumber=1&&uploadId=A",
+                "partNumber=%31&uploadId=A",
+            ],
+            &["list-type=2&prefix=a%2Fb", "list-type=2&prefix=a/b"],
+        ];
+        let canonical = |q: &str| {
+            let mut out = Vec::new();
+            sigv4::canonical_query_into(&mut out, q, None);
+            out
+        };
+        for group in groups {
+            let first = group[0];
+            for q in *group {
+                assert_eq!(canonical(q), canonical(first), "premise: {q} ~ {first}");
+                for name in ["uploadId", "uploads", "partNumber", "list-type", "prefix"] {
+                    assert_eq!(
+                        has_query_flag(q, name),
+                        has_query_flag(first, name),
+                        "has_query_flag({q:?}, {name})"
+                    );
+                    assert_eq!(
+                        extract_query_param(q, name),
+                        extract_query_param(first, name),
+                        "extract_query_param({q:?}, {name})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

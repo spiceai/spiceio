@@ -511,6 +511,7 @@ impl Authenticator {
         check_skew(ts, now)?;
         reject_session_token(headers, parts.uri.query().unwrap_or(""))?;
         reject_unsigned_amz_headers(headers, auth.signed_headers)?;
+        reject_repeats(parts, auth.signed_headers)?;
         let payload_hash = header_payload_hash(headers)?;
         let secret = self.secret(cred.access_key_id)?;
 
@@ -586,6 +587,7 @@ impl Authenticator {
             return Err(AuthFailure::denied("Request has expired."));
         }
         reject_unsigned_amz_headers(headers, &signed_headers)?;
+        reject_repeats(parts, &signed_headers)?;
         // A presigned URL cannot sign a body it has not seen, so the payload is
         // UNSIGNED-PAYLOAD unless the signer put a digest in the query.
         let payload_hash: Cow<'_, str> = match query_param(query, "X-Amz-Content-Sha256") {
@@ -716,6 +718,30 @@ fn reject_session_token(headers: &HeaderMap, query: &str) -> Result<(), AuthFail
     Ok(())
 }
 
+/// Refuse what a signature cannot pin down: a repeated query parameter (the
+/// canonical query is sorted, so which one comes first is not signed) or a
+/// repeated signed header (its values are joined with `,`, so `X: a,b` and
+/// two `X` lines sign alike). Dispatch and the handlers read the first of
+/// each, so either would let the request be rearranged in flight into one
+/// that does something else under the same signature.
+fn reject_repeats(parts: &Parts, signed: &str) -> Result<(), AuthFailure> {
+    if let Some(name) = sigv4::repeated_query_param(parts.uri.query().unwrap_or("")) {
+        return Err(AuthFailure::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            format!("Query parameter {name:?} appears more than once in a signed request."),
+        ));
+    }
+    if let Some(name) = sigv4::repeated_signed_header(&parts.headers, signed) {
+        return Err(AuthFailure::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            format!("Signed header {name:?} appears more than once."),
+        ));
+    }
+    Ok(())
+}
+
 /// S3 requires every `x-amz-*` header to be signed, so none can be added or
 /// changed in flight to alter what the request does (`x-amz-copy-source`
 /// turning a PUT into a copy, for one). `x-amz-content-sha256` and
@@ -780,14 +806,10 @@ fn header_payload_hash(headers: &HeaderMap) -> Result<Cow<'_, str>, AuthFailure>
     }
 }
 
-/// First query parameter named exactly `name`, percent-decoded. Parameter
-/// names are compared raw: the X-Amz-* names are plain ASCII and no client
-/// encodes them.
+/// First query parameter named `name`, read the way the canonical query
+/// reads it (see [`sigv4::query_pairs`]).
 fn query_param<'a>(query: &'a str, name: &str) -> Option<Cow<'a, str>> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        (k == name).then(|| percent_encoding::percent_decode_str(v).decode_utf8_lossy())
-    })
+    sigv4::query_pairs(query).find_map(|(k, v)| (k == name).then_some(v))
 }
 
 /// `yyyymmddThhmmssZ` for a Unix time (the form a `Date`-signed request's

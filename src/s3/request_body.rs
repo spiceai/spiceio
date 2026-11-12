@@ -468,6 +468,18 @@ impl<B> RequestBody<B> {
             done: false,
         }
     }
+
+    /// Whether reading this body to its end checks it against the signature
+    /// (a signed digest, or signed chunks). An operation that has no use for
+    /// the body must still read such a body before it acts; otherwise a
+    /// payload that does not match what was signed goes unnoticed.
+    pub fn verifies_payload(&self) -> bool {
+        match &self.kind {
+            Kind::Plain => false,
+            Kind::Digest { .. } => true,
+            Kind::Chunked(decoder) => decoder.verify.is_some(),
+        }
+    }
 }
 
 impl<B> Body for RequestBody<B>

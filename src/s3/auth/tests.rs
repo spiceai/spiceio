@@ -681,6 +681,62 @@ fn every_amz_header_must_be_signed() {
 }
 
 #[test]
+fn repeats_the_signature_cannot_order_are_refused() {
+    // The canonical query is sorted and repeated header values are joined
+    // with `,`, so neither the order of a repeated parameter nor the split of
+    // a header into several lines is signed — while dispatch and the
+    // handlers read the first of each. A request carrying either cannot be
+    // read the way its signer meant, so it is refused.
+    for q in [
+        "uploadId=a&uploadId=b",
+        "uploadId=b&uploadId=a",
+        "uploadId=a&%75ploadId=b",
+        "acl&acl=",
+    ] {
+        let mut parts = get(&format!("/b/k?{q}"));
+        sign(&mut parts, SECRET, NOW_AMZ, None);
+        let f = failure(enforce().check(&parts, NOW));
+        assert_eq!(
+            (f.status, f.code),
+            (StatusCode::BAD_REQUEST, "InvalidArgument"),
+            "{q}: {}",
+            f.message
+        );
+    }
+    // X-Amz-Signature is left out of the canonical query, so a second one
+    // changes nothing that was signed.
+    let uri = format!("{PRESIGNED}&X-Amz-Signature={}", "0".repeat(64));
+    assert_eq!(
+        failure(enforce().check(&presigned(&uri), PRESIGNED_AT)).code,
+        "InvalidArgument"
+    );
+
+    // One header holding `a,b` and the same header twice sign identically.
+    let mut parts = Request::put("/b/k")
+        .header("x-amz-meta-note", "a,b")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    sign(&mut parts, SECRET, NOW_AMZ, Some(sigv4::UNSIGNED_PAYLOAD));
+    assert!(enforce().check(&parts, NOW).is_ok());
+    parts.headers.remove("x-amz-meta-note");
+    parts
+        .headers
+        .append("x-amz-meta-note", "a".parse().unwrap());
+    parts
+        .headers
+        .append("x-amz-meta-note", "b".parse().unwrap());
+    let f = failure(enforce().check(&parts, NOW));
+    assert_eq!(
+        (f.status, f.code),
+        (StatusCode::BAD_REQUEST, "InvalidArgument"),
+        "{}",
+        f.message
+    );
+}
+
+#[test]
 fn session_tokens_are_refused_not_ignored() {
     let mut parts = get("/b/k");
     parts
@@ -1108,4 +1164,101 @@ async fn router_enforce_mode_verifies_payloads_before_acknowledging() {
     sign(&mut read, SECRET, &now_amz(), None);
     let resp = send(&state, raw(&read, b"")).await;
     assert!(resp.ends_with("\r\n\r\nhello world"), "{resp:?}");
+}
+
+#[tokio::test]
+async fn router_reads_a_signed_query_the_way_it_was_signed() {
+    let (state, _smb) = router_state(enforce()).await;
+    let mut put = Request::put("/audit/q.txt")
+        .header("host", "localhost")
+        .header("content-length", "4")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    sign(&mut put, SECRET, &now_amz(), Some(sigv4::UNSIGNED_PAYLOAD));
+    let resp = send(&state, raw(&put, b"data")).await;
+    assert_eq!(status(&resp), "200", "{resp}");
+
+    // A signed ListParts. Re-encoding the parameter name keeps the canonical
+    // query, and so the signature; it must stay a ListParts rather than
+    // become a GetObject of the key (the DELETE form of the same rewrite
+    // turns AbortMultipartUpload into DeleteObject).
+    let mut list_parts = get("/audit/q.txt?uploadId=nope");
+    sign(&mut list_parts, SECRET, &now_amz(), None);
+    for uri in ["/audit/q.txt?uploadId=nope", "/audit/q.txt?%75ploadId=nope"] {
+        list_parts.uri = uri.parse().unwrap();
+        let resp = send(&state, raw(&list_parts, b"")).await;
+        assert_eq!(status(&resp), "404", "{uri}: {resp}");
+        assert!(resp.contains("<Code>NoSuchUpload</Code>"), "{uri}: {resp}");
+    }
+}
+
+/// Operations that never read the body still answer only once it matches the
+/// payload hash that was signed.
+#[tokio::test]
+async fn router_enforce_mode_verifies_payloads_the_operation_does_not_read() {
+    let (state, _smb) = router_state(enforce()).await;
+    let digest = sigv4::hex32(&sha256(b"x"));
+    let digest = std::str::from_utf8(&digest).unwrap();
+    let request = |method: &str, uri: &str, extra: Option<(&str, &str)>| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost")
+            .header("content-length", "1");
+        if let Some((k, v)) = extra {
+            b = b.header(k, v);
+        }
+        let mut parts = b.body(()).unwrap().into_parts().0;
+        sign(&mut parts, SECRET, &now_amz(), Some(digest));
+        parts
+    };
+
+    // Answered from memory, so the signed body shows the handler still runs.
+    for (method, uri, extra) in [
+        ("GET", "/audit/body.txt?uploadId=nope", None),
+        ("DELETE", "/audit/body.txt?uploadId=nope", None),
+        (
+            "PUT",
+            "/audit/body.txt?partNumber=1&uploadId=nope",
+            Some(("x-amz-copy-source", "/audit/src.txt")),
+        ),
+    ] {
+        let parts = request(method, uri, extra);
+        let resp = send(&state, raw(&parts, b"x")).await;
+        assert_eq!(status(&resp), "404", "{method} {uri}, signed body: {resp}");
+        let resp = send(&state, raw(&parts, b"y")).await;
+        assert_eq!(status(&resp), "400", "{method} {uri}, other body: {resp}");
+        assert!(
+            resp.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+            "{resp}"
+        );
+    }
+
+    // These go to the backend once verified, and the test server never
+    // answers, so a reply within the timeout is one given before the
+    // handler ran.
+    for (method, uri, extra) in [
+        (
+            "PUT",
+            "/audit/copy.txt",
+            Some(("x-amz-copy-source", "/audit/src.txt")),
+        ),
+        ("POST", "/audit/new.txt?uploads", None),
+        ("DELETE", "/audit/body.txt", None),
+    ] {
+        let parts = request(method, uri, extra);
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(&state, raw(&parts, b"y")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{method} {uri} reached the backend with an unverified body"));
+        assert_eq!(status(&resp), "400", "{method} {uri}: {resp}");
+        assert!(
+            resp.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+            "{resp}"
+        );
+    }
 }

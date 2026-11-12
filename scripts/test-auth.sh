@@ -78,7 +78,9 @@ cleanup() {
     echo ""
     echo "[auth] cleaning up..."
     if [[ "$SCCACHE_STARTED" -eq 1 ]]; then
-        sccache --stop-server >/dev/null 2>&1 || true
+        # Through the same wrapper that started it: a bare `sccache` would
+        # stop the caller's daemon on the default port and leave ours running.
+        sccache_env sccache --stop-server >/dev/null 2>&1 || true
     fi
     if [[ -n "$SPICEIO_PID" ]]; then
         kill "$SPICEIO_PID" 2>/dev/null || true
