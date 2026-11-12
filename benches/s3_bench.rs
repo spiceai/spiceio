@@ -187,12 +187,21 @@ fn bench_auth_check(c: &mut Criterion) {
         enforce.check(&parts, BENCH_NOW).is_ok(),
         "bench request must verify"
     );
+    // The router reads the framing once, for this and for the body.
+    let framing = Some(Framing::Plain);
     let mut g = c.benchmark_group("auth_check");
     g.bench_function("off", |b| {
-        b.iter(|| off.check(black_box(&parts), BENCH_NOW).is_ok())
+        b.iter(|| {
+            off.check_framed(black_box(&parts), framing, BENCH_NOW)
+                .is_ok()
+        })
     });
     g.bench_function("sigv4_get", |b| {
-        b.iter(|| enforce.check(black_box(&parts), BENCH_NOW).is_ok())
+        b.iter(|| {
+            enforce
+                .check_framed(black_box(&parts), framing, BENCH_NOW)
+                .is_ok()
+        })
     });
     g.finish();
 }

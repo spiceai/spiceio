@@ -173,13 +173,24 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
     // Authenticate before anything else can answer — the cache-hit and
     // existence-index paths below, and ListBuckets, never reach SMB and would
     // otherwise serve an unauthenticated client.
-    let plan = match state.auth.check(&parts, crate::smb::ops::now_epoch_secs()) {
-        Ok(plan) => plan,
-        Err(failure) => {
-            return with_common_headers(auth_error_response(&failure), &request_id, &state.region);
-        }
-    };
-    let framing = match request_body::framing(hdrs) {
+    // Framing is read once: authentication holds it to what the signature
+    // pins, and the body is decoded with the same value.
+    let framing = request_body::framing(hdrs);
+    let plan =
+        match state
+            .auth
+            .check_framed(&parts, framing.ok(), crate::smb::ops::now_epoch_secs())
+        {
+            Ok(plan) => plan,
+            Err(failure) => {
+                return with_common_headers(
+                    auth_error_response(&failure),
+                    &request_id,
+                    &state.region,
+                );
+            }
+        };
+    let framing = match framing {
         Ok(f) => f,
         Err(e) => {
             return with_common_headers(framing_error_response(e), &request_id, &state.region);

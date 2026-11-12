@@ -425,7 +425,13 @@ enum Kind {
         enforce: bool,
     },
     Chunked(Box<ChunkedDecoder>),
+    /// An enforced plan the framing cannot carry: a whole-body digest around
+    /// aws-chunked framing, or signed chunks without it. Fails on first read.
+    Mismatched,
 }
+
+const MISMATCHED: BodyError =
+    BodyError::Framing("aws-chunked framing does not match the signed payload hash");
 
 /// A request body with framing removed and the payload verified.
 ///
@@ -448,17 +454,21 @@ impl<B> RequestBody<B> {
                     plan.enforce,
                 )))
             }
-            // `framing` refuses a digest with aws-chunked, and a signed
-            // STREAMING-* payload hash is aws-chunked by definition, so these
-            // are decode-only: there is no signature left to check.
-            (Framing::AwsChunked { decoded_len }, _) => {
-                Kind::Chunked(Box::new(ChunkedDecoder::new(decoded_len, None, false)))
-            }
             (Framing::Plain, PayloadAuth::Sha256(expected)) => Kind::Digest {
                 hasher: Sha256::new(),
                 expected,
                 enforce: plan.enforce,
             },
+            // Authentication refuses a plan its framing cannot carry, or in log
+            // mode serves it unchecked. Refused here too, so building a body
+            // cannot drop a check.
+            (_, PayloadAuth::Sha256(_) | PayloadAuth::Chunks(_)) if plan.enforce => {
+                Kind::Mismatched
+            }
+            // Nothing signed to check: decode only.
+            (Framing::AwsChunked { decoded_len }, _) => {
+                Kind::Chunked(Box::new(ChunkedDecoder::new(decoded_len, None, false)))
+            }
             (Framing::Plain, _) => Kind::Plain,
         };
         Self {
@@ -476,7 +486,7 @@ impl<B> RequestBody<B> {
     pub fn verifies_payload(&self) -> bool {
         match &self.kind {
             Kind::Plain => false,
-            Kind::Digest { .. } => true,
+            Kind::Digest { .. } | Kind::Mismatched => true,
             Kind::Chunked(decoder) => decoder.verify.is_some(),
         }
     }
@@ -522,6 +532,10 @@ where
                                 return Poll::Ready(Some(Err(e)));
                             }
                         }
+                        Kind::Mismatched => {
+                            this.done = true;
+                            return Poll::Ready(Some(Err(MISMATCHED)));
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -563,6 +577,7 @@ impl<B> RequestBody<B> {
                 }
             }
             Kind::Chunked(decoder) => decoder.finish(),
+            Kind::Mismatched => Err(MISMATCHED),
         }
     }
 }

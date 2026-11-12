@@ -574,6 +574,12 @@ fn sign_as(parts: &mut Parts, secret: &str, amz_date: &str, payload: &str) {
         .collect();
     names.sort_unstable();
     let signed = names.join(";");
+    sign_over(parts, secret, &signed, amz_date, payload);
+}
+
+/// Sign `parts` (header scheme) over exactly the `signed` header names,
+/// whether the request carries them or not.
+fn sign_over(parts: &mut Parts, secret: &str, signed: &str, amz_date: &str, payload: &str) {
     let date = &amz_date[..8];
     let scope = format!("{date}/us-east-1/s3/aws4_request");
     let canonical = CanonicalRequest {
@@ -582,7 +588,7 @@ fn sign_as(parts: &mut Parts, secret: &str, amz_date: &str, payload: &str) {
         raw_query: parts.uri.query().unwrap_or(""),
         exclude_query: None,
         headers: &parts.headers,
-        signed_headers: &signed,
+        signed_headers: signed,
         payload_hash: payload,
     }
     .build();
@@ -594,6 +600,48 @@ fn sign_as(parts: &mut Parts, secret: &str, amz_date: &str, payload: &str) {
         std::str::from_utf8(&sig).unwrap()
     );
     parts.headers.insert(AUTHORIZATION, value.parse().unwrap());
+}
+
+/// Presign `parts` (query scheme) over `signed`, putting `query_hash` in
+/// `X-Amz-Content-Sha256` when given; the canonical payload is then that
+/// hash, and `UNSIGNED-PAYLOAD` otherwise.
+fn presign(parts: &mut Parts, signed: &str, amz_date: &str, query_hash: Option<&str>) {
+    let date = &amz_date[..8];
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+    let mut query = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+         &X-Amz-Credential={AKID}%2F{date}%2Fus-east-1%2Fs3%2Faws4_request\
+         &X-Amz-Date={amz_date}&X-Amz-Expires=600&X-Amz-SignedHeaders={}",
+        signed.replace(';', "%3B")
+    );
+    if let Some(h) = query_hash {
+        query.push_str("&X-Amz-Content-Sha256=");
+        query.push_str(h);
+    }
+    let path = parts.uri.path().to_string();
+    let canonical = CanonicalRequest {
+        method: parts.method.as_str(),
+        raw_path: &path,
+        raw_query: &query,
+        exclude_query: None,
+        headers: &parts.headers,
+        signed_headers: signed,
+        payload_hash: query_hash.unwrap_or(sigv4::UNSIGNED_PAYLOAD),
+    }
+    .build();
+    let sts = sigv4::string_to_sign(amz_date, &scope, &canonical);
+    let key = sigv4::signing_key(&Secret::new(SECRET).prefixed, date, "us-east-1");
+    let sig = sigv4::hex32(&sigv4::sign(&key, &sts));
+    parts.uri = format!(
+        "{path}?{query}&X-Amz-Signature={}",
+        std::str::from_utf8(&sig).unwrap()
+    )
+    .parse()
+    .unwrap();
+}
+
+fn hex_digest(body: &[u8]) -> String {
+    String::from_utf8(sigv4::hex32(&sha256(body)).to_vec()).unwrap()
 }
 
 fn get(uri: &str) -> Parts {
@@ -734,6 +782,158 @@ fn repeats_the_signature_cannot_order_are_refused() {
         "{}",
         f.message
     );
+}
+
+/// SignedHeaders names headers the request carries. An absent header and an
+/// empty one canonicalize alike (`name:`), so a signed empty header could
+/// otherwise be stripped in flight under the same signature.
+#[test]
+fn every_signed_header_must_be_present() {
+    let unsigned = sigv4::UNSIGNED_PAYLOAD;
+    let mut put = Request::put("/b/k")
+        .header("host", "localhost")
+        .header("if-match", "")
+        .header("x-amz-date", NOW_AMZ)
+        .header("x-amz-content-sha256", unsigned)
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let signed = "host;if-match;x-amz-content-sha256;x-amz-date";
+    sign_over(&mut put, SECRET, signed, NOW_AMZ, unsigned);
+    assert!(enforce().check(&put, NOW).is_ok());
+    put.headers.remove("if-match");
+    let f = failure(enforce().check(&put, NOW));
+    assert_eq!((f.status.as_u16(), f.code), (403, "AccessDenied"), "{f:?}");
+    assert!(f.message.contains("\"if-match\""), "{}", f.message);
+
+    let mut get = Request::get("/b/k")
+        .header("host", "localhost")
+        .header("if-none-match", "")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    presign(&mut get, "host;if-none-match", NOW_AMZ, None);
+    assert!(enforce().check(&get, NOW).is_ok());
+    get.headers.remove("if-none-match");
+    let f = failure(enforce().check(&get, NOW));
+    assert_eq!(f.code, "AccessDenied", "{f:?}");
+}
+
+/// A presigned request can also pin its payload with a signed
+/// `x-amz-content-sha256` header; the body must then match it, and it must
+/// agree with any hash in the query. Neither that header nor `x-amz-date` is
+/// covered by a presigned signature unless listed, so unlisted they are
+/// unsigned `x-amz-*` headers like any other.
+#[tokio::test]
+async fn presigned_payload_is_pinned_by_a_signed_content_sha256_header() {
+    let put = |hash: Option<&str>| {
+        let mut b = Request::put("/b/k").header("host", "localhost");
+        if let Some(h) = hash {
+            b = b.header("x-amz-content-sha256", h);
+        }
+        b.body(()).unwrap().into_parts().0
+    };
+    let x = hex_digest(b"x");
+    let y = hex_digest(b"y");
+
+    for query in [None, Some(x.as_str()), Some(sigv4::UNSIGNED_PAYLOAD)] {
+        let mut parts = put(Some(&x));
+        presign(&mut parts, "host;x-amz-content-sha256", NOW_AMZ, query);
+        let plan = enforce().check(&parts, NOW).unwrap();
+        assert!(
+            matches!(plan.auth, PayloadAuth::Sha256(_)),
+            "{query:?}: {plan:?}"
+        );
+        assert_eq!(deliver(&parts, b"x", plan.clone(), 1).await.unwrap(), b"x");
+        let err = deliver(&parts, b"y", plan, 1).await.unwrap_err();
+        assert!(err.contains("x-amz-content-sha256"), "{query:?}: {err}");
+    }
+
+    // The header and the query disagree about the payload.
+    for (header, query) in [
+        (x.as_str(), y.as_str()),
+        (sigv4::UNSIGNED_PAYLOAD, y.as_str()),
+        (sigv4::STREAMING_UNSIGNED_TRAILER, y.as_str()),
+    ] {
+        let mut parts = put(Some(header));
+        presign(
+            &mut parts,
+            "host;x-amz-content-sha256",
+            NOW_AMZ,
+            Some(query),
+        );
+        let f = failure(enforce().check(&parts, NOW));
+        assert_eq!(f.code, "InvalidArgument", "{header}: {f:?}");
+    }
+
+    // Signed chunks chain from a header signature; no presigning client
+    // sends them.
+    let mut parts = put(Some(sigv4::STREAMING_SIGNED));
+    presign(&mut parts, "host;x-amz-content-sha256", NOW_AMZ, None);
+    assert_eq!(
+        failure(enforce().check(&parts, NOW)).code,
+        "InvalidArgument"
+    );
+
+    for (name, value) in [
+        ("x-amz-content-sha256", x.as_str()),
+        ("x-amz-date", NOW_AMZ),
+    ] {
+        let mut parts = put(None);
+        parts.headers.insert(name, value.parse().unwrap());
+        presign(&mut parts, "host", NOW_AMZ, None);
+        let f = failure(enforce().check(&parts, NOW));
+        assert_eq!(f.code, "AccessDenied", "{name}: {f:?}");
+        assert_eq!(f.headers_not_signed(), Some(name));
+    }
+}
+
+/// What the body is decoded as must be what the signature pins. A whole-body
+/// digest cannot describe an aws-chunked body, so a request whose unsigned
+/// headers turn it into one is refused rather than decoded unchecked (and
+/// only logged in log mode). `RequestBody` refuses the pairing on its own as
+/// well, so no caller can drop the digest by building one.
+#[tokio::test]
+async fn framing_cannot_unpin_a_signed_digest() {
+    let hello = hex_digest(b"hello");
+    let parts = || {
+        let mut parts = Request::put("/b/k")
+            .header("host", "localhost")
+            .header("x-amz-decoded-content-length", "5")
+            .header("content-encoding", "aws-chunked")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        presign(
+            &mut parts,
+            "host;x-amz-decoded-content-length",
+            NOW_AMZ,
+            Some(&hello),
+        );
+        parts
+    };
+    let f = failure(enforce().check(&parts(), NOW));
+    assert_eq!(
+        (f.status.as_u16(), f.code),
+        (400, "InvalidArgument"),
+        "{f:?}"
+    );
+    let plan = authenticator(Mode::Log).check(&parts(), NOW).unwrap();
+    assert!(
+        !plan.enforce && matches!(plan.auth, PayloadAuth::None),
+        "{plan:?}"
+    );
+
+    let chunked = b"5\r\nHELLO\r\n0\r\n\r\n";
+    let pinned = PayloadPlan {
+        auth: PayloadAuth::Sha256(sha256(b"hello")),
+        enforce: true,
+    };
+    let err = deliver(&parts(), chunked, pinned, 4).await.unwrap_err();
+    assert!(err.contains("aws-chunked"), "{err}");
 }
 
 #[test]
@@ -1261,4 +1461,77 @@ async fn router_enforce_mode_verifies_payloads_the_operation_does_not_read() {
             "{resp}"
         );
     }
+}
+
+/// A PUT signed with an empty `If-Match` is refused as a conditional write;
+/// stripping the header must not turn it into an unconditional one under the
+/// same signature.
+#[tokio::test]
+async fn router_refuses_a_request_missing_a_header_it_signed() {
+    let (state, _smb) = router_state(enforce()).await;
+    let now = now_amz();
+    let unsigned = sigv4::UNSIGNED_PAYLOAD;
+    let mut put = Request::put("/audit/cond.txt")
+        .header("host", "localhost")
+        .header("content-length", "4")
+        .header("if-match", "")
+        .header("x-amz-date", &now)
+        .header("x-amz-content-sha256", unsigned)
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    let signed = "host;if-match;x-amz-content-sha256;x-amz-date";
+    sign_over(&mut put, SECRET, signed, &now, unsigned);
+    let resp = send(&state, raw(&put, b"data")).await;
+    assert_eq!(status(&resp), "400", "as signed: {resp}");
+    put.headers.remove("if-match");
+    let resp = send(&state, raw(&put, b"data")).await;
+    assert_eq!(status(&resp), "403", "stripped of its If-Match: {resp}");
+}
+
+/// A presigned PUT pinned by a query digest, which also signs
+/// `x-amz-decoded-content-length`. Headers its signature does not cover must
+/// not make the router decode the body as aws-chunked: the digest would go
+/// unchecked and other bytes be stored.
+#[tokio::test]
+async fn router_refuses_framing_that_would_unpin_a_signed_digest() {
+    let (state, _smb) = router_state(enforce()).await;
+    let now = now_amz();
+    let hello = hex_digest(b"hello");
+    let put = |extra: Option<(&str, &str)>| {
+        let mut b = Request::put("/audit/pinned.txt")
+            .header("host", "localhost")
+            .header("x-amz-decoded-content-length", "5");
+        if let Some((k, v)) = extra {
+            b = b.header(k, v);
+        }
+        let mut parts = b.body(()).unwrap().into_parts().0;
+        presign(
+            &mut parts,
+            "host;x-amz-decoded-content-length",
+            &now,
+            Some(&hello),
+        );
+        parts
+    };
+    let resp = send(&state, raw(&put(None), b"hello")).await;
+    assert_eq!(status(&resp), "200", "as signed: {resp}");
+
+    let chunked = b"5\r\nHELLO\r\n0\r\n\r\n";
+    for (header, code) in [
+        (
+            ("x-amz-content-sha256", sigv4::STREAMING_UNSIGNED_TRAILER),
+            "403",
+        ),
+        (("content-encoding", "aws-chunked"), "400"),
+    ] {
+        let resp = send(&state, raw(&put(Some(header)), chunked)).await;
+        assert_eq!(status(&resp), code, "{header:?}: {resp}");
+    }
+
+    let mut read = get("/audit/pinned.txt");
+    sign(&mut read, SECRET, &now, None);
+    let resp = send(&state, raw(&read, b"")).await;
+    assert!(resp.ends_with("\r\n\r\nhello"), "{resp:?}");
 }

@@ -157,13 +157,20 @@ pub fn repeated_query_param(raw_query: &str) -> Option<String> {
         .map(|w| w[0].clone().into_owned())
 }
 
-/// A signed header that occurs more than once, if any. Repeated values are
-/// joined with `,` for signing, so `X: a,b` and `X: a` + `X: b` sign alike,
-/// while readers take the first value.
-pub fn repeated_signed_header<'a>(headers: &HeaderMap, signed_headers: &'a str) -> Option<&'a str> {
-    signed_headers
-        .split(';')
-        .find(|name| headers.get_all(*name).iter().nth(1).is_some())
+/// The first signed header the request does not carry exactly once, and how
+/// many times it does carry it: `0` or `2` (meaning two or more). Either is a
+/// way to change the request without changing its signature. An absent
+/// header canonicalizes like an empty one (`name:`), so a signed empty header
+/// could be dropped. Repeated values are joined with `,`, so `X: a,b` and
+/// `X: a` + `X: b` sign alike, while readers take the first value.
+pub fn signed_header_not_once<'a>(
+    headers: &HeaderMap,
+    signed_headers: &'a str,
+) -> Option<(&'a str, usize)> {
+    signed_headers.split(';').find_map(|name| {
+        let n = headers.get_all(name).iter().take(2).count();
+        (n != 1).then_some((name, n))
+    })
 }
 
 /// Canonical query string: every parameter decoded and re-encoded (`/`
@@ -431,9 +438,16 @@ pub fn parse_authorization(value: &str) -> Result<Authorization<'_>, &'static st
 }
 
 /// SignedHeaders must be non-empty lowercase names, unique, and include `host`.
+///
+/// The list is unauthenticated and up to a request head long, so uniqueness
+/// is checked without rescanning: every signer sorts it, and a strictly
+/// ascending list is unique in one pass. Anything else is sorted to find a
+/// repeat (O(n log n)).
 pub fn validate_signed_headers(list: &str) -> Result<(), &'static str> {
     let mut has_host = false;
-    for (i, name) in list.split(';').enumerate() {
+    let mut ascending = true;
+    let mut prev: Option<&str> = None;
+    for name in list.split(';') {
         if name.is_empty()
             || !name
                 .bytes()
@@ -441,10 +455,16 @@ pub fn validate_signed_headers(list: &str) -> Result<(), &'static str> {
         {
             return Err("SignedHeaders must be lowercase header names separated by ';'");
         }
-        if list.split(';').take(i).any(|n| n == name) {
+        ascending &= prev.is_none_or(|p| p < name);
+        prev = Some(name);
+        has_host |= name == "host";
+    }
+    if !ascending {
+        let mut names: Vec<&str> = list.split(';').collect();
+        names.sort_unstable();
+        if names.windows(2).any(|w| w[0] == w[1]) {
             return Err("SignedHeaders lists a header twice");
         }
-        has_host |= name == "host";
     }
     if !has_host {
         return Err("SignedHeaders must include host");
@@ -597,6 +617,39 @@ mod tests {
         ] {
             assert!(parse_authorization(bad).is_err(), "{bad:?} must not parse");
         }
+    }
+
+    /// SignedHeaders is attacker-sized and checked before any key lookup, so
+    /// finding a duplicate must not cost a rescan per name.
+    #[test]
+    fn signed_headers_duplicates_are_found_in_any_order() {
+        for ok in ["host", "host;x-amz-date", "x-amz-date;host", "b;a;host;c"] {
+            assert_eq!(validate_signed_headers(ok), Ok(()), "{ok}");
+        }
+        for dup in [
+            "host;host",
+            "a;host;a",
+            "host;b;a;b",
+            "a;a;host",
+            "b;host;b",
+        ] {
+            assert_eq!(
+                validate_signed_headers(dup),
+                Err("SignedHeaders lists a header twice"),
+                "{dup}"
+            );
+        }
+        // 40,000 distinct names in descending order, ~360 KB: within the
+        // ~408 KB request head hyper accepts. Comparing each name with every
+        // earlier one is ~800 million comparisons; sorting is milliseconds.
+        let mut names: Vec<String> = (0..40_000).map(|i| format!("x-h{i:05}")).collect();
+        names.push("host".into());
+        names.reverse();
+        let list = names.join(";");
+        let start = std::time::Instant::now();
+        assert_eq!(validate_signed_headers(&list), Ok(()));
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 
     /// The AWS documentation's worked example (GET Object with a Range

@@ -201,17 +201,26 @@ What is verified:
 - Signed payloads: a body that does not hash to its signed
   `x-amz-content-sha256` is rejected (`XAmzContentSHA256Mismatch`) before it
   is stored or acknowledged, write-back included, and before operations that
-  ignore their body (DELETE, CopyObject, multipart initiate/abort) act.
+  ignore their body (DELETE, CopyObject, multipart initiate/abort) act. A
+  presigned URL's digest can be in its query or in a signed
+  `x-amz-content-sha256` header; if both are present, they must agree.
 - Signed aws-chunked uploads (minio-go/mc), chunk by chunk, including signed
   trailers. Unsigned aws-chunked uploads (`aws s3 cp` in aws-cli v2) are
-  accepted when the request headers are signed, as S3 does.
+  accepted when the request headers are signed, as S3 does. A body pinned by
+  a whole-body digest is never decoded as aws-chunked: unsigned headers
+  (`Content-Encoding`, for one) cannot switch it to framing the digest does
+  not cover.
 - Every `x-amz-*` header must be signed, so a header such as
-  `x-amz-copy-source` cannot be added to a signed request in transit.
+  `x-amz-copy-source` cannot be added to a signed request in transit. In a
+  presigned request this includes `x-amz-content-sha256` and `x-amz-date`,
+  which its signature covers only when they are listed.
 - The request is read exactly as it was signed. Query parameter names are
-  decoded the way the signature decodes them, and a signed request that
-  repeats a query parameter or a signed header is refused
-  (`InvalidArgument`): a signature does not cover their order, so it could
-  be rearranged in transit into a different operation.
+  decoded the way the signature decodes them. A signed request that repeats a
+  query parameter or a signed header is refused (`InvalidArgument`), because
+  a signature does not cover their order. One that lacks a header it signed
+  is refused too (`AccessDenied`), because an absent header signs like an
+  empty one. Either could otherwise be rewritten in transit into a different
+  request, such as dropping a signed empty `If-Match`.
 
 Session tokens are refused rather than ignored: only long-term keys are
 supported. A rejected request returns the standard S3 error code; for

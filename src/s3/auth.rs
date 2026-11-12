@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use http::{HeaderMap, HeaderValue, StatusCode, request::Parts};
 
 use super::headers::{parse_amz_date, parse_http_date};
+use super::request_body::{self, Framing};
 use super::sigv4::{self, CanonicalRequest};
 
 /// Largest accepted difference between a request's timestamp and the clock
@@ -395,14 +396,28 @@ impl Authenticator {
         ids
     }
 
-    /// Authenticate a request's head. `now` is the current Unix time.
+    /// [`Self::check_framed`], reading the framing from the request's own
+    /// headers.
+    pub fn check(&self, parts: &Parts, now: u64) -> Result<PayloadPlan, AuthFailure> {
+        self.check_framed(parts, request_body::framing(&parts.headers).ok(), now)
+    }
+
+    /// Authenticate a request's head. `framing` is how its body will be
+    /// decoded (`request_body::framing`), or `None` when that is refused
+    /// anyway; it must fit what the signature pins. `now` is the current Unix
+    /// time.
     ///
     /// `Ok` carries what the body still has to prove; `Err` is the response
     /// to send instead (enforce mode only — log mode logs and returns `Ok`).
-    pub fn check(&self, parts: &Parts, now: u64) -> Result<PayloadPlan, AuthFailure> {
+    pub fn check_framed(
+        &self,
+        parts: &Parts,
+        framing: Option<Framing>,
+        now: u64,
+    ) -> Result<PayloadPlan, AuthFailure> {
         match self.mode {
             Mode::Off => Ok(PayloadPlan::unchecked()),
-            Mode::Log => match self.verify(parts, now) {
+            Mode::Log => match self.verify(parts, framing, now) {
                 Ok(auth) => Ok(PayloadPlan {
                     auth,
                     enforce: false,
@@ -412,7 +427,7 @@ impl Authenticator {
                     Ok(PayloadPlan::unchecked())
                 }
             },
-            Mode::Enforce => match self.verify(parts, now) {
+            Mode::Enforce => match self.verify(parts, framing, now) {
                 Ok(auth) => Ok(PayloadPlan {
                     auth,
                     enforce: true,
@@ -425,12 +440,17 @@ impl Authenticator {
         }
     }
 
-    fn verify(&self, parts: &Parts, now: u64) -> Result<PayloadAuth, AuthFailure> {
+    fn verify(
+        &self,
+        parts: &Parts,
+        framing: Option<Framing>,
+        now: u64,
+    ) -> Result<PayloadAuth, AuthFailure> {
         let query = parts.uri.query().unwrap_or("");
         let header = parts.headers.get(http::header::AUTHORIZATION);
         let presigned = query_param(query, "X-Amz-Algorithm").is_some()
             || query_param(query, "X-Amz-Signature").is_some();
-        match (header, presigned) {
+        let auth = match (header, presigned) {
             (Some(_), true) => Err(AuthFailure::new(
                 StatusCode::BAD_REQUEST,
                 "InvalidArgument",
@@ -448,7 +468,9 @@ impl Authenticator {
             (None, false) => Err(AuthFailure::denied(
                 "Access Denied: requests must be signed with AWS Signature Version 4.",
             )),
-        }
+        }?;
+        check_framing(framing, &auth)?;
+        Ok(auth)
     }
 
     fn secret(&self, access_key_id: &str) -> Result<&Secret, AuthFailure> {
@@ -510,8 +532,14 @@ impl Authenticator {
         }
         check_skew(ts, now)?;
         reject_session_token(headers, parts.uri.query().unwrap_or(""))?;
-        reject_unsigned_amz_headers(headers, auth.signed_headers)?;
-        reject_repeats(parts, auth.signed_headers)?;
+        // The string to sign carries x-amz-date and the canonical request the
+        // payload hash, listed or not.
+        reject_unsigned_amz_headers(
+            headers,
+            auth.signed_headers,
+            &["x-amz-content-sha256", "x-amz-date"],
+        )?;
+        reject_rewritable(parts, auth.signed_headers)?;
         let payload_hash = header_payload_hash(headers)?;
         let secret = self.secret(cred.access_key_id)?;
 
@@ -586,10 +614,13 @@ impl Authenticator {
         if now > ts.saturating_add(expires) {
             return Err(AuthFailure::denied("Request has expired."));
         }
-        reject_unsigned_amz_headers(headers, &signed_headers)?;
-        reject_repeats(parts, &signed_headers)?;
-        // A presigned URL cannot sign a body it has not seen, so the payload is
-        // UNSIGNED-PAYLOAD unless the signer put a digest in the query.
+        // Here the date and payload hash are in the query, so the headers of
+        // those names are covered only when listed, like any other.
+        reject_unsigned_amz_headers(headers, &signed_headers, &[])?;
+        reject_rewritable(parts, &signed_headers)?;
+        // A presigned URL cannot sign a body it has not seen, so the canonical
+        // payload is UNSIGNED-PAYLOAD unless the signer put a digest in the
+        // query.
         let payload_hash: Cow<'_, str> = match query_param(query, "X-Amz-Content-Sha256") {
             Some(h)
                 if h == sigv4::UNSIGNED_PAYLOAD || sigv4::decode_hex32(h.as_bytes()).is_some() =>
@@ -603,6 +634,7 @@ impl Authenticator {
             }
             None => Cow::Borrowed(sigv4::UNSIGNED_PAYLOAD),
         };
+        let payload = presigned_payload(headers, &payload_hash)?;
         let secret = self.secret(cred.access_key_id)?;
 
         let canonical = CanonicalRequest {
@@ -627,14 +659,79 @@ impl Authenticator {
         if !cached {
             secret.remember(cred.date, cred.region, key);
         }
-        Ok(payload_auth(
-            &payload_hash,
-            key,
-            &amz_date,
-            cred.scope,
-            seed,
+        Ok(payload_auth(payload, key, &amz_date, cred.scope, seed))
+    }
+}
+
+/// What a presigned request's body must be. The canonical request carries the
+/// query's payload hash, but the signer can also list `x-amz-content-sha256`
+/// in SignedHeaders (unlisted, it is refused as unsigned). The body is then
+/// held to that header, which must agree with any hash in the query.
+fn presigned_payload<'a>(
+    headers: &'a HeaderMap,
+    query_hash: &'a str,
+) -> Result<&'a str, AuthFailure> {
+    let Some(v) = headers.get("x-amz-content-sha256") else {
+        return Ok(query_hash);
+    };
+    let header = v.to_str().unwrap_or("");
+    match header {
+        sigv4::UNSIGNED_PAYLOAD | sigv4::STREAMING_UNSIGNED_TRAILER => {}
+        sigv4::STREAMING_SIGNED | sigv4::STREAMING_SIGNED_TRAILER => {
+            return Err(AuthFailure::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Signed aws-chunked uploads need the Authorization header, not a presigned URL.",
+            ));
+        }
+        _ if sigv4::decode_hex32(header.as_bytes()).is_some() => {}
+        _ => {
+            return Err(AuthFailure::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
+                 STREAMING-UNSIGNED-PAYLOAD-TRAILER, or a SHA-256 hex digest.",
+            ));
+        }
+    }
+    if header == query_hash || query_hash == sigv4::UNSIGNED_PAYLOAD {
+        Ok(header)
+    } else {
+        Err(AuthFailure::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The x-amz-content-sha256 header does not match X-Amz-Content-Sha256.",
         ))
     }
+}
+
+/// The router decodes the body as its headers say (`request_body::framing`),
+/// and not all of those are signed: `Content-Encoding` never has to be, and a
+/// presigned request's payload hash is in its query. So the framing is held to
+/// what the signature pins. A whole-body digest cannot describe an aws-chunked
+/// body (decoding one would leave the digest unchecked), and signed chunks
+/// exist only inside aws-chunked framing. `None`: the router refuses the
+/// framing itself.
+fn check_framing(framing: Option<Framing>, auth: &PayloadAuth) -> Result<(), AuthFailure> {
+    let chunked = match framing {
+        Some(Framing::AwsChunked { .. }) => true,
+        Some(Framing::Plain) => false,
+        None => return Ok(()),
+    };
+    let fits = match auth {
+        PayloadAuth::None => true,
+        PayloadAuth::Sha256(_) => !chunked,
+        PayloadAuth::Chunks(_) => chunked,
+    };
+    if fits {
+        return Ok(());
+    }
+    Err(AuthFailure::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "The body's framing does not match its signed payload hash: a SHA-256 digest \
+         needs a plain body, signed chunks an aws-chunked one.",
+    ))
 }
 
 /// Check the client's signature; on success return it (the seed a signed
@@ -718,13 +815,16 @@ fn reject_session_token(headers: &HeaderMap, query: &str) -> Result<(), AuthFail
     Ok(())
 }
 
-/// Refuse what a signature cannot pin down: a repeated query parameter (the
-/// canonical query is sorted, so which one comes first is not signed) or a
-/// repeated signed header (its values are joined with `,`, so `X: a,b` and
-/// two `X` lines sign alike). Dispatch and the handlers read the first of
-/// each, so either would let the request be rearranged in flight into one
-/// that does something else under the same signature.
-fn reject_repeats(parts: &Parts, signed: &str) -> Result<(), AuthFailure> {
+/// Refuse what a signature cannot pin down, each a way to rewrite the request
+/// in flight into one that does something else under the same signature:
+/// - a repeated query parameter: the canonical query is sorted, so which one
+///   comes first is not signed, and dispatch and the handlers read the first;
+/// - a repeated signed header: its values are joined with `,`, so `X: a,b`
+///   and two `X` lines sign alike, and readers take the first;
+/// - an absent signed header: it canonicalizes like an empty one (`name:`),
+///   so a signed empty `If-Match` could be dropped to make the write
+///   unconditional.
+fn reject_rewritable(parts: &Parts, signed: &str) -> Result<(), AuthFailure> {
     if let Some(name) = sigv4::repeated_query_param(parts.uri.query().unwrap_or("")) {
         return Err(AuthFailure::new(
             StatusCode::BAD_REQUEST,
@@ -732,30 +832,32 @@ fn reject_repeats(parts: &Parts, signed: &str) -> Result<(), AuthFailure> {
             format!("Query parameter {name:?} appears more than once in a signed request."),
         ));
     }
-    if let Some(name) = sigv4::repeated_signed_header(&parts.headers, signed) {
-        return Err(AuthFailure::new(
+    match sigv4::signed_header_not_once(&parts.headers, signed) {
+        None => Ok(()),
+        Some((name, 0)) => Err(AuthFailure::denied(format!(
+            "Signed header {name:?} is not in the request."
+        ))),
+        Some((name, _)) => Err(AuthFailure::new(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
             format!("Signed header {name:?} appears more than once."),
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// S3 requires every `x-amz-*` header to be signed, so none can be added or
 /// changed in flight to alter what the request does (`x-amz-copy-source`
-/// turning a PUT into a copy, for one). `x-amz-content-sha256` and
-/// `x-amz-date` are covered by the canonical request and string to sign
-/// whether listed or not.
-fn reject_unsigned_amz_headers(headers: &HeaderMap, signed: &str) -> Result<(), AuthFailure> {
+/// turning a PUT into a copy, for one). `covered` names the headers the
+/// signature covers whether listed or not.
+fn reject_unsigned_amz_headers(
+    headers: &HeaderMap,
+    signed: &str,
+    covered: &[&str],
+) -> Result<(), AuthFailure> {
     let mut missing: Vec<&str> = Vec::new();
     for name in headers.keys() {
         let n = name.as_str();
-        if n.starts_with("x-amz-")
-            && n != "x-amz-content-sha256"
-            && n != "x-amz-date"
-            && !sigv4::is_signed(signed, n)
-        {
+        if n.starts_with("x-amz-") && !covered.contains(&n) && !sigv4::is_signed(signed, n) {
             missing.push(n);
         }
     }
