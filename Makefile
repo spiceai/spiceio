@@ -146,7 +146,9 @@ install: release
 	    echo "note: $(LAUNCHD_LABEL) still runs the previous binary; restart it with"; \
 	    echo "      launchctl kickstart -k gui/$$(id -u)/$(LAUNCHD_LABEL)"; \
 	  fi; \
+	  restart_status=$$?; \
 	  ./scripts/agent-bind-report.sh "$(LAUNCHD_LABEL)"; \
+	  exit "$$restart_status"; \
 	fi
 
 # Removes what `install` wrote. Leaves the launchd agent, its config and its
