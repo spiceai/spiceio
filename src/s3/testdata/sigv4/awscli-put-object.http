@@ -1,0 +1,15 @@
+PUT /bkt/dir/a%20b%2Bc.txt HTTP/1.1
+Host: 127.0.0.1:18999
+Accept-Encoding: identity
+User-Agent: aws-cli/2.39.7 md/awscrt#0.38.1 ua/2.1 os/macos#27.2.0 md/arch#arm64 lang/python#3.15.2 md/pyimpl#CPython m/b,E,N,Z,W,g,AN cfg/retry-mode#standard md/installer#source sid/b062b7a1b434 md/prompt#off md/command#s3api.put-object
+Expect: 100-continue
+x-amz-checksum-crc64nvme: jSnVw/bqjr4=
+x-amz-sdk-checksum-algorithm: CRC64NVME
+X-Amz-Date: 20261111T194140Z
+X-Amz-Content-SHA256: b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261111/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-crc64nvme;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm, Signature=2202d9450fb9cf37da1788cfc50433a881b024b4c86248b34a74e90b08089f7d
+amz-sdk-invocation-id: 84b0479c-0510-4bc2-816b-549e8f9ea2a6
+amz-sdk-request: attempt=1
+Content-Length: 11
+
+hello world

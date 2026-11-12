@@ -1,0 +1,3 @@
+# Captured HTTP requests: CRLF line endings are part of what is signed and
+# parsed, so never convert them.
+src/s3/testdata/** -text

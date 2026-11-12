@@ -1,0 +1,10 @@
+GET /bkt?list-type=2&delimiter=%2F&prefix=a%20b%2F%C3%BC&encoding-type=url HTTP/1.1
+Host: 127.0.0.1:18999
+Accept-Encoding: identity
+User-Agent: aws-cli/2.39.7 md/awscrt#0.38.1 ua/2.1 os/macos#27.2.0 md/arch#arm64 lang/python#3.15.2 md/pyimpl#CPython m/C,E,b,Z,N,AN,g cfg/retry-mode#standard md/installer#source sid/b062b7a1b434 md/prompt#off md/command#s3api.list-objects-v2
+X-Amz-Date: 20261111T194142Z
+X-Amz-Content-SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261111/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=5b255a0a220de6a3fde82f1b25c89ca543d3e73697d49bbad1f40f1c0e4477a8
+amz-sdk-invocation-id: 85c2106b-2678-4a22-8706-9dcc996f04d8
+amz-sdk-request: attempt=1
+

@@ -1,0 +1,15 @@
+PUT /bkt/small.txt HTTP/1.1
+Host: 127.0.0.1:18999
+User-Agent: MinIO (darwin; arm64) minio-go/v7.0.90 mc/RELEASE.2025-08-13T08-35-41Z
+Content-Length: 183
+Accept-Encoding: zstd,gzip
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDTEST/20261111/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=587f8198f12e01e651fb9a0808f1abb7adf853c6a56293a847ed5e9d4a8d389c
+Content-Type: text/plain
+X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+X-Amz-Date: 20261111T194106Z
+X-Amz-Decoded-Content-Length: 11
+
+b;chunk-signature=5d4a691b69bf8b6220e213b143c90bfd79c8f2bac91aedc85a26aabdb600fff4
+hello world
+0;chunk-signature=b91535f2604d724d7def5262a93ba555505a45bf20dc5ec2a5e51a92243b93d0
+

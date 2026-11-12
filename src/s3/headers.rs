@@ -143,6 +143,35 @@ fn parse_iso8601(s: &str) -> Option<u64> {
     date_to_epoch(year, month, day, hour, min, sec)
 }
 
+/// Parse the SigV4 basic ISO 8601 timestamp (`20130524T000000Z`, the form of
+/// `x-amz-date` and `X-Amz-Date`) to epoch seconds. Strict: exactly 16 bytes,
+/// digits where digits belong — the string is also signed verbatim, so a lax
+/// parse would accept timestamps the client never meant.
+pub fn parse_amz_date(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u64> {
+        let mut v = 0u64;
+        for &c in &b[r] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + u64::from(c - b'0');
+        }
+        Some(v)
+    };
+    date_to_epoch(
+        num(0..4)?,
+        num(4..6)?,
+        num(6..8)?,
+        num(9..11)?,
+        num(11..13)?,
+        num(13..15)?,
+    )
+}
+
 fn month_number(s: &str) -> Option<u64> {
     Some(match s {
         "Jan" => 1,
