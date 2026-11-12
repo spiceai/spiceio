@@ -214,12 +214,16 @@ pub async fn handle_request(req: Request<Incoming>, state: &AppState) -> Respons
         return with_common_headers(*resp, &request_id, &state.region);
     }
 
-    // Parse bucket and key from path-style: /{bucket}/{key...}
-    // Percent-decode the key so encoded characters (spaces, Unicode, `%`, …)
-    // map to the real object name instead of a literal `%XX` filename.
-    let (req_bucket, raw_key) = parse_path(path);
-    let key_decoded = percent_decode(raw_key);
-    let key: &str = &key_decoded;
+    // Parse bucket and key from path-style: /{bucket}/{key...}, splitting
+    // *after* percent-decoding, as the signature reads it: the canonical URI
+    // is the decoded path, so `/bkt%2Fk`, `/%62kt/k` and `/bkt/k` carry one
+    // signature and must name one object. (Split first, and the first two
+    // were a bucket that does not exist, so a signed request for one could
+    // be rewritten into the other.) Decoding also maps encoded characters
+    // (spaces, Unicode, `%`, …) to the real object name; it borrows when
+    // nothing is encoded.
+    let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+    let (req_bucket, key) = parse_path(&decoded_path);
 
     // Service-level operations (no bucket) — ListBuckets is in-memory and must
     // stay available as a liveness probe even when the NAS is overloaded.

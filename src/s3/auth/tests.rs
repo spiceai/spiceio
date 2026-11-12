@@ -936,6 +936,45 @@ async fn framing_cannot_unpin_a_signed_digest() {
     assert!(err.contains("aws-chunked"), "{err}");
 }
 
+/// Canonical header values collapse runs of spaces and tabs, so a copy
+/// source of `/bkt/a b` and one of `/bkt/a  b` carry one signature while
+/// naming different objects. Signed requests must percent-encode whitespace
+/// in it, as S3 clients do.
+#[test]
+fn signed_copy_source_must_encode_whitespace() {
+    let copy = |source: &str| {
+        Request::put("/bkt/dest")
+            .header("host", "localhost")
+            .header("x-amz-copy-source", source)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0
+    };
+    let mut parts = copy("/bkt/a%20b");
+    sign(&mut parts, SECRET, NOW_AMZ, None);
+    assert!(enforce().check(&parts, NOW).is_ok());
+    let mut parts = copy("/bkt/a%20b");
+    presign(&mut parts, "host;x-amz-copy-source", NOW_AMZ, None);
+    assert!(enforce().check(&parts, NOW).is_ok());
+
+    let mut signed = copy("/bkt/a b");
+    sign(&mut signed, SECRET, NOW_AMZ, None);
+    for source in ["/bkt/a b", "/bkt/a  b", "/bkt/a\tb"] {
+        signed
+            .headers
+            .insert("x-amz-copy-source", source.parse().unwrap());
+        let f = failure(enforce().check(&signed, NOW));
+        assert_eq!(f.code, "InvalidArgument", "{source:?}: {f:?}");
+    }
+    let mut parts = copy("/bkt/a b");
+    presign(&mut parts, "host;x-amz-copy-source", NOW_AMZ, None);
+    assert_eq!(
+        failure(enforce().check(&parts, NOW)).code,
+        "InvalidArgument"
+    );
+}
+
 #[test]
 fn session_tokens_are_refused_not_ignored() {
     let mut parts = get("/b/k");
@@ -1534,4 +1573,41 @@ async fn router_refuses_framing_that_would_unpin_a_signed_digest() {
     sign(&mut read, SECRET, &now, None);
     let resp = send(&state, raw(&read, b"")).await;
     assert!(resp.ends_with("\r\n\r\nhello"), "{resp:?}");
+}
+
+/// The path is signed decoded (`canonical_uri_into`), so `/audit%2Fp.txt`,
+/// `/%61udit/p.txt` and `/audit/p.txt` carry one signature and must name one
+/// object. Splitting bucket from key before decoding made the first two a
+/// bucket that does not exist, and a signed request for one could be
+/// rewritten into the other: a DELETE of nothing into a DeleteObject.
+#[tokio::test]
+async fn router_reads_a_signed_path_the_way_it_was_signed() {
+    let (state, _smb) = router_state(enforce()).await;
+    let now = now_amz();
+    let mut put = Request::put("/audit/p.txt")
+        .header("host", "localhost")
+        .header("content-length", "4")
+        .body(())
+        .unwrap()
+        .into_parts()
+        .0;
+    sign(&mut put, SECRET, &now, Some(sigv4::UNSIGNED_PAYLOAD));
+    let resp = send(&state, raw(&put, b"data")).await;
+    assert_eq!(status(&resp), "200", "{resp}");
+
+    for uri in [
+        "/audit/p.txt",
+        "/audit%2Fp.txt",
+        "/%61udit/p.txt",
+        "/%61udit%2Fp%2Etxt",
+    ] {
+        let mut header = get(uri);
+        sign(&mut header, SECRET, &now, None);
+        let mut presigned = get(uri);
+        presign(&mut presigned, "host", &now, None);
+        for (scheme, parts) in [("header", header), ("presigned", presigned)] {
+            let resp = send(&state, raw(&parts, b"")).await;
+            assert!(resp.ends_with("\r\n\r\ndata"), "{scheme} {uri}: {resp:?}");
+        }
+    }
 }
