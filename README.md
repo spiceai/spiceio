@@ -120,7 +120,7 @@ All configuration is via environment variables:
 | `SPICEIO_SMB_USER`            | yes      |                     | SMB username              |
 | `SPICEIO_SMB_PASS`            | yes      |                     | SMB password              |
 | `SPICEIO_SMB_SHARE`           | yes      |                     | SMB share name            |
-| `SPICEIO_BIND`                | no       | `0.0.0.0:8333`      | Listen address            |
+| `SPICEIO_BIND`                | no       | `127.0.0.1:8333`    | Listen address. Loopback only by default: the S3 endpoint is unauthenticated, so set this (`0.0.0.0:8333`, `*:8333`, or a specific interface) to accept other hosts |
 | `SPICEIO_SMB_PORT`            | no       | `445`               | SMB port                  |
 | `SPICEIO_SMB_DOMAIN`          | no       | *(empty)*           | SMB domain                |
 | `SPICEIO_BUCKET`              | no       | `SPICEIO_SMB_SHARE` | Virtual S3 bucket name    |
@@ -421,7 +421,7 @@ HTTP request
 make                   # fmt + full CI-local gate
 make ci                # parity with GitHub Actions (lint + unit + live SMB suites)
 make release           # optimized release build
-make install           # install the release build (+ dSYM) into ~/.local/bin
+make install           # install the release build (+ dSYM) into ~/.local/bin; restarts the launchd agent and reports its listen address
 make lint              # static only — not sufficient to claim CI will pass
 make test-unit         # cargo test (no SMB)
 make test              # sccache integration (requires SPICEIO_SMB_USER/PASS)

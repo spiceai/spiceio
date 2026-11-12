@@ -19,7 +19,7 @@ spiceio is an S3-compatible API proxy that translates S3 HTTP requests into SMB 
 make                           # fmt + full CI-local gate (see make ci)
 make ci                        # **required before PR green** — parity with .github/workflows/ci.yml
 make release                   # optimized release build
-make install                   # install release build + dSYM into ~/.local/bin (PREFIX=), restarting the launchd agent if one is loaded
+make install                   # install release build + dSYM into ~/.local/bin (PREFIX=), restarting the launchd agent if one is loaded, then report where it listens (warns if not loopback)
 make lint                      # static only: fmt-check + check + clippy + rustdoc (NOT full CI)
 make test-unit                 # cargo test --locked (no SMB)
 make test                      # sccache integration only (requires SPICEIO_SMB_USER/PASS)
@@ -117,7 +117,7 @@ The binary requires these environment variables:
 - `SPICEIO_SMB_USER` (required) — SMB username
 - `SPICEIO_SMB_PASS` (required) — SMB password
 - `SPICEIO_SMB_SHARE` (required) — SMB share name
-- `SPICEIO_BIND` — listen address (default `0.0.0.0:8333`)
+- `SPICEIO_BIND` — listen address (default `127.0.0.1:8333`, **loopback only**). The S3 endpoint is unauthenticated and fronts the whole share, so anything wider (`0.0.0.0:8333`, `*:8333`, a specific interface) must be configured explicitly; a non-loopback bind logs a warning at startup
 - `SPICEIO_SMB_PORT` — SMB port (default `445`)
 - `SPICEIO_SMB_DOMAIN` — SMB domain (default empty)
 - `SPICEIO_BUCKET` — virtual S3 bucket name (defaults to `SPICEIO_SMB_SHARE`)
