@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       # `runner` is not available in job-level env. RUNNER_NAME is set on
       # the runner; skip the export if empty so spiceio uses hostname.
@@ -48,12 +48,13 @@ jobs:
           fi
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           components: rustfmt,clippy
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.3
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -196,7 +197,7 @@ jobs:
         # is not stripped, so its reports symbolize in place; the release dSYM
         # below covers the shipped artifact.
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: spiceio-crash-logs-${{ github.run_id }}
           path: crash-logs/
@@ -207,7 +208,7 @@ jobs:
         run: cargo build --release --locked --bin spiceio
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           # Ship the dSYM alongside the binary: release builds are stripped, so
           # a production crash report's raw addresses are symbolized offline
