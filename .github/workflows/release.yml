@@ -25,10 +25,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
 
+      # Build releases with the compiler CI tested: the pinned toolchain.
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          if [[ -z "$channel" ]]; then
+            echo "::error file=rust-toolchain.toml::no channel found"
+            exit 1
+          fi
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ steps.toolchain.outputs.channel }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2.9.3

@@ -47,10 +47,22 @@ jobs:
             echo "SPICEIO_MACHINE=${RUNNER_NAME}" >> "$GITHUB_ENV"
           fi
 
+      # rust-toolchain.toml is the single source of the Rust version; install
+      # exactly that, so clippy and rustfmt here match a local `make ci`.
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          if [[ -z "$channel" ]]; then
+            echo "::error file=rust-toolchain.toml::no channel found"
+            exit 1
+          fi
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: stable
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt,clippy
 
       - name: Cache Rust build artifacts

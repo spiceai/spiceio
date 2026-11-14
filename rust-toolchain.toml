@@ -1,0 +1,10 @@
+# The one place the Rust version is set. rustup selects it for every cargo
+# invocation inside the repo (`rustup toolchain install` here fetches it), and
+# both CI workflows read `channel` from this file, so local builds, CI, and
+# release artifacts compile with the same compiler and lint with the same
+# clippy. Dependabot (`rust-toolchain` ecosystem) proposes bumps; raising
+# `rust-version` in Cargo.toml is a separate, deliberate step (see there).
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -2,6 +2,11 @@
 name = "spiceio"
 version = "0.11.0"
 edition = "2024"
+# Minimum supported Rust. Clippy's `incompatible_msrv` (in clippy::all, denied
+# below) rejects std APIs stabilized after this, so a toolchain bump in
+# rust-toolchain.toml does not silently raise it: raise it deliberately when
+# the code starts needing a newer release.
+rust-version = "1.100"
 description = "S3-compatible API proxy to SMB file shares"
 license = "Apache-2.0"
 
@@ -71,6 +76,16 @@ unused_qualifications = "deny"
 all = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
 cargo_common_metadata = "allow"
+
+# Cargo's own lints (Rust 1.100+). `warnings = "deny"` above covers rustc only,
+# so an unused dependency would otherwise be a warning nobody reads. It fires
+# only when every target that could use a dependency is built (`cargo check`,
+# `--all-targets`), so partial builds such as `--bin spiceio` do not
+# false-positive. It also skips a direct dependency that something else in the
+# graph already pulls in (e.g. dropping every `bytes::` use would go unflagged,
+# since hyper depends on it), so it catches dead weight, not every stale line.
+[lints.cargo]
+unused_dependencies = "deny"
 
 [profile.release]
 opt-level = 3
