@@ -30,11 +30,19 @@ doc:
 lint: fmt-check check clippy doc
 
 # Unit tests only (no SMB).
-test-unit: test-clean-unit test-setup-action
+test-unit: test-clean-unit test-setup-action test-agent-install
 	# --features loadgen so spiceio-loadgen and spiceio-sccache-nas tests run:
 	# loadgen's status classifier, and the NAS durability checker's path /
 	# listing / digest tests (no SMB). They would silently not compile without it.
 	cargo test --locked --features loadgen
+
+# `make install`'s launchd half and the sccache-spiceio wrapper, against a
+# stubbed launchctl: plist edits, key creation, reload-vs-kickstart, and the
+# post-restart auth check. Touches no real agent.
+.PHONY: test-agent-install
+test-agent-install:
+	cargo build --locked --bin spiceio
+	bash scripts/test-agent-install.sh target/debug/spiceio
 
 # Setup-action download helper (no gh / curl-to-GitHub). Includes the
 # two-server check that Authorization is not forwarded on a host change.
@@ -116,6 +124,13 @@ LAUNCHD_LABEL ?= ai.spice.spiceio
 # that does not restart it changes nothing for its clients. RESTART_AGENT=0
 # stages the new binary and leaves the running one alone.
 RESTART_AGENT ?= 1
+# The agent requires SigV4. install sets the agent's SPICEIO_S3_AUTH to
+# AGENT_AUTH: enforce, log (verify and log, but serve anyway; for moving
+# clients over) or off. AGENT_AUTH=keep leaves its auth settings alone. An
+# agent that names no credentials file gets S3_CREDENTIALS_FILE, created with
+# a fresh key if it does not exist. A file that exists is never rewritten.
+AGENT_AUTH ?= enforce
+S3_CREDENTIALS_FILE ?= $(HOME)/.config/spiceio/credentials
 
 # The dSYM is installed alongside the binary the way the release tarball ships
 # it: release builds are stripped, so without it a crash report from the
@@ -128,40 +143,36 @@ RESTART_AGENT ?= 1
 # cargo leaves target/release/spiceio.dSYM as a *symlink* into deps/ — copying
 # it verbatim installs a dangling link that symbolizes nothing.
 #
-# install never writes the agent's config, so it never picks a listen address
-# either. It reports the one the agent actually bound, and warns when that is
-# reachable beyond this host: the binary's default is loopback only, and
-# anything wider is the agent's own SPICEIO_BIND.
+# sccache-spiceio is sccache with the agent's key, for RUSTC_WRAPPER (see the
+# script). scripts/agent-install.sh does the launchd half: it sets the
+# agent's SigV4 settings in its plist, restarts it (a reload if the plist
+# changed, since kickstart keeps the old environment), then reports where it
+# listens and checks that an unsigned request is refused and a request
+# signed through sccache-spiceio is served. It never chooses a listen
+# address; it warns when the agent's SPICEIO_BIND is reachable beyond this host.
 install: release
 	install -d "$(BINDIR)"
 	install -m 0755 target/release/spiceio "$(BINDIR)/spiceio"
+	install -m 0755 scripts/sccache-spiceio "$(BINDIR)/sccache-spiceio"
 	rm -rf "$(BINDIR)/spiceio.dSYM.new"
 	cp -RL target/release/spiceio.dSYM "$(BINDIR)/spiceio.dSYM.new"
 	rm -rf "$(BINDIR)/spiceio.dSYM"
 	mv "$(BINDIR)/spiceio.dSYM.new" "$(BINDIR)/spiceio.dSYM"
-	@echo "installed $$("$(BINDIR)/spiceio" --version) -> $(BINDIR)/spiceio"
+	@echo "installed $$("$(BINDIR)/spiceio" --version) -> $(BINDIR)/spiceio (+ sccache-spiceio)"
 	@case ":$$PATH:" in \
 	  *":$(BINDIR):"*) ;; \
 	  *) echo "note: $(BINDIR) is not on PATH" ;; \
 	esac
-	@if launchctl print "gui/$$(id -u)/$(LAUNCHD_LABEL)" >/dev/null 2>&1; then \
-	  if [ "$(RESTART_AGENT)" != "0" ]; then \
-	    echo "restarting $(LAUNCHD_LABEL) (SIGTERM: in-flight requests and the write-back backlog drain first)"; \
-	    launchctl kickstart -k "gui/$$(id -u)/$(LAUNCHD_LABEL)"; \
-	  else \
-	    echo "note: $(LAUNCHD_LABEL) still runs the previous binary; restart it with"; \
-	    echo "      launchctl kickstart -k gui/$$(id -u)/$(LAUNCHD_LABEL)"; \
-	  fi; \
-	  restart_status=$$?; \
-	  ./scripts/agent-bind-report.sh "$(LAUNCHD_LABEL)"; \
-	  exit "$$restart_status"; \
-	fi
+	@BINDIR="$(BINDIR)" LAUNCHD_LABEL="$(LAUNCHD_LABEL)" RESTART_AGENT="$(RESTART_AGENT)" \
+	  AGENT_AUTH="$(AGENT_AUTH)" S3_CREDENTIALS_FILE="$(S3_CREDENTIALS_FILE)" \
+	  ./scripts/agent-install.sh
 
-# Removes what `install` wrote. Leaves the launchd agent, its config and its
-# log alone — those are not ours to remove, and a bootout would be a surprise
-# from an uninstall of the binary.
+# Removes what `install` wrote. Leaves the launchd agent, its config, its log
+# and the credentials file alone. Those are configuration, not ours to remove:
+# a bootout would be a surprise from uninstalling the binary, and deleting
+# the key would lock out every client that signs with it.
 uninstall:
-	rm -f "$(BINDIR)/spiceio"
+	rm -f "$(BINDIR)/spiceio" "$(BINDIR)/sccache-spiceio"
 	rm -rf "$(BINDIR)/spiceio.dSYM"
 
 clean:

@@ -1,0 +1,66 @@
+#!/bin/sh
+# sccache-spiceio: run sccache signed with the local spiceio agent's access key.
+#
+# `make install` puts this beside the spiceio binary and points the launchd
+# agent at a credentials file. Once the agent requires SigV4, point Cargo at
+# this instead of sccache:
+#
+#   export RUSTC_WRAPPER="$HOME/.local/bin/sccache-spiceio"
+#   # and drop SCCACHE_S3_NO_CREDENTIALS, which makes sccache send unsigned requests
+#
+# The key reaches sccache only through this process's environment, as
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. Exporting those in the shell
+# would override AWS_PROFILE for every AWS tool, and they would sign real AWS
+# requests with a key only spiceio knows.
+#
+# Only the sccache *server* talks to S3, and it inherits the environment of
+# the client that started it. So after switching RUSTC_WRAPPER, run
+# `sccache --stop-server` once. The next build then starts a server that has
+# the key. A server started without it keeps sending unsigned requests, and
+# the agent refuses them.
+#
+# The key is the *last* `ACCESS_KEY_ID SECRET` line of
+# $SPICEIO_CLIENT_CREDENTIALS_FILE (default ~/.config/spiceio/credentials,
+# the file `make install` points the agent at). Last, so a rotation runs in
+# this order: append the new key, restart the agent so it accepts both, run
+# `sccache --stop-server` so the next server signs with the new key, then
+# delete the old line and restart the agent again.
+#
+# A missing key fails the wrapper, rather than silently running sccache
+# unsigned. Unsigned, every cache request would be refused and each build
+# would quietly compile from scratch.
+#
+# SPICEIO_SCCACHE names the program to run (default: `sccache` on PATH).
+# `make install` sets it to curl to prove that what this hands sccache
+# actually signs.
+#
+# This runs once per rustc invocation, so it forks nothing: the file is read
+# with the shell's own `read`.
+
+file="${SPICEIO_CLIENT_CREDENTIALS_FILE:-$HOME/.config/spiceio/credentials}"
+id=""
+secret=""
+if [ -r "$file" ]; then
+    # `|| [ -n "$a" ]` keeps a last line that has no trailing newline.
+    while read -r a b _ || [ -n "$a" ]; do
+        case "$a" in
+        '' | '#'*) ;;
+        *)
+            id=$a
+            secret=$b
+            ;;
+        esac
+    done <"$file"
+fi
+if [ -z "$id" ] || [ -z "$secret" ]; then
+    echo "sccache-spiceio: no access key in $file" >&2
+    echo "sccache-spiceio: run \`make install\` in the spiceio repo to create one, or set SPICEIO_CLIENT_CREDENTIALS_FILE" >&2
+    exit 1
+fi
+
+export AWS_ACCESS_KEY_ID="$id"
+export AWS_SECRET_ACCESS_KEY="$secret"
+# spiceio refuses session tokens instead of ignoring them, so a token left in
+# the shell by an AWS SSO login would get every request rejected.
+unset AWS_SESSION_TOKEN SCCACHE_S3_NO_CREDENTIALS
+exec "${SPICEIO_SCCACHE:-sccache}" "$@"
