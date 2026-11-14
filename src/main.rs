@@ -399,6 +399,18 @@ async fn next_signal(sig: &mut Option<signal::unix::Signal>) {
 /// Interval between spill sweeps, chosen from how full the last one found the
 /// directory. A cache with room to spare does not need a tree walk every
 /// minute; one near its budget does.
+/// The resolved S3 auth configuration in one line, as startup logs it and
+/// `--check-auth` prints it. Key ids are not secret; secrets never appear.
+fn auth_summary(auth: &s3::auth::Authenticator) -> String {
+    match auth.mode() {
+        s3::auth::Mode::Off => "off (requests are not authenticated)".to_string(),
+        mode => format!(
+            "{mode} (SigV4; access keys: {})",
+            auth.access_key_ids().join(", ")
+        ),
+    }
+}
+
 fn sweep_interval(stats: &spill::SweepStats) -> Duration {
     if stats.skipped {
         // Another instance is sweeping — check back on its cadence, not ours.
@@ -416,6 +428,22 @@ fn sweep_interval(stats: &spill::SweepStats) -> Duration {
 async fn main() {
     if env::args().any(|a| a == "--version" || a == "-V") {
         println!("spiceio {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    // `--check-auth`: resolve the S3 auth configuration from the environment
+    // exactly as startup does, print the result and exit, touching nothing
+    // else (no SMB, no listener, no log file). `make install` runs it with
+    // the agent's settings before restarting the agent, so a credentials file
+    // the server would refuse stops the install instead of the agent.
+    if env::args().any(|a| a == "--check-auth") {
+        match s3::auth::Authenticator::from_env() {
+            Ok(auth) => println!("S3 auth: {}", auth_summary(&auth)),
+            Err(e) => {
+                eprintln!("S3 auth configuration: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -475,22 +503,14 @@ async fn main() {
             flush_and_exit(1);
         }
     };
-    match auth.mode() {
-        s3::auth::Mode::Off => {
-            slog!("[spiceio] S3 auth: off (requests are not authenticated)");
-            if !config.bind_addr.ip().is_loopback() {
-                serr!(
-                    "[spiceio] warning: S3 auth is off and {} is not a loopback address; \
-                     anyone who can reach it can read, write and delete the whole share. \
-                     Configure SPICEIO_S3_ACCESS_KEY_ID/SPICEIO_S3_SECRET_ACCESS_KEY to require SigV4.",
-                    config.bind_addr
-                );
-            }
-        }
-        mode => slog!(
-            "[spiceio] S3 auth: {mode} (SigV4; access keys: {})",
-            auth.access_key_ids().join(", ")
-        ),
+    slog!("[spiceio] S3 auth: {}", auth_summary(&auth));
+    if auth.mode() == s3::auth::Mode::Off && !config.bind_addr.ip().is_loopback() {
+        serr!(
+            "[spiceio] warning: S3 auth is off and {} is not a loopback address; \
+             anyone who can reach it can read, write and delete the whole share. \
+             Configure SPICEIO_S3_ACCESS_KEY_ID/SPICEIO_S3_SECRET_ACCESS_KEY to require SigV4.",
+            config.bind_addr
+        );
     }
 
     // A malformed value never becomes valid, so reject it here: inside the

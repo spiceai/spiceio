@@ -84,7 +84,8 @@ export SCCACHE_ENDPOINT=http://localhost:8333
 export SCCACHE_REGION=us-east-1
 export SCCACHE_S3_USE_SSL=false
 export SCCACHE_S3_KEY_PREFIX=sccache
-# Any values work while spiceio's auth is off; with it on, use a configured key.
+# Any values work while spiceio's auth is off; with it on, use a configured key
+# (or RUSTC_WRAPPER=sccache-spiceio, see "The local launchd agent" below).
 export AWS_ACCESS_KEY_ID=test
 export AWS_SECRET_ACCESS_KEY=test
 export RUSTC_WRAPPER=sccache
@@ -250,6 +251,55 @@ Over plain HTTP, SigV4 keeps the secret off the wire and stops a request from
 being altered, but a captured request can be replayed within the 15-minute
 window and the data itself is not encrypted. Keep spiceio on a trusted network
 or loopback.
+
+### The local launchd agent (`make install`)
+
+`make install` sets up SigV4 for a launchd agent (`ai.spice.spiceio`) running
+the installed binary, and checks that it works:
+
+1. If the agent's plist names no credentials file, the agent gets
+   `~/.config/spiceio/credentials` (mode 0600, in a 0700 directory). If that
+   file does not exist, install creates it with a fresh key. A credentials
+   file that already exists is never rewritten. An agent that already names
+   one keeps it, because other clients may sign with its keys.
+2. install sets `SPICEIO_S3_CREDENTIALS_FILE` and `SPICEIO_S3_AUTH` in the
+   plist's `EnvironmentVariables`. The edit is made on a copy and renamed into
+   place, and the plist keeps its mode, its format and its symlink. First,
+   `spiceio --check-auth` validates the result exactly as startup would, so a
+   bad key file stops the install, not the agent.
+3. install restarts the agent. If the plist's environment differs from what
+   launchd loaded, it does a full reload instead, because `kickstart` would
+   keep the old environment.
+4. install checks the result. An unsigned request must be refused, and a
+   request signed through `sccache-spiceio` must be served. Otherwise the
+   install fails.
+
+```bash
+make install                    # SPICEIO_S3_AUTH=enforce
+make install AGENT_AUTH=log     # verify and log, but still serve unsigned requests
+make install AGENT_AUTH=keep    # leave the agent's auth settings alone
+make install RESTART_AGENT=0    # stage the binary and the plist edit; a later install reloads it
+```
+
+sccache has to sign too, and once the agent enforces, an sccache that does not
+sign **fails the build**, because its server cannot start against a store that
+refuses it. Use the `sccache-spiceio` wrapper, installed beside the binary. It
+passes the agent's key to sccache alone, so your shell's `AWS_PROFILE` still
+applies to real AWS:
+
+```bash
+export RUSTC_WRAPPER="$HOME/.local/bin/sccache-spiceio"   # instead of sccache
+# remove SCCACHE_S3_NO_CREDENTIALS; the wrapper unsets it, and AWS_SESSION_TOKEN
+sccache --stop-server   # once: a running sccache server keeps the settings it started with
+```
+
+The wrapper signs with the *last* key in the file (or in
+`SPICEIO_CLIENT_CREDENTIALS_FILE`). To rotate:
+
+1. Append a new key.
+2. Run `make install` so the agent accepts both keys.
+3. Run `sccache --stop-server` so sccache starts signing with the new key.
+4. Delete the old line and run `make install` again.
 
 ## OTEL metrics (Spice Cloud)
 
@@ -528,7 +578,7 @@ HTTP request
 make                   # fmt + full CI-local gate
 make ci                # parity with GitHub Actions (lint + unit + live SMB suites)
 make release           # optimized release build
-make install           # install the release build (+ dSYM) into ~/.local/bin; restarts the launchd agent and reports its listen address
+make install           # install the release build (+ dSYM, sccache-spiceio) into ~/.local/bin; set up SigV4 for the launchd agent, restart it, check its auth
 make lint              # static only — not sufficient to claim CI will pass
 make test-unit         # cargo test (no SMB)
 make test              # sccache integration (requires SPICEIO_SMB_USER/PASS)
