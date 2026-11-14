@@ -34,6 +34,22 @@ make bench-sccache-build       # real cargo builds: spiceio vs local-disk vs no 
 make bench-sccache-all         # both
 ```
 
+### Rust toolchain
+
+`rust-toolchain.toml` pins the compiler (currently 1.100.0) and is the only
+place the version is set: rustup selects it inside the repo, and `ci.yml` and
+`release.yml` read `channel` from it, so local `make ci`, CI, and the release
+artifact use the same rustc and clippy. Bump it there (Dependabot proposes
+bumps weekly) and fix whatever the new clippy flags in the same PR. Do not add
+a toolchain version to a workflow.
+
+`rust-version` in `Cargo.toml` is the MSRV and moves separately. Clippy's
+`incompatible_msrv` (denied via `clippy::all`) rejects std APIs newer than it,
+so raise it only when code needs a newer release, never just because the pin
+moved. `[lints.cargo] unused_dependencies = "deny"` fails `make lint` on a
+dependency nothing uses. It does not flag one that another dependency also
+pulls in, so after removing the last use of a crate, check `Cargo.toml` by hand.
+
 ### Measuring sccache performance
 
 The two bench targets answer different questions and are **measurements, not

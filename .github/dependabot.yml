@@ -14,3 +14,13 @@ updates:
       github-actions:
         patterns:
           - '*'
+
+  # Bumps `channel` in rust-toolchain.toml. Same 7-day cooldown as actions, so
+  # a new release has a week for regressions to surface before CI moves to it;
+  # the bump PR runs the full live-suite CI on the new compiler.
+  - package-ecosystem: 'rust-toolchain'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    cooldown:
+      default-days: 7

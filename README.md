@@ -38,7 +38,9 @@ S3 client  --->  spiceio (HTTP :8333)  --->  SMB server (TCP :445)
 
 ## Quick start
 
-Requires macOS 26+ and Rust (edition 2024).
+Requires macOS 26+ and Rust 1.100 (edition 2024). The toolchain is pinned in
+`rust-toolchain.toml`; with rustup, run `rustup toolchain install` in the repo
+once to fetch it.
 
 ```bash
 make release
