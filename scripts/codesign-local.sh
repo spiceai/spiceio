@@ -93,7 +93,10 @@ make_sign_home() {
     [ -z "$(HOME=$sign_home security list-keychains -d user)" ] ||
         die "security does not read the keychain search list from HOME here; not signing (it would edit your search list)"
     HOME=$sign_home security list-keychains -d user -s "$kc" || die "cannot set a private keychain search list"
-    HOME=$sign_home security list-keychains -d user | grep -Fq -e "$kc" -e "$(cd "$(dirname "$kc")" && pwd -P)/$(basename "$kc")" ||
+    # Compared as files, not strings: security prints the resolved path, and
+    # SIGNING_KEYCHAIN may name the keychain through a symlink.
+    listed=$(HOME=$sign_home security list-keychains -d user | sed 's/^[[:space:]]*"//; s/"$//')
+    [ -e "$listed" ] && [ "$(stat -L -f %d:%i "$listed")" = "$(stat -L -f %d:%i "$kc")" ] ||
         die "the private keychain search list does not hold $kc"
 }
 drop_sign_home() {
@@ -151,20 +154,21 @@ case "$kc" in
 *) die "SIGNING_KEYCHAIN=$kc is not an absolute path" ;;
 esac
 
-# One signing run at a time per signing keychain. Each run unlocks the
-# keychain (or finds it unlocked), signs and locks it again, so two
-# concurrent installs would interleave: one would lock the keychain between
-# the other's lock-state check and its codesign, which then fails or, in a
-# login session, asks for the password in a dialog. The run re-executes
-# itself under lockf(1) on a file beside the keychain, and a second run
-# waits for the first to finish.
-if [ "${SPICEIO_SIGN_LOCK_HELD:-}" != "$kc" ]; then
-    kc_dir=$(dirname "$kc")
-    [ -d "$kc_dir" ] || (umask 077 && mkdir -p "$kc_dir") || die "cannot create $kc_dir"
-    lock="$kc_dir/.$(basename "$kc").lock"
+# One signing run at a time for this user. Each run unlocks the keychain (or
+# finds it unlocked), signs and locks it again, so two concurrent installs
+# would interleave: one would lock the keychain between the other's
+# lock-state check and its codesign, which then fails or, in a login session,
+# asks for the password in a dialog. The run re-executes itself under
+# lockf(1), and a second run waits for the first to finish. The lock is one
+# file per user (getconf DARWIN_USER_TEMP_DIR, which does not follow TMPDIR),
+# not one named after SIGNING_KEYCHAIN: two runs naming the same keychain by
+# different paths (a symlink, /var and /private/var) must take the same lock.
+user_tmp=$(getconf DARWIN_USER_TEMP_DIR) && [ -n "$user_tmp" ] || die "cannot find this user's temporary directory for the signing lock"
+lock="${user_tmp%/}/spiceio-codesign.lock"
+if [ "${SPICEIO_SIGN_LOCK_HELD:-}" != "$lock" ]; then
     lockf -k -s -t 0 "$lock" true ||
-        echo "waiting for another run to finish signing with $kc" >&2
-    exec env SPICEIO_SIGN_LOCK_HELD="$kc" lockf -k -t 900 "$lock" /bin/sh "$0" "$@"
+        echo "waiting for another run to finish signing" >&2
+    exec env SPICEIO_SIGN_LOCK_HELD="$lock" lockf -k -t 900 "$lock" /bin/sh "$0" "$@"
 fi
 
 keychain_state() { "$SPICEIO_HELPER_BIN" --keychain-status "$kc"; }
@@ -182,6 +186,20 @@ identity_hash() {
 key_attribute() {
     security dump-keychain "$kc" 2>/dev/null |
         awk -v a="$1" '/^class: 0x00000010/ { k = 1 } /^keychain:/ { if (k) exit } k && $1 == a { print $2; exit }'
+}
+
+# Refuse a signing key that can be exported, on every run: a key made outside
+# this script, by hand or by a version that imported a .p12 (whose -x
+# `security import -f pkcs12` ignores), may be exportable, and a copy of it
+# could sign a binary that reads the SMB password. Reading the key's
+# Extractable attribute (0x10) touches no ACL, so it raises no dialog.
+require_unexportable_key() {
+    extractable=$(key_attribute 0x00000010)
+    [ "$extractable" = "<uint32>=0x00000000" ] && return 0
+    die "the signing key in $kc is exportable (Extractable ${extractable:-unknown}), so a copy of it
+       could sign a binary that reads the SMB password. Not signing with it. To start over,
+       delete the keychain (security delete-keychain $(shq "$kc")) and run \`make install\`
+       again; a new identity cannot read items the old one stored (README, \"New signing identity\")."
 }
 
 create_identity() {
@@ -208,11 +226,8 @@ EOF
     # private key is never written to a file. codesign is on its access list.
     "$SPICEIO_HELPER_BIN" --create-signing-identity "$kc" "$CN" >/dev/null ||
         die "could not create the signing identity in $kc"
-    # Check it rather than trust the flag: the key's Extractable attribute
-    # (0x10) must be 0. Reading attributes touches no ACL, so no dialog.
-    extractable=$(key_attribute 0x00000010)
-    [ "$extractable" = "<uint32>=0x00000000" ] ||
-        die "the new signing key is exportable (Extractable $extractable); not using it"
+    # Check it rather than trust the flag, before codesign is let near it.
+    require_unexportable_key
     echo "Allow codesign to use the new key (asks for the signing keychain's password again):"
     security set-key-partition-list -S apple-tool:,apple: -s "$kc" >/dev/null ||
         die "could not let codesign use the key in $kc"
@@ -240,6 +255,7 @@ hash=$(identity_hash)
 [ -n "$hash" ] || die "$kc has no \"$CN\" identity. To start over, delete the keychain
        (security delete-keychain $(shq "$kc")) and run \`make install\` again. A new identity
        cannot read keychain items the old one stored: see README, \"New signing identity\"."
+require_unexportable_key
 
 stage
 # --timestamp=none: nothing to ask Apple's timestamp server about a

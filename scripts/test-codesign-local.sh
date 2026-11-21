@@ -158,21 +158,52 @@ check "exits 0" [ "$RC" -eq 0 ]
 check "asks for nothing" lacks "assword"
 check "locked again" [ "$(state "$KC")" = locked ]
 
-echo "--- a second run waits for one that is signing"
-# Hold the signing lock the way a run does, then start another run.
-LOCK="$(dirname "$KC")/.$(basename "$KC").lock"
-lockf -k "$LOCK" sleep 3 &
-HOLDER=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do lockf -k -s -t 0 "$LOCK" true || break; sleep 0.1; done
-security unlock-keychain -p "$PW" "$KC"
-START=$(date +%s)
-run env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/waited"
-WAITED=$(($(date +%s) - START))
-wait "$HOLDER"
-check "exits 0" [ "$RC" -eq 0 ]
-check "says it is waiting" has "waiting for another run to finish signing with $KC"
-check "and waits for the lock (${WAITED}s)" [ "$WAITED" -ge 2 ]
-check "locked again" [ "$(state "$KC")" = locked ]
+echo "--- a second run waits for one that is signing, whatever path it names"
+# Hold the signing lock the way a run does, then start another run: once
+# naming the keychain directly, once through a symlink to it.
+LOCK="$(getconf DARWIN_USER_TEMP_DIR | sed 's#/$##')/spiceio-codesign.lock"
+ln -s "$KC" "$WORK/alias.kc"
+for named in "$KC" "$WORK/alias.kc"; do
+    lockf -k "$LOCK" sleep 3 &
+    HOLDER=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do lockf -k -s -t 0 "$LOCK" true || break; sleep 0.1; done
+    security unlock-keychain -p "$PW" "$KC"
+    START=$(date +%s)
+    run env SIGNING_KEYCHAIN="$named" sh "$SIGN" "$SPICEIO_BIN" "$WORK/waited"
+    WAITED=$(($(date +%s) - START))
+    wait "$HOLDER"
+    check "$(basename "$named"): exits 0" [ "$RC" -eq 0 ]
+    check "$(basename "$named"): says it is waiting" has "waiting for another run to finish signing"
+    check "$(basename "$named"): and waits for the lock (${WAITED}s)" [ "$WAITED" -ge 2 ]
+    check "$(basename "$named"): locked again" [ "$(state "$KC")" = locked ]
+done
+
+echo "--- an existing signing key that can be exported is refused"
+# Made the way an older version made one: openssl, then `security import -f
+# pkcs12`, which ignores -x and stores the key Extractable. A stand-in
+# codesign records any call, so even a regression here cannot sign (or raise
+# a dialog) with it.
+EXP="$WORK/exportable.keychain-db"
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/exp-key.pem" -out "$WORK/exp-cert.pem" \
+    -days 1 -subj "/CN=spiceio local code signing" \
+    -addext "extendedKeyUsage=critical,codeSigning" -addext "keyUsage=critical,digitalSignature" 2>/dev/null
+/usr/bin/openssl pkcs12 -export -inkey "$WORK/exp-key.pem" -in "$WORK/exp-cert.pem" \
+    -out "$WORK/exp.p12" -passout pass:exp 2>/dev/null
+security create-keychain -p "$PW" "$EXP"
+security import "$WORK/exp.p12" -k "$EXP" -f pkcs12 -P exp -T /usr/bin/codesign >/dev/null
+check "the stand-in key is exportable" [ "$(KC=$EXP key_attr 0x00000010)" = "<uint32>=0x00000001" ]
+mkdir -p "$WORK/stub"
+printf '#!/bin/sh\necho "$*" >> "%s/stub/calls"\n' "$WORK" >"$WORK/stub/codesign"
+chmod +x "$WORK/stub/codesign"
+: >"$WORK/stub/calls"
+run env PATH="$WORK/stub:$PATH" SPICEIO_HELPER_BIN="$SPICEIO_BIN" SIGNING_KEYCHAIN="$EXP" sh "$SIGN" "$SPICEIO_BIN" "$WORK/exp-signed"
+check "exits 1" [ "$RC" -eq 1 ]
+check "says the key is exportable" has "is exportable"
+check "and how to start over" has "security delete-keychain '$EXP'"
+check "never calls codesign to sign" [ -z "$(grep -e ' -s ' "$WORK/stub/calls")" ]
+check "leaves no output binary" [ ! -e "$WORK/exp-signed" ]
+check "locks the keychain again" [ "$(state "$EXP")" = locked ]
+security delete-keychain "$EXP"
 
 echo "--- the keychain named through a symlinked path"
 # security prints resolved paths (/private/var/… for /var/…); the private
