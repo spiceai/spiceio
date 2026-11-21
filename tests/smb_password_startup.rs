@@ -87,8 +87,13 @@ fn read_until(child: &mut std::process::Child, marker: &str, timeout: Duration) 
     // both loops end) as soon as both pipes close: a child that dies early is
     // reported at once, not after `timeout`.
     drop(tx);
+    // One deadline for the whole wait, not a fresh `timeout` per line: a
+    // child that keeps logging without printing `marker` is still stopped.
+    let deadline = std::time::Instant::now() + timeout;
     let mut seen = Vec::new();
-    while let Ok(line) = rx.recv_timeout(timeout) {
+    while let Ok(line) =
+        rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+    {
         let done = line.contains(marker);
         seen.push(line);
         if done {
@@ -218,6 +223,35 @@ fn an_invalid_port_stops_startup() {
         text(&out).contains("SPICEIO_SMB_PORT=smb is not a valid port"),
         "{}",
         text(&out)
+    );
+}
+
+/// The login keychain comes from the user database, not `HOME`: an
+/// installer's shell and the agent's plist can carry different values for the
+/// same user, and must resolve the same keychain.
+#[test]
+fn the_login_keychain_does_not_follow_home() {
+    let elsewhere = std::env::temp_dir().join("spiceio-not-home");
+    let out = Command::new(env!("CARGO_BIN_EXE_spiceio"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &elsewhere)
+        .args([
+            "--check-smb-password",
+            "--server",
+            "nas.invalid",
+            "--user",
+            "u",
+            "--service",
+            "ai.spice.spiceio.home-probe",
+        ])
+        .output()
+        .unwrap();
+    let text = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        !text.contains("spiceio-not-home"),
+        "the login keychain followed HOME: {text}"
     );
 }
 

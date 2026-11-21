@@ -465,11 +465,61 @@ fn os_error(status: OSStatus) -> Error {
     }
 }
 
-/// The login keychain's file: `~/Library/Keychains/login.keychain-db`.
-fn login_keychain() -> Result<PathBuf, Error> {
-    std::env::home_dir()
+/// `struct passwd` from <pwd.h> (macOS layout).
+#[repr(C)]
+struct Passwd {
+    pw_name: *mut c_char,
+    pw_passwd: *mut c_char,
+    pw_uid: u32,
+    pw_gid: u32,
+    pw_change: i64,
+    pw_class: *mut c_char,
+    pw_gecos: *mut c_char,
+    pw_dir: *mut c_char,
+    pw_shell: *mut c_char,
+    pw_expire: i64,
+}
+
+unsafe extern "C" {
+    fn getuid() -> u32;
+    fn getpwuid_r(
+        uid: u32,
+        pwd: *mut Passwd,
+        buf: *mut c_char,
+        buflen: usize,
+        result: *mut *mut Passwd,
+    ) -> i32;
+}
+
+/// The home directory of the user this process runs as, from the user
+/// database: not `$HOME`, which differs between environments (an installer's
+/// shell and a launchd agent's plist) for the same user.
+fn user_home() -> Option<PathBuf> {
+    // SAFETY: `Passwd` is plain pointers and integers, valid when zeroed.
+    let mut pwd: Passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as c_char; 16 * 1024];
+    let mut result: *mut Passwd = std::ptr::null_mut();
+    // SAFETY: `pwd` and `buf` outlive the call, which writes the strings
+    // `pwd` points at into `buf` (sized by its length).
+    let rc = unsafe { getpwuid_r(getuid(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_dir` is a NUL-terminated string inside `buf`.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
+/// The login keychain's file, `~/Library/Keychains/login.keychain-db`, with
+/// `~` from the user database. So `make install` (checking from a shell) and
+/// the launchd agent (reading at startup) resolve the same file whatever
+/// `HOME` their environments carry.
+pub fn login_keychain() -> Result<PathBuf, Error> {
+    user_home()
         .map(|home| home.join("Library/Keychains/login.keychain-db"))
-        .ok_or_else(|| Error::Invalid("no home directory, so no login keychain".into()))
+        .ok_or_else(|| {
+            Error::Invalid("no home directory for this user, so no login keychain".into())
+        })
 }
 
 /// The one keychain file an item addresses (see [`Item`]), opened, and the

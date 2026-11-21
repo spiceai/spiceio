@@ -181,14 +181,19 @@ SIGNING_KEYCHAIN ?= $(HOME)/Library/Keychains/spiceio-signing.keychain-db
 # (`agent-install.sh --preflight`: can it read the agent's SMB password?) and
 # only then renamed over it. A rename replaces the target atomically, like
 # install(1), and a failed signature or check leaves the old binary in place.
+# The staged copy has a name unique to this run (mktemp), and signing, the
+# check and the rename happen in one shell, so a concurrent `make install`
+# cannot swap in a build between this one's check and its rename.
 install: release
 	install -d "$(BINDIR)"
-	@CODESIGN="$(CODESIGN)" SIGNING_KEYCHAIN="$(SIGNING_KEYCHAIN)" \
-	  ./scripts/codesign-local.sh target/release/spiceio "$(BINDIR)/.spiceio.new"
-	@BINDIR="$(BINDIR)" LAUNCHD_LABEL="$(LAUNCHD_LABEL)" \
-	  ./scripts/agent-install.sh --preflight "$(BINDIR)/.spiceio.new" || \
-	  { rm -f "$(BINDIR)/.spiceio.new"; exit 1; }
-	mv -f "$(BINDIR)/.spiceio.new" "$(BINDIR)/spiceio"
+	@set -e; \
+	  staged=$$(mktemp "$(BINDIR)/.spiceio.XXXXXX"); \
+	  trap 'rm -f "$$staged"' EXIT; \
+	  CODESIGN="$(CODESIGN)" SIGNING_KEYCHAIN="$(SIGNING_KEYCHAIN)" \
+	    ./scripts/codesign-local.sh target/release/spiceio "$$staged"; \
+	  BINDIR="$(BINDIR)" LAUNCHD_LABEL="$(LAUNCHD_LABEL)" \
+	    ./scripts/agent-install.sh --preflight "$$staged"; \
+	  mv -f "$$staged" "$(BINDIR)/spiceio"
 	install -m 0755 scripts/sccache-spiceio "$(BINDIR)/sccache-spiceio"
 	rm -rf "$(BINDIR)/spiceio.dSYM.new"
 	cp -RL target/release/spiceio.dSYM "$(BINDIR)/spiceio.dSYM.new"

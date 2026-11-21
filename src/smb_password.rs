@@ -188,7 +188,8 @@ pub struct Setting {
 /// through here, so they can never disagree about the item. Values are kept
 /// raw and checked when used ([`Settings::destination`]), after any flags
 /// have replaced them: an invalid environment value a flag overrides is not
-/// an error. Empty values (and a blank port) count as unset.
+/// an error. Empty values count as unset, and so does a port of only spaces
+/// (a password of only spaces is still a password).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     /// `SPICEIO_SMB_SERVER` / `--server`.
@@ -210,11 +211,11 @@ pub struct Settings {
 impl Settings {
     /// Read the settings through `get` (`std::env::var` in production).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        let get = |name: &str| get(name).filter(|v| !v.trim().is_empty());
+        let get = |name: &str| get(name).filter(|v| !v.is_empty());
         let setting = |name: &'static str| get(name).map(|value| Setting { value, from: name });
         Self {
             server: setting("SPICEIO_SMB_SERVER"),
-            port: setting("SPICEIO_SMB_PORT"),
+            port: setting("SPICEIO_SMB_PORT").filter(|port| !port.value.trim().is_empty()),
             user: get("SPICEIO_SMB_USER"),
             domain: get("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
             inline: get("SPICEIO_SMB_PASS"),
@@ -239,15 +240,24 @@ impl Settings {
         S: AsRef<str>,
     {
         let mut args = args.into_iter().map(|a| a.as_ref().to_string());
+        let mut position = 0;
         while let Some(arg) = args.next() {
+            position += 1;
             if arg == subcommand {
                 continue;
             }
+            // Errors below name the flag but never repeat a value: a value
+            // given by mistake (`-p=…`, a misspelt `--pasword=…`, a bare
+            // word) may well be the password.
+            if !arg.starts_with('-') {
+                return Err(format!(
+                    "unexpected argument {position}: a value with no flag before it (expected \
+                     --server, --user, --domain, --port or --service)"
+                ));
+            }
             let (name, inline) = match arg.split_once('=') {
-                Some((name, value)) if name.starts_with("--") => {
-                    (name.to_string(), Some(value.to_string()))
-                }
-                _ => (arg.clone(), None),
+                Some((name, value)) => (name.to_string(), Some(value.to_string())),
+                None => (arg, None),
             };
             let mut value = || {
                 let value = match inline.clone() {
@@ -285,8 +295,8 @@ impl Settings {
                 }
                 _ => {
                     return Err(format!(
-                        "unknown argument {arg:?} (expected --server, --user, --domain, --port \
-                         or --service)"
+                        "unknown flag {name:?} (expected --server, --user, --domain, --port or \
+                         --service)"
                     ));
                 }
             }
@@ -485,10 +495,18 @@ fn explain(item: &Item, shown: &str, e: &keychain::Error, storing: bool) -> Stri
                 delete_command(item, shown)
             )
         }
-        keychain::Error::NoSuchKeychain => format!(
-            "{} does not exist (SPICEIO_SMB_PASS_KEYCHAIN_PATH)",
-            item.location()
-        ),
+        keychain::Error::NoSuchKeychain => match &item.keychain {
+            Some(path) => format!(
+                "keychain {} does not exist (SPICEIO_SMB_PASS_KEYCHAIN_PATH)",
+                path.display()
+            ),
+            None => format!(
+                "the login keychain ({}) does not exist",
+                keychain::login_keychain()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "no home directory".into())
+            ),
+        },
         other => format!("{what} in {}: {other}", item.location()),
     }
 }
@@ -1004,6 +1022,31 @@ mod tests {
         );
     }
 
+    /// No refusal repeats a value: one typed by mistake may be the password.
+    #[test]
+    fn refusals_never_echo_a_value() {
+        for list in [
+            &["-p=hunter2"][..],
+            &["--password=hunter2"],
+            &["--pasword=hunter2"],
+            &["hunter2"],
+            &["--server", "nas", "hunter2"],
+        ] {
+            let err = Settings::default().with_args(args(list), "-").unwrap_err();
+            assert!(!err.contains("hunter2"), "{list:?}: {err}");
+        }
+        let err = Settings::default()
+            .with_args(args(&["-p=hunter2"]), "-")
+            .unwrap_err();
+        assert!(err.contains("never taken from the command line"), "{err}");
+    }
+
+    #[test]
+    fn a_password_of_spaces_is_a_password() {
+        let s = settings(&[("SPICEIO_SMB_PASS", "   ")]);
+        assert_eq!(Source::resolve(&s), Ok(Source::Env("   ".into())));
+    }
+
     #[test]
     fn bad_flags_are_errors() {
         assert!(
@@ -1030,13 +1073,13 @@ mod tests {
             Settings::default()
                 .with_args(args(&["--serverr", "x"]), "-")
                 .unwrap_err()
-                .contains("unknown argument")
+                .contains("unknown flag \"--serverr\"")
         );
         assert!(
             Settings::default()
                 .with_args(args(&["nas"]), "-")
                 .unwrap_err()
-                .contains("unknown argument")
+                .contains("unexpected argument 1")
         );
     }
 }

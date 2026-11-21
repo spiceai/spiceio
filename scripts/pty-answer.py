@@ -35,6 +35,8 @@ def give_up(*_):
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
+        # The group already exited on its own: nothing is left to kill, and
+        # waitpid below still reaps the child.
         pass
     os.waitpid(pid, 0)
     sys.stdout.write(seen.decode(errors="replace"))

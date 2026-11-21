@@ -317,7 +317,7 @@ check "and says why" has "never taken from the command line"
 check "without echoing it" lacks "$SECRET"
 run flags "$WORK/a" --check-smb-password --sever nas.example
 check "an unknown flag: exits 1" [ "$RC" -eq 1 ]
-check "and names it" has "unknown argument \"--sever\""
+check "and names it" has "unknown flag \"--sever\""
 
 echo "--- refusals"
 stdin_run "x" smb SPICEIO_SMB_PASS=inline "$WORK/a" --store-smb-password
