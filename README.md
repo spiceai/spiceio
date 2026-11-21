@@ -389,9 +389,14 @@ someone who has your login password.
 ### Rotation, backup and recovery
 
 - **New SMB password.** Change it on the NAS, then store it with the installed
-  (signed) binary: `~/.local/bin/spiceio --store-smb-password --server <server>
-  --user <user>` (plus `--domain`/`--port` if the agent sets them). Then restart the agent:
-  `launchctl kickstart -k gui/$(id -u)/ai.spice.spiceio`.
+  (signed) binary, using **all** of the agent's lookup settings: the item is
+  keyed on them, and a missing one files the password where the agent never
+  looks. That means `--server` and `--user`, plus `--domain`, `--port` and
+  `--service` if its plist sets `SPICEIO_SMB_DOMAIN`, `SPICEIO_SMB_PORT` or
+  `SPICEIO_SMB_PASS_KEYCHAIN`. If the plist sets `SPICEIO_SMB_PASS_KEYCHAIN_PATH`,
+  set it in the environment as well:
+  `~/.local/bin/spiceio --store-smb-password --server <server> --user <user> […]`.
+  Then restart the agent: `launchctl kickstart -k gui/$(id -u)/ai.spice.spiceio`.
 - **After moving a password out of a plist.** Backups and copies of the plist
   made before the move (Time Machine, a dotfiles repo) still hold the old
   password. If any of them could have been read, rotate it as above.
@@ -405,9 +410,14 @@ someone who has your login password.
   1. `security delete-keychain ~/Library/Keychains/spiceio-signing.keychain-db`
   2. `make release && scripts/codesign-local.sh target/release/spiceio /tmp/spiceio-new`
      (creates the new identity and signs a temporary copy with it)
-  3. `security delete-generic-password -s ai.spice.spiceio.smb` (macOS may ask
-     for your login password)
-  4. `/tmp/spiceio-new --store-smb-password --server <server> --user <user>`
+  3. Delete exactly the agent's item: its service (`SPICEIO_SMB_PASS_KEYCHAIN`,
+     usually `ai.spice.spiceio.smb`), its account, and its keychain file if
+     the plist names one (`SPICEIO_SMB_PASS_KEYCHAIN_PATH`; otherwise the login
+     keychain). macOS may ask for your login password:
+     `security delete-generic-password -s <service> -a 'smb://[<domain>;]<user>@<server>[:<port>]' [<keychain file>]`.
+     `--check-smb-password` prints the account with the user masked.
+  4. `/tmp/spiceio-new --store-smb-password`, with all of the agent's lookup
+     settings, as under **New SMB password** above.
   5. `make install`, then `rm /tmp/spiceio-new`
 
   The running agent keeps working until step 5 restarts it on the new build.

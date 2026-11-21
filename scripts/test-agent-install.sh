@@ -61,8 +61,7 @@ install -m 0755 "$ROOT/scripts/sccache-spiceio" "$WORK/adhocbin/sccache-spiceio"
 
 # The installed spiceio is signed the way `make install` signs it (a
 # self-signed identity in its own keychain), so keychain items it stores pin
-# that identity rather than one build. Made here with a known password; the
-# interactive path is test-codesign-local.sh's job.
+# that identity rather than one build.
 SIGNING_KC="$WORK/signing.keychain-db"
 # setup WHAT CMD...: run a setup step, quiet on success; on failure say which
 # step and show its output, then stop (set -e) with that reason.
@@ -80,60 +79,9 @@ setup() {
 # takes. Not by hand with `security set-key-partition-list -k`: that form
 # raised a GUI keychain dialog (securityd: "displaying keychain prompt for
 # /usr/bin/security") on every run, which a test must never do.
-cat >"$WORK/pty.py" <<'EOF'
-import os, pty, select, signal, sys, time
-password = os.environ["PTY_PASSWORD"].encode()
-limit = float(os.environ.get("PTY_DEADLINE", "120"))
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(sys.argv[1], sys.argv[1:])
-seen, pending, deadline = b"", b"", time.time() + limit
-
-
-def give_up():
-    # pty.fork made the child a session leader, so its process group is its
-    # pid: kill the whole group and reap it, instead of waiting on a child
-    # stuck at an unanswered prompt.
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    os.waitpid(pid, 0)
-    sys.stdout.write(seen.decode(errors="replace"))
-    sys.stdout.write("\npty.py: gave up after %gs\n" % limit)
-    sys.exit(124)
-
-
-while True:
-    if time.time() >= deadline:
-        give_up()
-    if not select.select([fd], [], [], 0.5)[0]:
-        continue
-    try:
-        data = os.read(fd, 4096)
-    except OSError:
-        break
-    if not data:
-        break
-    seen += data
-    pending += data
-    if b"assword" in pending and pending.rstrip().endswith(b":"):
-        os.write(fd, password + b"\n")
-        pending = b""
-# The terminal closed; the child may still be running. Wait for it only
-# until the deadline.
-while True:
-    done, status = os.waitpid(pid, os.WNOHANG)
-    if done:
-        break
-    if time.time() >= deadline:
-        give_up()
-    time.sleep(0.1)
-sys.stdout.write(seen.decode(errors="replace"))
-sys.exit(os.waitstatus_to_exitcode(status))
-EOF
+PTY="$ROOT/scripts/pty-answer.py"
 setup "create the signing identity (scripts/codesign-local.sh)" env PTY_PASSWORD=signing-pw \
-    SIGNING_KEYCHAIN="$SIGNING_KC" python3 -I "$WORK/pty.py" sh "$ROOT/scripts/codesign-local.sh" \
+    SIGNING_KEYCHAIN="$SIGNING_KC" python3 -I "$PTY" sh "$ROOT/scripts/codesign-local.sh" \
     "$SPICEIO_BIN" "$WORK/bindir/spiceio"
 # codesign-local.sh locks it when done; the variants below sign directly.
 setup "unlock the signing keychain" security unlock-keychain -p signing-pw "$SIGNING_KC"
@@ -143,47 +91,7 @@ SIGNING_HASH=$(security find-identity -p codesigning "$SIGNING_KC" | awk '/Match
     security find-identity -p codesigning "$SIGNING_KC" >&2
     exit 1
 }
-# listed KC CMD...: run CMD with keychain KC on the user's search list, as
-# codesign-local.sh does while it signs (codesign finds a --keychain identity
-# only through the list in some sessions, such as the CI runner's). The list
-# is re-read before taking KC off again, so other changes survive.
-listed() {
-    local kc=$1 rc=0 k
-    shift
-    local list=()
-    while IFS= read -r k; do
-        k=${k#*\"}
-        k=${k%\"*}
-        [[ -n "$k" ]] && list+=("$k")
-    done < <(security list-keychains -d user)
-    security list-keychains -d user -s "${list[@]}" "$kc"
-    "$@" || rc=$?
-    unlist "$kc"
-    return $rc
-}
-# unlist KC: take KC off the user's search list, in either spelling
-# (`security list-keychains` prints /private/var/… for /var/…).
-unlist() {
-    local kc=$1 real k
-    real=$(cd "$(dirname "$kc")" 2>/dev/null && pwd -P)/$(basename "$kc")
-    local list=()
-    while IFS= read -r k; do
-        k=${k#*\"}
-        k=${k%\"*}
-        [[ -n "$k" && "$k" != "$kc" && "$k" != "$real" ]] && list+=("$k")
-    done < <(security list-keychains -d user)
-    security list-keychains -d user -s "${list[@]}"
-}
-# signing_diagnostics KC: what to look at when signing with KC fails.
-signing_diagnostics() {
-    {
-        echo "macOS $(sw_vers -productVersion), session $(launchctl managername 2>/dev/null)"
-        echo "identities in $1:"
-        security find-identity -p codesigning "$1"
-        echo "valid identities in $1:"
-        security find-identity -v -p codesigning "$1"
-    } >&2
-}
+source "$ROOT/scripts/test-keychain-lib.sh"
 # sign DST [extra -o flags]: a copy of the binary under test, signed with it.
 sign() {
     cp "$SPICEIO_BIN" "$1"
@@ -600,6 +508,13 @@ install_agent
 check "install treats the agent as keychain-backed" [ "$RC" -eq 0 ]
 check "and does not try to migrate an empty password" has "SMB password from keychain item \"ai.spice.spiceio.smb\" (unchanged)"
 
+echo "--- a password that starts with a newline is a password, not an empty value"
+fresh_agent
+plutil -replace EnvironmentVariables.SPICEIO_SMB_PASS -string $'\nleading-newline' "$PLIST"
+install_agent
+check "migrates it" [ -z "$(env_of SPICEIO_SMB_PASS)" ]
+check "to the keychain" [ "$(env_of SPICEIO_SMB_PASS_KEYCHAIN)" = ai.spice.spiceio.smb ]
+
 echo "--- preflight cannot read the loaded agent's plist"
 fresh_agent
 install_agent
@@ -621,7 +536,7 @@ fresh_agent
 install_agent
 check "migrates with the current identity" [ "$RC" -eq 0 ]
 setup "create a second signing identity" env PTY_PASSWORD=rotated-pw \
-    SIGNING_KEYCHAIN="$WORK/rotated-signing.keychain-db" python3 -I "$WORK/pty.py" \
+    SIGNING_KEYCHAIN="$WORK/rotated-signing.keychain-db" python3 -I "$PTY" \
     sh "$ROOT/scripts/codesign-local.sh" "$SPICEIO_BIN" "$WORK/rotated"
 # Deleting the old item would ask for the login password; naming a service
 # that holds nothing is the same state for preflight.

@@ -191,17 +191,14 @@ unsafe extern "C" {
     ) -> OSStatus;
 }
 
-// CommonCrypto ships in libSystem; no framework to link.
-unsafe extern "C" {
-    fn CCRandomGenerateBytes(bytes: *mut c_void, count: usize) -> i32;
-}
-
 /// An owned CoreFoundation object, released on drop.
 struct Cf(CFTypeRef);
 
 impl Cf {
+    /// Wrap a Create/Copy result, or `None` for null. Lazily: a `Cf` built
+    /// around null would `CFRelease(NULL)` on drop, which crashes.
     fn new(ptr: CFTypeRef) -> Option<Self> {
-        (!ptr.is_null()).then_some(Self(ptr))
+        if ptr.is_null() { None } else { Some(Self(ptr)) }
     }
 }
 
@@ -231,6 +228,27 @@ fn cf_data(bytes: &[u8]) -> Result<Cf, Error> {
     // SAFETY: the bytes outlive the call; CF copies them.
     let ptr = unsafe { CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as CFIndex) };
     Cf::new(ptr).ok_or_else(|| Error::Invalid("CFDataCreate failed".into()))
+}
+
+/// A CFArray of CF-type values (retained by the array).
+fn cf_array(values: &[CFTypeRef]) -> Result<Cf, Error> {
+    // SAFETY: `values` holds valid CF objects for the call; the CFType
+    // callbacks retain them for the array's lifetime.
+    let ptr = unsafe {
+        CFArrayCreate(
+            std::ptr::null(),
+            values.as_ptr(),
+            values.len() as CFIndex,
+            &raw const kCFTypeArrayCallBacks,
+        )
+    };
+    Cf::new(ptr).ok_or_else(|| Error::Invalid("CFArrayCreate failed".into()))
+}
+
+/// `path` as a C string, for the calls that take one.
+fn c_path(path: &Path) -> Result<CString, Error> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::Invalid(format!("{} contains NUL", path.display())))
 }
 
 /// A CFDictionary of CF-type keys and values (both retained by the dictionary).
@@ -323,15 +341,18 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// One generic-password item: `service` + `account`, in `keychain` (a
-/// keychain file) or, when that is `None`, the user's keychain search list
-/// (normally just the login keychain).
+/// keychain file) or, when that is `None`, the login keychain. The login
+/// keychain by path, not the user's search list or default keychain: any
+/// process running as the user can put a keychain of its own first in that
+/// list, and an item there would then be read (and, on a store, written)
+/// instead of the real one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     /// `kSecAttrService`.
     pub service: String,
     /// `kSecAttrAccount`.
     pub account: String,
-    /// A keychain file to use instead of the user's search list.
+    /// A keychain file to use instead of the login keychain.
     pub keychain: Option<PathBuf>,
 }
 
@@ -404,8 +425,7 @@ impl Drop for NoPrompts {
 }
 
 fn open_keychain(path: &Path) -> Result<Cf, Error> {
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| Error::Invalid(format!("keychain path {} contains NUL", path.display())))?;
+    let c_path = c_path(path)?;
     let mut keychain: CFTypeRef = std::ptr::null();
     // SAFETY: `c_path` is NUL-terminated and outlives the call; the result is
     // a new reference that `Cf` releases. Opening does not touch the file.
@@ -445,40 +465,35 @@ fn os_error(status: OSStatus) -> Error {
     }
 }
 
-/// The keychain file an item addresses, opened, and the one-element search
-/// list built from it. Both stay alive for as long as a query uses them.
+/// The login keychain's file: `~/Library/Keychains/login.keychain-db`.
+fn login_keychain() -> Result<PathBuf, Error> {
+    std::env::home_dir()
+        .map(|home| home.join("Library/Keychains/login.keychain-db"))
+        .ok_or_else(|| Error::Invalid("no home directory, so no login keychain".into()))
+}
+
+/// The one keychain file an item addresses (see [`Item`]), opened, and the
+/// one-element search list built from it, so every query and write is
+/// confined to it. Both stay alive for as long as a query uses them.
 struct Target {
-    keychain: Option<Cf>,
-    search_list: Option<Cf>,
+    keychain: Cf,
+    search_list: Cf,
 }
 
 impl Target {
     fn new(item: &Item) -> Result<Self, Error> {
-        let Some(path) = &item.keychain else {
-            return Ok(Self {
-                keychain: None,
-                search_list: None,
-            });
+        let path = match &item.keychain {
+            Some(path) => path.clone(),
+            None => login_keychain()?,
         };
-        let keychain = open_keychain(path)?;
+        let keychain = open_keychain(&path)?;
         // A file that does not exist opens fine and only fails later with a
         // vaguer status; ask now so the error names the real problem.
         keychain_locked(keychain.0)?;
-        let values = [keychain.0];
-        // SAFETY: one valid CF object; the array retains it.
-        let list = unsafe {
-            CFArrayCreate(
-                std::ptr::null(),
-                values.as_ptr(),
-                1,
-                &raw const kCFTypeArrayCallBacks,
-            )
-        };
-        let search_list =
-            Cf::new(list).ok_or_else(|| Error::Invalid("CFArrayCreate failed".into()))?;
+        let search_list = cf_array(&[keychain.0])?;
         Ok(Self {
-            keychain: Some(keychain),
-            search_list: Some(search_list),
+            keychain,
+            search_list,
         })
     }
 
@@ -488,19 +503,16 @@ impl Target {
         match status {
             ERR_SEC_ITEM_NOT_FOUND => Error::NotFound,
             ERR_SEC_NO_SUCH_KEYCHAIN => Error::NoSuchKeychain,
-            ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => {
-                let keychain = self.keychain.as_ref().map_or(std::ptr::null(), |k| k.0);
-                Error::Denied {
-                    locked: keychain_locked(keychain).unwrap_or(false),
-                }
-            }
+            ERR_SEC_AUTH_FAILED | ERR_SEC_INTERACTION_NOT_ALLOWED => Error::Denied {
+                locked: keychain_locked(self.keychain.0).unwrap_or(false),
+            },
             other => os_error(other),
         }
     }
 }
 
 /// The attributes that identify `item` in a query: class, service, account,
-/// and the search list when a keychain file is named.
+/// and the one-keychain search list.
 fn identity_pairs(
     item_keys: &(Cf, Cf),
     target: &Target,
@@ -512,12 +524,9 @@ fn identity_pairs(
             (kSecClass, kSecClassGenericPassword),
             (kSecAttrService, item_keys.0.0),
             (kSecAttrAccount, item_keys.1.0),
+            (kSecMatchSearchList, target.search_list.0),
         ]
     };
-    if let Some(list) = &target.search_list {
-        // SAFETY: reading an immutable framework constant.
-        pairs.push((unsafe { kSecMatchSearchList }, list.0));
-    }
     pairs.extend_from_slice(extra);
     pairs
 }
@@ -531,8 +540,8 @@ fn item_keys(item: &Item) -> Result<(Cf, Cf), Error> {
     Ok((cf_string(&item.service)?, cf_string(&item.account)?))
 }
 
-/// Read `item`'s secret. Caller holds a [`NoPrompts`].
-fn read_unlocked(item: &Item, target: &Target, keys: &(Cf, Cf)) -> Result<Vec<u8>, Error> {
+/// Read the secret of the item `keys` names. Caller holds a [`NoPrompts`].
+fn read_unlocked(target: &Target, keys: &(Cf, Cf)) -> Result<Vec<u8>, Error> {
     // SAFETY: reading immutable framework constants.
     let extra = unsafe {
         [
@@ -550,22 +559,7 @@ fn read_unlocked(item: &Item, target: &Target, keys: &(Cf, Cf)) -> Result<Vec<u8
         return Err(target.classify(status));
     }
     let data = Cf::new(result).ok_or_else(|| Error::Invalid("keychain returned no data".into()))?;
-    // SAFETY: `data` is a valid CF object; its type is checked before it is
-    // read as CFData, and the bytes are copied while it is alive.
-    unsafe {
-        if CFGetTypeID(data.0) != CFDataGetTypeID() {
-            return Err(Error::Invalid(format!(
-                "keychain item {} returned something other than data",
-                item.service
-            )));
-        }
-        let len = usize::try_from(CFDataGetLength(data.0)).unwrap_or(0);
-        let ptr = CFDataGetBytePtr(data.0);
-        if len == 0 || ptr.is_null() {
-            return Ok(Vec::new());
-        }
-        Ok(std::slice::from_raw_parts(ptr, len).to_vec())
-    }
+    data_bytes(&data)
 }
 
 /// Read `item`'s secret, without prompting.
@@ -573,7 +567,7 @@ pub fn read(item: &Item) -> Result<Vec<u8>, Error> {
     let _no_prompts = NoPrompts::new();
     let target = Target::new(item)?;
     let keys = item_keys(item)?;
-    read_unlocked(item, &target, &keys)
+    read_unlocked(&target, &keys)
 }
 
 /// Create or update `item` so it holds `secret`, without prompting, and read
@@ -592,7 +586,7 @@ pub fn store(item: &Item, label: &str, secret: &[u8]) -> Result<Stored, Error> {
     let target = Target::new(item)?;
     let keys = item_keys(item)?;
     let data = cf_data(secret)?;
-    let outcome = match read_unlocked(item, &target, &keys) {
+    let outcome = match read_unlocked(&target, &keys) {
         Ok(current) if current == secret => Stored::Unchanged,
         Ok(_) => {
             let query = cf_dict(&identity_pairs(&keys, &target, &[]))?;
@@ -608,20 +602,16 @@ pub fn store(item: &Item, label: &str, secret: &[u8]) -> Result<Stored, Error> {
         Err(Error::NotFound) => {
             let label = cf_string(label)?;
             // SAFETY: reading immutable framework constants.
-            let mut pairs = unsafe {
-                vec![
+            let attributes = cf_dict(&unsafe {
+                [
                     (kSecClass, kSecClassGenericPassword),
                     (kSecAttrService, keys.0.0),
                     (kSecAttrAccount, keys.1.0),
                     (kSecAttrLabel, label.0),
                     (kSecValueData, data.0),
+                    (kSecUseKeychain, target.keychain.0),
                 ]
-            };
-            if let Some(keychain) = &target.keychain {
-                // SAFETY: reading an immutable framework constant.
-                pairs.push((unsafe { kSecUseKeychain }, keychain.0));
-            }
-            let attributes = cf_dict(&pairs)?;
+            })?;
             // SAFETY: valid dictionary; no result requested.
             let status = unsafe { SecItemAdd(attributes.0, std::ptr::null_mut()) };
             if status != 0 {
@@ -631,7 +621,7 @@ pub fn store(item: &Item, label: &str, secret: &[u8]) -> Result<Stored, Error> {
         }
         Err(e) => return Err(e),
     };
-    match read_unlocked(item, &target, &keys) {
+    match read_unlocked(&target, &keys) {
         Ok(back) if back == secret => Ok(outcome),
         Ok(_) => Err(Error::Invalid(
             "the keychain item reads back different from what was stored".into(),
@@ -722,36 +712,23 @@ pub fn own_signature() -> Result<Signature, Error> {
 /// The access list a key's ACL is built from: the given applications, plus
 /// this binary (it signs the key's own certificate right after creating it).
 fn access_for(label: &str, trusted_apps: &[&Path]) -> Result<Cf, Error> {
-    let mut apps: Vec<Cf> = Vec::with_capacity(trusted_apps.len() + 1);
-    let mut this: CFTypeRef = std::ptr::null();
-    // SAFETY: a null path means "this application"; out-parameter.
-    let status = unsafe { SecTrustedApplicationCreateFromPath(std::ptr::null(), &mut this) };
-    if status != 0 {
-        return Err(os_error(status));
-    }
-    apps.push(Cf::new(this).ok_or_else(|| Error::Invalid("no trusted application".into()))?);
-    for path in trusted_apps {
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| Error::Invalid(format!("{} contains NUL", path.display())))?;
+    let paths = trusted_apps
+        .iter()
+        .map(|path| c_path(path).map(Some))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut apps: Vec<Cf> = Vec::with_capacity(paths.len() + 1);
+    // `None` first: a null path is "this application".
+    for path in std::iter::once(None).chain(paths) {
         let mut app: CFTypeRef = std::ptr::null();
-        // SAFETY: NUL-terminated path; out-parameter.
-        let status = unsafe { SecTrustedApplicationCreateFromPath(c_path.as_ptr(), &mut app) };
+        let ptr = path.as_ref().map_or(std::ptr::null(), |p| p.as_ptr());
+        // SAFETY: null or a NUL-terminated path; out-parameter.
+        let status = unsafe { SecTrustedApplicationCreateFromPath(ptr, &mut app) };
         if status != 0 {
             return Err(os_error(status));
         }
         apps.push(Cf::new(app).ok_or_else(|| Error::Invalid("no trusted application".into()))?);
     }
-    let values: Vec<CFTypeRef> = apps.iter().map(|a| a.0).collect();
-    // SAFETY: valid CF objects; the array retains them.
-    let list = Cf::new(unsafe {
-        CFArrayCreate(
-            std::ptr::null(),
-            values.as_ptr(),
-            values.len() as CFIndex,
-            &raw const kCFTypeArrayCallBacks,
-        )
-    })
-    .ok_or_else(|| Error::Invalid("CFArrayCreate failed".into()))?;
+    let list = cf_array(&apps.iter().map(|a| a.0).collect::<Vec<_>>())?;
     let descriptor = cf_string(label)?;
     let mut access: CFTypeRef = std::ptr::null();
     // SAFETY: valid CFString and CFArray; out-parameter.
@@ -854,11 +831,7 @@ pub fn create_signing_identity(
         .ok_or_else(|| cf_error(error, "exporting the public key"))?;
     let public_der = data_bytes(&public_der)?;
 
-    let mut serial = [0u8; 16];
-    // SAFETY: the buffer is writable for its length.
-    if unsafe { CCRandomGenerateBytes(serial.as_mut_ptr().cast(), serial.len()) } != 0 {
-        return Err(Error::Invalid("CCRandomGenerateBytes failed".into()));
-    }
+    let mut serial = crate::crypto::random_bytes::<16>();
     // Positive (high bit clear) and never shortened by leading zeros.
     serial[0] = (serial[0] & 0x7f) | 0x40;
     let now = std::time::SystemTime::now()
@@ -924,7 +897,7 @@ fn data_bytes(data: &Cf) -> Result<Vec<u8>, Error> {
 /// certificate. No parser: Security.framework parses the result
 /// (`SecCertificateCreateWithData`), and codesign checks it.
 mod x509 {
-    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+    pub(super) fn der(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag];
         let len = content.len();
         if len < 0x80 {
@@ -1056,55 +1029,31 @@ mod x509 {
     pub(super) fn certificate(tbs: &[u8], signature: &[u8]) -> Vec<u8> {
         seq(&[tbs.to_vec(), sha256_with_rsa(), bit_string(signature)])
     }
-
-    #[cfg(test)]
-    pub(super) fn length_of(encoded: &[u8]) -> usize {
-        // For tests: the length an encoding claims, to check der() round trips.
-        let first = encoded[1];
-        if first < 0x80 {
-            usize::from(first)
-        } else {
-            encoded[2..2 + usize::from(first & 0x7f)]
-                .iter()
-                .fold(0usize, |acc, &b| (acc << 8) | usize::from(b))
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn encode(tag: u8, content: &[u8]) -> Vec<u8> {
-        der(tag, content)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A throwaway keychain file, deleted on drop. Tests never touch the
     /// login keychain: every item names this file explicitly.
     struct TempKeychain {
-        dir: PathBuf,
         path: PathBuf,
+        // Dropped after `Drop::drop` has deleted the keychain.
+        _dir: crate::test_support::TempDir,
     }
 
     const PASSWORD: &str = "spiceio-test-keychain";
 
     impl TempKeychain {
         fn new() -> Self {
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "spiceio-keychain-test-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("test.keychain-db");
+            let dir = crate::test_support::TempDir::new("keychain");
+            let path = dir.0.join("test.keychain-db");
             security(&["create-keychain", "-p", PASSWORD, path.to_str().unwrap()]);
             // No auto-lock timeout: a slow CI host must not lock it mid-test.
             security(&["set-keychain-settings", path.to_str().unwrap()]);
-            Self { dir, path }
+            Self { path, _dir: dir }
         }
 
         fn item(&self, account: &str) -> Item {
@@ -1121,7 +1070,6 @@ mod tests {
             let _ = Command::new("/usr/bin/security")
                 .args(["delete-keychain", self.path.to_str().unwrap()])
                 .output();
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1200,11 +1148,23 @@ mod tests {
         assert_eq!(read(&item).unwrap(), b"one");
     }
 
+    /// The length a DER encoding claims.
+    fn der_length(encoded: &[u8]) -> usize {
+        let first = encoded[1];
+        if first < 0x80 {
+            usize::from(first)
+        } else {
+            encoded[2..2 + usize::from(first & 0x7f)]
+                .iter()
+                .fold(0usize, |acc, &b| (acc << 8) | usize::from(b))
+        }
+    }
+
     #[test]
     fn der_lengths_round_trip() {
         for len in [0usize, 1, 127, 128, 255, 256, 65_535, 65_536] {
-            let encoded = x509::encode(0x04, &vec![0u8; len]);
-            assert_eq!(x509::length_of(&encoded), len, "length {len}");
+            let encoded = x509::der(0x04, &vec![0u8; len]);
+            assert_eq!(der_length(&encoded), len, "length {len}");
         }
     }
 

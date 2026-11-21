@@ -67,7 +67,7 @@ listed=0
 created=0
 cleanup() {
     [ -z "$staged" ] || rm -f "$staged"
-    [ "$listed" = 0 ] || search_list_remove
+    search_list_remove
     [ "$relock" = 0 ] || security lock-keychain "$kc" 2>/dev/null
     # A keychain this run created but could not finish (an exportable key,
     # say) must not be picked up by the next install as a working one.
@@ -78,41 +78,43 @@ cleanup() {
 # list in some sessions: on a CI runner it answered "no identity found" for
 # a keychain named with --keychain but not on the list, where a login session
 # signs fine. So the signing keychain goes on the list for the signature and
-# comes off again. Each change re-reads the list instead of restoring a
+# comes off again, and only if this run put it there: an entry that was
+# already on the list stays. Removal re-reads the list instead of restoring a
 # snapshot, so an entry someone else adds meanwhile survives. Paths may hold
 # spaces, so the list is carried in "$@", never in a word-split string.
 # `security list-keychains` prints resolved paths (/private/var/… for
 # /var/…), so entries are compared against both spellings of the keychain.
-kc_resolved() { (cd "$(dirname "$kc")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename "$kc")"); }
-is_kc() { [ "$1" = "$kc" ] || [ "$1" = "$(kc_resolved)" ]; }
-search_list_has() {
-    while IFS= read -r line; do
-        line=$(printf '%s' "$line" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
-        is_kc "$line" && return 0
-    done <<EOF
-$(security list-keychains -d user)
-EOF
-    return 1
+kc_real=""
+
+# The user's keychain search list, one path per line, quotes removed.
+search_list() {
+    security list-keychains -d user | while IFS= read -r line; do
+        line=${line#*\"}
+        printf '%s\n' "${line%\"*}"
+    done
 }
+
 search_list_add() {
-    search_list_has && return 0
+    kc_real=$(cd "$(dirname "$kc")" && pwd -P)/$(basename "$kc")
+    list=$(search_list)
+    printf '%s\n' "$list" | grep -Fxq -e "$kc" -e "$kc_real" && return 0
     set --
     while IFS= read -r line; do
-        line=$(printf '%s' "$line" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
         [ -z "$line" ] || set -- "$@" "$line"
     done <<EOF
-$(security list-keychains -d user)
+$list
 EOF
     security list-keychains -d user -s "$@" "$kc" || die "cannot add $kc to the keychain search list"
     listed=1
 }
+
 search_list_remove() {
+    [ "$listed" = 1 ] || return 0
     set --
     while IFS= read -r line; do
-        line=$(printf '%s' "$line" | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
-        [ -z "$line" ] || is_kc "$line" || set -- "$@" "$line"
+        [ -z "$line" ] || [ "$line" = "$kc" ] || [ "$line" = "$kc_real" ] || set -- "$@" "$line"
     done <<EOF
-$(security list-keychains -d user)
+$(search_list)
 EOF
     security list-keychains -d user -s "$@" 2>/dev/null
     listed=0
@@ -187,7 +189,8 @@ make install signs spiceio with a local, self-signed certificate so the keychain
 item holding the SMB password stays readable by every build you install.
 Creating its own keychain for the signing key: $kc
 Choose a password for it (not your login password). install asks for it each
-time it signs, so nothing else running as you can sign with this key.
+time it signs and locks the keychain again afterwards, so the key is usable
+only while install is signing.
 EOF
     dir=$(dirname "$kc")
     [ -d "$dir" ] || (umask 077 && mkdir -p "$dir") || die "cannot create $dir"

@@ -3,8 +3,10 @@
 # password end to end: that an item stored by one signed build is readable by
 # another build signed with the same identity, and by nothing else.
 #
-# Everything happens in throwaway keychain files under a temp directory, none
-# of them on the keychain search list; the login keychain is never touched.
+# Everything happens in throwaway keychain files under a temp directory; the
+# login keychain is never touched. A signing keychain is on the search list
+# only while something signs with it, and the run checks the list is left as
+# it was found.
 # Password prompts are answered through a pseudo-terminal (python3 pty), the
 # way a person at a terminal would. No step can raise a keychain dialog: the
 # script checks lock state with `spiceio --keychain-status` before codesign
@@ -59,63 +61,12 @@ SECRET='p@ss w0rd&<amp>"'
 
 # run_tty PASSWORD CMD...: run CMD on a pseudo-terminal, typing PASSWORD at
 # every password prompt. OUT gets what the terminal showed, RC the status.
-cat >"$WORK/pty.py" <<'EOF'
-import os, pty, select, signal, sys, time
-password = os.environ["PTY_PASSWORD"].encode()
-limit = float(os.environ.get("PTY_DEADLINE", "120"))
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(sys.argv[1], sys.argv[1:])
-seen, pending, deadline = b"", b"", time.time() + limit
-
-
-def give_up():
-    # pty.fork made the child a session leader, so its process group is its
-    # pid: kill the whole group and reap it, instead of waiting on a child
-    # stuck at an unanswered prompt.
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    os.waitpid(pid, 0)
-    sys.stdout.write(seen.decode(errors="replace"))
-    sys.stdout.write("\npty.py: gave up after %gs\n" % limit)
-    sys.exit(124)
-
-
-while True:
-    if time.time() >= deadline:
-        give_up()
-    if not select.select([fd], [], [], 0.5)[0]:
-        continue
-    try:
-        data = os.read(fd, 4096)
-    except OSError:
-        break
-    if not data:
-        break
-    seen += data
-    pending += data
-    if b"assword" in pending and pending.rstrip().endswith(b":"):
-        os.write(fd, password + b"\n")
-        pending = b""
-# The terminal closed; the child may still be running. Wait for it only
-# until the deadline.
-while True:
-    done, status = os.waitpid(pid, os.WNOHANG)
-    if done:
-        break
-    if time.time() >= deadline:
-        give_up()
-    time.sleep(0.1)
-sys.stdout.write(seen.decode(errors="replace"))
-sys.exit(os.waitstatus_to_exitcode(status))
-EOF
+PTY="$ROOT/scripts/pty-answer.py"
 run_tty() {
     local password=$1
     shift
     set +e
-    OUT=$(PTY_PASSWORD="$password" python3 -I "$WORK/pty.py" "$@" 2>&1)
+    OUT=$(PTY_PASSWORD="$password" python3 -I "$PTY" "$@" 2>&1)
     RC=$?
     set -e
 }
@@ -126,47 +77,7 @@ run() {
     RC=$?
     set -e
 }
-# listed KC CMD...: run CMD with keychain KC on the user's search list, as
-# codesign-local.sh does while it signs (codesign finds a --keychain identity
-# only through the list in some sessions, such as the CI runner's). The list
-# is re-read before taking KC off again, so other changes survive.
-listed() {
-    local kc=$1 rc=0 k
-    shift
-    local list=()
-    while IFS= read -r k; do
-        k=${k#*\"}
-        k=${k%\"*}
-        [[ -n "$k" ]] && list+=("$k")
-    done < <(security list-keychains -d user)
-    security list-keychains -d user -s "${list[@]}" "$kc"
-    "$@" || rc=$?
-    unlist "$kc"
-    return $rc
-}
-# unlist KC: take KC off the user's search list, in either spelling
-# (`security list-keychains` prints /private/var/… for /var/…).
-unlist() {
-    local kc=$1 real k
-    real=$(cd "$(dirname "$kc")" 2>/dev/null && pwd -P)/$(basename "$kc")
-    local list=()
-    while IFS= read -r k; do
-        k=${k#*\"}
-        k=${k%\"*}
-        [[ -n "$k" && "$k" != "$kc" && "$k" != "$real" ]] && list+=("$k")
-    done < <(security list-keychains -d user)
-    security list-keychains -d user -s "${list[@]}"
-}
-# signing_diagnostics KC: what to look at when signing with KC fails.
-signing_diagnostics() {
-    {
-        echo "macOS $(sw_vers -productVersion), session $(launchctl managername 2>/dev/null)"
-        echo "identities in $1:"
-        security find-identity -p codesigning "$1"
-        echo "valid identities in $1:"
-        security find-identity -v -p codesigning "$1"
-    } >&2
-}
+source "$ROOT/scripts/test-keychain-lib.sh"
 state() { "$SPICEIO_BIN" --keychain-status "$1"; }
 # cs ARGS...: codesign, quiet on success, its own error on failure (set -e
 # then stops the run with a reason instead of silently).
@@ -245,6 +156,16 @@ check "exits 0" [ "$RC" -eq 0 ]
 check "leaves the search list as it was" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
 check "locked again" [ "$(state "$KC")" = locked ]
 
+echo "--- a signing keychain already on the search list stays there"
+security list-keychains -d user -s $(security list-keychains -d user | tr -d '"') "$KC"
+security unlock-keychain -p "$PW" "$KC"
+run env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/prelisted"
+check "exits 0" [ "$RC" -eq 0 ]
+on_search_list() { security list-keychains -d user | grep -qF "$1"; }
+check "and leaves the entry it found" on_search_list "$KC"
+unlist "$KC"
+check "taken off again by the test" off_search_list "$KC"
+
 echo "--- no signing keychain and no terminal"
 run env SIGNING_KEYCHAIN="$WORK/none.keychain-db" sh "$SIGN" "$SPICEIO_BIN" "$WORK/d"
 check "exits 1" [ "$RC" -eq 1 ]
@@ -272,13 +193,13 @@ check "the existing binary is still untouched" [ "$(cat "$WORK/installed" 2>/dev
 echo "--- the pty driver gives up at its deadline"
 start=$(date +%s)
 set +e
-OUT=$(PTY_PASSWORD=x PTY_DEADLINE=2 perl -e 'alarm 30; exec @ARGV' python3 -I "$WORK/pty.py" sleep 41.25 2>&1)
+OUT=$(PTY_PASSWORD=x PTY_DEADLINE=0.3 perl -e 'alarm 30; exec @ARGV' python3 -I "$PTY" sleep 41.25 2>&1)
 RC=$?
 set -e
 elapsed=$(($(date +%s) - start))
 check "exits 124 (not killed by the outer 30s alarm)" [ "$RC" -eq 124 ]
-check "within a few seconds of its 2s deadline" [ "$elapsed" -lt 10 ]
-check "and says so" has "pty.py: gave up after 2s"
+check "within a few seconds of its 0.3s deadline" [ "$elapsed" -lt 5 ]
+check "and says so" has "pty-answer: gave up after 0.3s"
 check "the child is gone" sh -c '! pgrep -f "sleep 41.25" >/dev/null'
 
 echo "--- CODESIGN=adhoc"

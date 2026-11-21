@@ -277,16 +277,7 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     buf.put_slice(&contexts);
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut buf = [0u8; N];
-    unsafe extern "C" {
-        fn arc4random_buf(buf: *mut u8, nbytes: usize);
-    }
-    unsafe {
-        arc4random_buf(buf.as_mut_ptr(), N);
-    }
-    buf
-}
+use crate::crypto::random_bytes;
 
 #[derive(Debug)]
 #[allow(dead_code)]

@@ -56,10 +56,8 @@ pub struct Destination {
     pub domain: String,
 }
 
-/// The SMB port in `raw`, as both startup and the password commands read it:
-/// surrounding whitespace ignored. Shared so the two can never key the
-/// keychain item on different ports.
-pub fn parse_port(raw: &str) -> Option<u16> {
+/// The SMB port in `raw`, surrounding whitespace ignored.
+fn parse_port(raw: &str) -> Option<u16> {
     raw.trim().parse().ok()
 }
 
@@ -175,22 +173,35 @@ pub fn account(dest: &Destination) -> String {
     s
 }
 
-/// The password settings, read from the environment (or any lookup, for
-/// tests). Empty values count as unset, as they do for every other
-/// `SPICEIO_SMB_*` variable.
+/// One setting's raw value and where it came from (`SPICEIO_SMB_SERVER`,
+/// `--server`, …), so an error names what was actually set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    /// The value as given.
+    pub value: String,
+    /// The variable or flag it came from.
+    pub from: &'static str,
+}
+
+/// The SMB settings that decide where the password comes from and which
+/// keychain item holds it. Startup and the password commands both read them
+/// through here, so they can never disagree about the item. Values are kept
+/// raw and checked when used ([`Settings::destination`]), after any flags
+/// have replaced them: an invalid environment value a flag overrides is not
+/// an error. Empty values (and a blank port) count as unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// `SPICEIO_SMB_SERVER`.
-    pub server: Option<String>,
-    /// `SPICEIO_SMB_PORT`, parsed.
-    pub port: u16,
-    /// `SPICEIO_SMB_USER`.
+    /// `SPICEIO_SMB_SERVER` / `--server`.
+    pub server: Option<Setting>,
+    /// `SPICEIO_SMB_PORT` / `--port`.
+    pub port: Option<Setting>,
+    /// `SPICEIO_SMB_USER` / `--user`.
     pub user: Option<String>,
-    /// `SPICEIO_SMB_DOMAIN`.
+    /// `SPICEIO_SMB_DOMAIN` / `--domain`.
     pub domain: String,
     /// `SPICEIO_SMB_PASS`.
     pub inline: Option<String>,
-    /// `SPICEIO_SMB_PASS_KEYCHAIN`.
+    /// `SPICEIO_SMB_PASS_KEYCHAIN` / `--service`.
     pub service: Option<String>,
     /// `SPICEIO_SMB_PASS_KEYCHAIN_PATH`.
     pub keychain_path: Option<PathBuf>,
@@ -198,30 +209,22 @@ pub struct Settings {
 
 impl Settings {
     /// Read the settings through `get` (`std::env::var` in production).
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let get = |name: &str| get(name).filter(|v| !v.is_empty());
-        let port = match get("SPICEIO_SMB_PORT").filter(|raw| !raw.trim().is_empty()) {
-            None => DEFAULT_PORT,
-            Some(raw) => parse_port(&raw)
-                .ok_or_else(|| format!("SPICEIO_SMB_PORT={raw} is not a valid port"))?,
-        };
-        let server = get("SPICEIO_SMB_SERVER");
-        if let Some(server) = &server {
-            check_server("SPICEIO_SMB_SERVER", server)?;
-        }
-        Ok(Self {
-            server,
-            port,
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let get = |name: &str| get(name).filter(|v| !v.trim().is_empty());
+        let setting = |name: &'static str| get(name).map(|value| Setting { value, from: name });
+        Self {
+            server: setting("SPICEIO_SMB_SERVER"),
+            port: setting("SPICEIO_SMB_PORT"),
             user: get("SPICEIO_SMB_USER"),
             domain: get("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
             inline: get("SPICEIO_SMB_PASS"),
             service: get("SPICEIO_SMB_PASS_KEYCHAIN"),
             keychain_path: get("SPICEIO_SMB_PASS_KEYCHAIN_PATH").map(PathBuf::from),
-        })
+        }
     }
 
     /// Read the settings from the process environment.
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env() -> Self {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
@@ -229,7 +232,7 @@ impl Settings {
     /// `--domain`, `--port` and `--service`, as `--flag value` or
     /// `--flag=value`. `subcommand` (the flag that chose the command) is
     /// skipped; anything else is an error, and a password flag is refused
-    /// with the reason.
+    /// with the reason. Values are checked later, with the rest.
     pub fn with_args<I, S>(mut self, args: I, subcommand: &str) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
@@ -246,8 +249,33 @@ impl Settings {
                 }
                 _ => (arg.clone(), None),
             };
+            let mut value = || {
+                let value = match inline.clone() {
+                    Some(v) => v,
+                    None => args.next().unwrap_or_default(),
+                };
+                if value.is_empty() {
+                    Err(format!("{name} needs a value"))
+                } else {
+                    Ok(value)
+                }
+            };
             match name.as_str() {
-                "--server" | "--user" | "--domain" | "--port" | "--service" => {}
+                "--server" => {
+                    self.server = Some(Setting {
+                        value: value()?,
+                        from: "--server",
+                    });
+                }
+                "--port" => {
+                    self.port = Some(Setting {
+                        value: value()?,
+                        from: "--port",
+                    });
+                }
+                "--user" => self.user = Some(value()?),
+                "--domain" => self.domain = value()?,
+                "--service" => self.service = Some(value()?),
                 "--password" | "--pass" | "--smb-pass" | "-p" => {
                     return Err(format!(
                         "{name}: the password is never taken from the command line, where any \
@@ -262,45 +290,37 @@ impl Settings {
                     ));
                 }
             }
-            let value = match inline {
-                Some(v) => v,
-                None => args.next().ok_or_else(|| format!("{name} needs a value"))?,
-            };
-            if value.is_empty() {
-                return Err(format!("{name} needs a value"));
-            }
-            match name.as_str() {
-                "--server" => {
-                    check_server("--server", &value)?;
-                    self.server = Some(value);
-                }
-                "--user" => self.user = Some(value),
-                "--domain" => self.domain = value,
-                "--port" => {
-                    self.port = parse_port(&value)
-                        .ok_or_else(|| format!("--port {value} is not a valid port"))?;
-                }
-                _ => self.service = Some(value),
-            }
         }
         Ok(self)
     }
 
-    /// The destination, which a keychain lookup needs in full.
+    /// The SMB port: the setting, or 445.
+    pub fn port(&self) -> Result<u16, String> {
+        match &self.port {
+            None => Ok(DEFAULT_PORT),
+            Some(Setting { value, from }) => {
+                parse_port(value).ok_or_else(|| format!("{from}={value} is not a valid port"))
+            }
+        }
+    }
+
+    /// The destination: server (checked to be a host), port, user and domain.
+    /// Startup connects to exactly this, and the keychain item is keyed on it.
     pub fn destination(&self) -> Result<Destination, String> {
-        match (&self.server, &self.user) {
-            (Some(server), Some(user)) => Ok(Destination {
-                server: server.clone(),
-                port: self.port,
-                user: user.clone(),
-                domain: self.domain.clone(),
-            }),
-            _ => Err(
+        let (Some(server), Some(user)) = (&self.server, &self.user) else {
+            return Err(
                 "the SMB server and user are required (--server/--user, or SPICEIO_SMB_SERVER/\
                  SPICEIO_SMB_USER): the keychain item is keyed on them"
                     .into(),
-            ),
-        }
+            );
+        };
+        check_server(server.from, &server.value)?;
+        Ok(Destination {
+            server: server.value.clone(),
+            port: self.port()?,
+            user: user.clone(),
+            domain: self.domain.clone(),
+        })
     }
 
     /// The keychain item for `service` and these settings' destination.
@@ -375,7 +395,7 @@ impl Source {
         match self {
             Self::Env(password) => Ok(password.clone()),
             Self::Keychain { item, shown } => {
-                let bytes = keychain::read(item).map_err(|e| explain(item, shown, &e))?;
+                let bytes = keychain::read(item).map_err(|e| explain(item, shown, &e, false))?;
                 let password = String::from_utf8(bytes).map_err(|_| {
                     format!(
                         "keychain item \"{}\" for {shown} is not UTF-8 text",
@@ -415,8 +435,10 @@ fn delete_command(item: &Item, shown: &str) -> String {
     cmd
 }
 
-/// A keychain failure as a sentence that says what to do.
-fn explain(item: &Item, shown: &str, e: &keychain::Error) -> String {
+/// A keychain failure as a sentence that says what to do. `storing`: the
+/// failure came from `--store-smb-password`, which leaves an unreadable item
+/// alone rather than overwrite it.
+fn explain(item: &Item, shown: &str, e: &keychain::Error, storing: bool) -> String {
     let what = format!("keychain item \"{}\" for {shown}", item.service);
     match e {
         keychain::Error::NotFound => format!(
@@ -443,13 +465,23 @@ fn explain(item: &Item, shown: &str, e: &keychain::Error) -> String {
             let signature = keychain::own_signature()
                 .map(|s| s.requirement)
                 .unwrap_or_else(|_| "unknown".into());
+            let (outcome, remedy) = if storing {
+                (
+                    "exists but this binary cannot read it, so it was left alone",
+                    "To replace it, delete it first",
+                )
+            } else {
+                (
+                    "cannot be read by this binary",
+                    "Install with `make install`, which signs with the same local identity every \
+                     time, or delete it",
+                )
+            };
             format!(
-                "this spiceio binary may not read {what}: its signature ({signature}) is not on \
-                 the item's access list, so a binary with another signature stored it. Install \
-                 with `make install`, which signs with the same local identity every time, or \
-                 delete the item ({}, with your SMB user for <user>, as DOMAIN;user if a domain \
-                 is set; macOS may ask for your login password) and run `spiceio \
-                 --store-smb-password` again",
+                "{what} {outcome}: this binary's signature ({signature}) is not on the item's \
+                 access list, so a binary with another signature stored it. {remedy} ({}, with \
+                 your SMB user for <user>, as DOMAIN;user if a domain is set; macOS may ask for \
+                 your login password) and run `spiceio --store-smb-password` again",
                 delete_command(item, shown)
             )
         }
@@ -463,7 +495,7 @@ fn explain(item: &Item, shown: &str, e: &keychain::Error) -> String {
 
 /// The settings for a subcommand: the environment, then `args` over it.
 fn settings_for(args: &[String], subcommand: &str) -> Result<Settings, String> {
-    Settings::from_env()?.with_args(args.iter().skip(1), subcommand)
+    Settings::from_env().with_args(args.iter().skip(1), subcommand)
 }
 
 /// `spiceio --check-smb-password [flags]`: resolve the password the way
@@ -534,18 +566,7 @@ fn store(args: &[String]) -> Result<(), String> {
     let label = format!("spiceio SMB password ({})", item.account);
     let result = keychain::store(&item, &label, &password);
     wipe(&mut password);
-    let stored = result.map_err(|e| match e {
-        keychain::Error::Denied { locked: false } => format!(
-            "keychain item \"{service}\" for {place} exists but this binary cannot read it, so \
-             it was left alone: its signature ({sig}) is not on the item's access list. To \
-             replace it, delete it first ({cmd}, with your SMB user for <user>; macOS may ask for \
-             your login password), then run this again",
-            service = item.service,
-            sig = signature.requirement,
-            cmd = delete_command(&item, &place),
-        ),
-        other => explain(&item, &place, &other),
-    })?;
+    let stored = result.map_err(|e| explain(&item, &place, &e, true))?;
     println!(
         "SMB password for {place}: {stored} in keychain item \"{}\" ({})",
         item.service,
@@ -659,7 +680,7 @@ mod tests {
         }
     }
 
-    fn settings(vars: &[(&str, &str)]) -> Result<Settings, String> {
+    fn settings(vars: &[(&str, &str)]) -> Settings {
         let map: HashMap<String, String> = vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -704,14 +725,14 @@ mod tests {
             ("SPICEIO_SMB_USER", "alice"),
             ("SPICEIO_SMB_PASS_KEYCHAIN", DEFAULT_SERVICE),
         ];
-        let a = Source::resolve(&settings(&base).unwrap()).unwrap();
-        let b = Source::resolve(&settings(&moved).unwrap()).unwrap();
+        let a = Source::resolve(&settings(&base)).unwrap();
+        let b = Source::resolve(&settings(&moved)).unwrap();
         assert_ne!(a, b);
     }
 
     #[test]
     fn inline_password_is_the_env_source() {
-        let s = settings(&[("SPICEIO_SMB_PASS", "secret")]).unwrap();
+        let s = settings(&[("SPICEIO_SMB_PASS", "secret")]);
         assert_eq!(Source::resolve(&s), Ok(Source::Env("secret".into())));
         assert_eq!(
             Source::resolve(&s).unwrap().describe(),
@@ -726,8 +747,7 @@ mod tests {
             ("SPICEIO_SMB_USER", "u"),
             ("SPICEIO_SMB_PASS_KEYCHAIN", "svc"),
             ("SPICEIO_SMB_PASS_KEYCHAIN_PATH", "/tmp/k.keychain-db"),
-        ])
-        .unwrap();
+        ]);
         let source = Source::resolve(&s).unwrap();
         assert_eq!(
             source,
@@ -754,11 +774,9 @@ mod tests {
             ("SPICEIO_SMB_USER", "u"),
             ("SPICEIO_SMB_PASS", "p"),
             ("SPICEIO_SMB_PASS_KEYCHAIN", "svc"),
-        ])
-        .unwrap();
+        ]);
         assert!(Source::resolve(&both).unwrap_err().contains("not both"));
-        let neither =
-            settings(&[("SPICEIO_SMB_SERVER", "nas"), ("SPICEIO_SMB_USER", "u")]).unwrap();
+        let neither = settings(&[("SPICEIO_SMB_SERVER", "nas"), ("SPICEIO_SMB_USER", "u")]);
         assert!(
             Source::resolve(&neither)
                 .unwrap_err()
@@ -774,14 +792,13 @@ mod tests {
             ("SPICEIO_SMB_SERVER", "nas"),
             ("SPICEIO_SMB_USER", "u"),
             ("SPICEIO_SMB_PORT", ""),
-        ])
-        .unwrap();
+        ]);
         assert!(matches!(Source::resolve(&s), Ok(Source::Keychain { .. })));
     }
 
     #[test]
     fn keychain_needs_server_and_user_and_an_absolute_path() {
-        let s = settings(&[("SPICEIO_SMB_PASS_KEYCHAIN", "svc")]).unwrap();
+        let s = settings(&[("SPICEIO_SMB_PASS_KEYCHAIN", "svc")]);
         assert!(
             Source::resolve(&s)
                 .unwrap_err()
@@ -792,8 +809,7 @@ mod tests {
             ("SPICEIO_SMB_USER", "u"),
             ("SPICEIO_SMB_PASS_KEYCHAIN", "svc"),
             ("SPICEIO_SMB_PASS_KEYCHAIN_PATH", "~/k.keychain-db"),
-        ])
-        .unwrap();
+        ]);
         assert!(
             Source::resolve(&s)
                 .unwrap_err()
@@ -826,10 +842,15 @@ mod tests {
         );
         assert!(check_server("--server", "nas.local/share").is_err());
         assert!(check_server("--server", "nas local").is_err());
-        assert!(settings(&[("SPICEIO_SMB_SERVER", "smb://nas")]).is_err());
+        let with_user = |server: &str| {
+            settings(&[("SPICEIO_SMB_SERVER", server), ("SPICEIO_SMB_USER", "u")]).destination()
+        };
+        assert!(with_user("smb://nas").is_err());
         assert!(
             Settings::default()
-                .with_args(args(&["--server", "smb://nas"]), "-")
+                .with_args(args(&["--server", "smb://nas", "--user", "u"]), "-")
+                .unwrap()
+                .destination()
                 .is_err()
         );
     }
@@ -855,19 +876,33 @@ mod tests {
     fn port_parsing_is_shared_and_ignores_whitespace() {
         assert_eq!(parse_port(" 4455 "), Some(4455));
         assert_eq!(parse_port("smb"), None);
+        assert_eq!(settings(&[("SPICEIO_SMB_PORT", " 4455 ")]).port(), Ok(4455));
         assert_eq!(
-            settings(&[("SPICEIO_SMB_PORT", " 4455 ")]).unwrap().port,
-            4455
-        );
-        assert_eq!(
-            settings(&[("SPICEIO_SMB_PORT", "   ")]).unwrap().port,
-            DEFAULT_PORT
+            settings(&[("SPICEIO_SMB_PORT", "   ")]).port(),
+            Ok(DEFAULT_PORT)
         );
     }
 
     #[test]
     fn bad_port_is_an_error() {
-        assert!(settings(&[("SPICEIO_SMB_PORT", "smb")]).is_err());
+        assert_eq!(
+            settings(&[("SPICEIO_SMB_PORT", "smb")]).port(),
+            Err("SPICEIO_SMB_PORT=smb is not a valid port".into())
+        );
+    }
+
+    /// Flags are applied before anything is checked, so a flag can replace an
+    /// environment value that would not pass.
+    #[test]
+    fn a_flag_overrides_an_invalid_environment_value() {
+        let s = settings(&[
+            ("SPICEIO_SMB_SERVER", "smb://nas"),
+            ("SPICEIO_SMB_PORT", "smb"),
+            ("SPICEIO_SMB_USER", "u"),
+        ])
+        .with_args(args(&["--server", "nas", "--port", "4455"]), "-")
+        .unwrap();
+        assert_eq!(account(&s.destination().unwrap()), "smb://u@nas:4455");
     }
 
     #[test]
@@ -905,8 +940,7 @@ mod tests {
             ("SPICEIO_SMB_SERVER", "env-nas"),
             ("SPICEIO_SMB_USER", "env-user"),
             ("SPICEIO_SMB_PORT", "4455"),
-        ])
-        .unwrap();
+        ]);
         let s = env
             .with_args(
                 args(&[
@@ -921,12 +955,16 @@ mod tests {
                 "--store-smb-password",
             )
             .unwrap();
-        assert_eq!(s.server.as_deref(), Some("flag-nas"));
+        assert_eq!(
+            s.server.as_ref().map(|v| v.value.as_str()),
+            Some("flag-nas")
+        );
         assert_eq!(s.user.as_deref(), Some("flag-user"));
         assert_eq!(s.domain, "CORP");
         assert_eq!(s.service.as_deref(), Some("svc"));
         assert_eq!(
-            s.port, 4455,
+            s.port(),
+            Ok(4455),
             "an unflagged setting keeps its environment value"
         );
         assert_eq!(
@@ -983,8 +1021,10 @@ mod tests {
         assert!(
             Settings::default()
                 .with_args(args(&["--port", "smb"]), "-")
+                .unwrap()
+                .port()
                 .unwrap_err()
-                .contains("not a valid port")
+                .contains("--port=smb is not a valid port")
         );
         assert!(
             Settings::default()

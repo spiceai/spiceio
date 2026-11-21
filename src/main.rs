@@ -127,26 +127,11 @@ fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// with the reason. A keychain that is locked or will not let this binary
 /// read the item is a configuration error, like a missing variable: it never
 /// fixes itself, so retrying it behind a 503 would only hide it.
-fn load_smb_password(server: &str, port: u16, user: &str, domain: &str) -> String {
-    let nonempty = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
-    let settings = smb_password::Settings {
-        server: Some(server.to_string()),
-        port,
-        user: Some(user.to_string()),
-        domain: domain.to_string(),
-        inline: nonempty("SPICEIO_SMB_PASS"),
-        service: nonempty("SPICEIO_SMB_PASS_KEYCHAIN"),
-        keychain_path: nonempty("SPICEIO_SMB_PASS_KEYCHAIN_PATH").map(Into::into),
-    };
-    let source = match smb_password::Source::resolve(&settings) {
-        Ok(source) => source,
-        Err(e) => {
-            serr!("[spiceio] SMB password: {e}");
-            flush_and_exit(1);
-        }
-    };
-    match source.load() {
-        Ok(password) => {
+fn load_smb_password(settings: &smb_password::Settings) -> String {
+    let loaded = smb_password::Source::resolve(settings)
+        .and_then(|source| source.load().map(|password| (source, password)));
+    match loaded {
+        Ok((source, password)) => {
             slog!("[spiceio] SMB password: {}", source.describe());
             password
         }
@@ -159,25 +144,18 @@ fn load_smb_password(server: &str, port: u16, user: &str, domain: &str) -> Strin
 
 impl Config {
     fn from_env() -> Self {
-        let smb_server = require_env("SPICEIO_SMB_SERVER");
-        if let Err(e) = smb_password::check_server("SPICEIO_SMB_SERVER", &smb_server) {
+        require_env("SPICEIO_SMB_SERVER");
+        require_env("SPICEIO_SMB_USER");
+        // The same parser `--check-smb-password` and `--store-smb-password`
+        // use, so startup connects to (and looks up the keychain item for)
+        // exactly the destination they check. A port that does not parse is
+        // an error here as there, not a silent fallback to 445.
+        let settings = smb_password::Settings::from_env();
+        let dest = settings.destination().unwrap_or_else(|e| {
             serr!("[spiceio] {e}");
             flush_and_exit(1);
-        }
-        // The password commands parse the port with the same function, so a
-        // keychain item they stored is found under the same account here.
-        let smb_port = match env::var("SPICEIO_SMB_PORT") {
-            Ok(raw) if !raw.trim().is_empty() => {
-                smb_password::parse_port(&raw).unwrap_or_else(|| {
-                    serr!("[spiceio] SPICEIO_SMB_PORT={raw} is not valid; using default");
-                    smb_password::DEFAULT_PORT
-                })
-            }
-            _ => smb_password::DEFAULT_PORT,
-        };
-        let smb_username = require_env("SPICEIO_SMB_USER");
-        let smb_domain = env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default();
-        let smb_password = load_smb_password(&smb_server, smb_port, &smb_username, &smb_domain);
+        });
+        let smb_password = load_smb_password(&settings);
         Self {
             bind_addr: match env::var("SPICEIO_BIND") {
                 Err(_) => DEFAULT_BIND,
@@ -192,11 +170,11 @@ impl Config {
                     }
                 },
             },
-            smb_server,
-            smb_port,
-            smb_username,
+            smb_server: dest.server,
+            smb_port: dest.port,
+            smb_username: dest.user,
             smb_password,
-            smb_domain,
+            smb_domain: dest.domain,
             smb_share: require_env("SPICEIO_SMB_SHARE"),
             bucket_name: env::var("SPICEIO_BUCKET").unwrap_or_else(|_| {
                 env::var("SPICEIO_SMB_SHARE").unwrap_or_else(|_| "data".into())
@@ -481,7 +459,9 @@ fn sweep_interval(stats: &spill::SweepStats) -> Duration {
 
 #[tokio::main]
 async fn main() {
-    if env::args().any(|a| a == "--version" || a == "-V") {
+    let args: Vec<String> = env::args().collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if has("--version") || has("-V") {
         println!("spiceio {}", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -491,7 +471,7 @@ async fn main() {
     // else (no SMB, no listener, no log file). `make install` runs it with
     // the agent's settings before restarting the agent, so a credentials file
     // the server would refuse stops the install instead of the agent.
-    if env::args().any(|a| a == "--check-auth") {
+    if has("--check-auth") {
         match s3::auth::Authenticator::from_env() {
             Ok(auth) => println!("S3 auth: {}", auth_summary(&auth)),
             Err(e) => {
@@ -507,16 +487,14 @@ async fn main() {
     // came from, and exit. Like `--check-auth`, it touches nothing else.
     // `make install` runs it with the agent's settings, so a binary that
     // cannot read the keychain item stops the install instead of the agent.
-    if env::args().any(|a| a == "--check-smb-password") {
-        let args: Vec<String> = env::args().collect();
+    if has("--check-smb-password") {
         std::process::exit(smb_password::check_command(&args));
     }
     // `--store-smb-password [--server H] [--user U] [--domain D] [--port P]
     // [--service S]`: put the SMB password for that server and user into the
     // keychain (read from the terminal or stdin, never from argv). Flags left
     // out fall back to their SPICEIO_SMB_* variables.
-    if env::args().any(|a| a == "--store-smb-password") {
-        let args: Vec<String> = env::args().collect();
+    if has("--store-smb-password") {
         std::process::exit(smb_password::store_command(&args));
     }
     // Hidden: `--create-signing-identity <keychain> <common name>` makes the
@@ -525,7 +503,6 @@ async fn main() {
     // self-signed certificate is built and signed here, so the private key
     // is never written anywhere. /usr/bin/codesign may use the key.
     {
-        let args: Vec<String> = env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--create-signing-identity") {
             let (Some(keychain), Some(name)) = (args.get(i + 1), args.get(i + 2)) else {
                 eprintln!("--create-signing-identity needs a keychain path and a common name");
@@ -550,7 +527,6 @@ async fn main() {
     // without prompting. `make install` asks before signing, because
     // codesign would raise an unlock dialog for a locked keychain.
     {
-        let args: Vec<String> = env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--keychain-status") {
             let Some(path) = args.get(i + 1) else {
                 eprintln!("--keychain-status needs a keychain path");
@@ -585,7 +561,6 @@ async fn main() {
     // Hidden: `--crash-test <panic|segv|abort>` deliberately crashes through
     // the real pipeline so the reporting path itself is testable end-to-end.
     {
-        let args: Vec<String> = env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--crash-test") {
             let mode = args.get(i + 1).map(String::as_str).unwrap_or("panic");
             crash::crash_test(mode);

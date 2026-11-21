@@ -83,6 +83,10 @@ fn read_until(child: &mut std::process::Child, marker: &str, timeout: Duration) 
             }
         });
     }
+    // Only the readers hold a sender now, so the channel disconnects (and
+    // both loops end) as soon as both pipes close: a child that dies early is
+    // reported at once, not after `timeout`.
+    drop(tx);
     let mut seen = Vec::new();
     while let Ok(line) = rx.recv_timeout(timeout) {
         let done = line.contains(marker);
@@ -97,6 +101,25 @@ fn read_until(child: &mut std::process::Child, marker: &str, timeout: Duration) 
         seen.push(line);
     }
     seen.join("\n")
+}
+
+/// `spiceio --store-smb-password` with `vars`, SECRET on stdin; must succeed.
+fn store_password(kc: &TempKeychain, vars: &[(&str, &str)]) {
+    let mut store = spiceio(Some(&kc.path), vars)
+        .arg("--store-smb-password")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    store
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(SECRET.as_bytes())
+        .unwrap();
+    let out = store.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
 }
 
 fn text(out: &Output) -> String {
@@ -164,21 +187,7 @@ fn a_padded_port_finds_the_same_item_at_startup() {
         ("SPICEIO_SMB_PASS_KEYCHAIN", "ai.spice.spiceio.smb"),
         ("SPICEIO_SMB_PORT", " 4455 "),
     ];
-    let mut store = spiceio(Some(&kc.path), &vars)
-        .arg("--store-smb-password")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    store
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(SECRET.as_bytes())
-        .unwrap();
-    let out = store.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", text(&out));
+    store_password(&kc, &vars);
 
     let mut child = spiceio(Some(&kc.path), &vars)
         .stdout(Stdio::piped())
@@ -191,6 +200,24 @@ fn a_padded_port_finds_the_same_item_at_startup() {
             "SMB password: keychain item \"ai.spice.spiceio.smb\" for smb://****@127.0.0.1:4455"
         ),
         "{log}"
+    );
+}
+
+/// A port that does not parse stops startup, as it stops the password
+/// commands, instead of quietly falling back to 445 and a different item.
+#[test]
+fn an_invalid_port_stops_startup() {
+    let out = spiceio(
+        None,
+        &[("SPICEIO_SMB_PASS", "x"), ("SPICEIO_SMB_PORT", "smb")],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        text(&out).contains("SPICEIO_SMB_PORT=smb is not a valid port"),
+        "{}",
+        text(&out)
     );
 }
 
@@ -212,21 +239,7 @@ fn stored_password_is_used_and_never_logged() {
 
     // The test build is ad-hoc signed; storing with this same binary makes
     // its cdhash the item's access list, so this binary can read it back.
-    let mut store = spiceio(Some(&kc.path), &service)
-        .arg("--store-smb-password")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    store
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(SECRET.as_bytes())
-        .unwrap();
-    let out = store.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", text(&out));
+    store_password(&kc, &service);
 
     let mut child = spiceio(Some(&kc.path), &service)
         .stdout(Stdio::piped())
