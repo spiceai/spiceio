@@ -494,12 +494,16 @@ async fn main() {
     // `make install` runs it with the agent's settings, so a binary that
     // cannot read the keychain item stops the install instead of the agent.
     if env::args().any(|a| a == "--check-smb-password") {
-        std::process::exit(smb_password::check_command());
+        let args: Vec<String> = env::args().collect();
+        std::process::exit(smb_password::check_command(&args));
     }
-    // `--store-smb-password`: put the SMB password for the configured server
-    // and user into the keychain (read from the terminal or stdin).
+    // `--store-smb-password [--server H] [--user U] [--domain D] [--port P]
+    // [--service S]`: put the SMB password for that server and user into the
+    // keychain (read from the terminal or stdin, never from argv). Flags left
+    // out fall back to their SPICEIO_SMB_* variables.
     if env::args().any(|a| a == "--store-smb-password") {
-        std::process::exit(smb_password::store_command());
+        let args: Vec<String> = env::args().collect();
+        std::process::exit(smb_password::store_command(&args));
     }
     // Hidden: `--keychain-status <path>` prints `locked` or `unlocked`
     // without prompting. `make install` asks before signing, because

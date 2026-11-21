@@ -88,7 +88,7 @@ fn missing_keychain_item_stops_startup_with_the_reason() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(
         text(&out).contains(
-            "SMB password: no keychain item \"ai.spice.spiceio.smb\" for smb://startup@127.0.0.1:9"
+            "SMB password: no keychain item \"ai.spice.spiceio.smb\" for smb://****@127.0.0.1:9"
         ),
         "{}",
         text(&out)
@@ -184,12 +184,16 @@ fn stored_password_is_used_and_never_logged() {
     assert!(found, "startup never reached the SMB connect:\n{log}");
     assert!(
         log.contains(
-            "SMB password: keychain item \"ai.spice.spiceio.smb\" for smb://startup@127.0.0.1:9"
+            "SMB password: keychain item \"ai.spice.spiceio.smb\" for smb://****@127.0.0.1:9"
         ),
         "{log}"
     );
     assert!(
         !log.contains(SECRET),
         "the password reached the log:\n{log}"
+    );
+    assert!(
+        !log.contains("startup@"),
+        "the SMB user reached the log:\n{log}"
     );
 }

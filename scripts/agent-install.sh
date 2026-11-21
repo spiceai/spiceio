@@ -316,8 +316,8 @@ wire_smb_pass() {
     printf '%s\n' "$stored" | sed 's/^/  /'
     echo "note: copies of the plist made before now (Time Machine, other backups, a dotfiles repo)"
     echo "      still hold the SMB password. If any could have been read, change it on the NAS,"
-    echo "      then store the new one with: $BINDIR/spiceio --store-smb-password"
-    echo "      (with the agent's SPICEIO_SMB_SERVER, SPICEIO_SMB_USER and SPICEIO_SMB_PASS_KEYCHAIN set)"
+    echo "      then store the new one: $BINDIR/spiceio --store-smb-password --server <server> --user <user>"
+    echo "      (plus --domain/--port/--service if the agent sets them)"
 }
 
 # `--preflight BIN`: can BIN read the agent's SMB password?

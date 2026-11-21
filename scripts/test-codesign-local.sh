@@ -97,6 +97,16 @@ run() {
     set -e
 }
 state() { "$SPICEIO_BIN" --keychain-status "$1"; }
+# cs ARGS...: codesign, quiet on success, its own error on failure (set -e
+# then stops the run with a reason instead of silently).
+cs() {
+    local out
+    if ! out=$(codesign "$@" 2>&1); then
+        echo "setup failed: codesign $*:" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+}
 requirement() { codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p'; }
 cdhash() { codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
 mode_of() { stat -f '%Lp' "$1"; }
@@ -120,6 +130,11 @@ RC=$?
 set -e
 check "the private key cannot be exported" [ "$RC" -ne 0 ]
 HASH=$(security find-identity -p codesigning "$KC" | awk '/Matching identities/ {m=1} m && /spiceio local code signing/ {print $2; exit}')
+[[ -n "$HASH" ]] || {
+    echo "setup failed: no signing identity in $KC:" >&2
+    security find-identity -p codesigning "$KC" >&2
+    exit 1
+}
 security lock-keychain "$KC"
 REQ_A=$(requirement "$WORK/a")
 
@@ -185,7 +200,8 @@ stdin_run() { # INPUT CMD...: CMD with INPUT on stdin
 echo "--- the signed build stores the password"
 stdin_run "$SECRET" smb "$WORK/a" --store-smb-password
 check "exits 0" [ "$RC" -eq 0 ]
-check "says added, keyed on server and user" has "SMB password for smb://svc-spiceio@nas.example: added in keychain item \"ai.spice.spiceio.smb\""
+check "says added, for the server" has "SMB password for smb://****@nas.example: added in keychain item \"ai.spice.spiceio.smb\""
+check "never prints the SMB user" lacks "svc-spiceio"
 check "names the requirement that may read it" has "readable by: $REQ_A"
 check "no ad-hoc warning" lacks "ad-hoc"
 check "never prints the password" lacks "$SECRET"
@@ -200,21 +216,23 @@ cp "$WORK/a" "$WORK/rebuilt"
 # A rebuild changes the cdhash; so does a different CodeDirectory flag, which
 # is how this stands in for one without recompiling. The keychain checks the
 # designated requirement, which names the identity, not the cdhash.
-codesign -f -s "$HASH" --keychain "$KC" -i ai.spice.spiceio -o runtime,kill --timestamp=none "$WORK/rebuilt" 2>/dev/null
+cs -f -s "$HASH" --keychain "$KC" -i ai.spice.spiceio -o runtime,kill --timestamp=none "$WORK/rebuilt"
 security lock-keychain "$KC"
 check "its cdhash differs" [ "$(cdhash "$WORK/rebuilt")" != "$(cdhash "$WORK/a")" ]
 check "its requirement is the same" [ "$(requirement "$WORK/rebuilt")" = "$REQ_A" ]
 run smb "$WORK/rebuilt" --check-smb-password
 check "exits 0" [ "$RC" -eq 0 ]
-check "and says where the password came from" has "SMB password: keychain item \"ai.spice.spiceio.smb\" for smb://svc-spiceio@nas.example (keychain $ITEMS)"
+check "and says where the password came from" has "SMB password: keychain item \"ai.spice.spiceio.smb\" for smb://****@nas.example (keychain $ITEMS)"
+check "without the SMB user" lacks "svc-spiceio"
 
 echo "--- an ad-hoc build is refused, and cannot clobber it"
 cp "$WORK/a" "$WORK/unsigned"
-codesign -f -s - -i ai.spice.spiceio "$WORK/unsigned" 2>/dev/null
+cs -f -s - -i ai.spice.spiceio "$WORK/unsigned"
 run smb "$WORK/unsigned" --check-smb-password
 check "exits 1" [ "$RC" -eq 1 ]
 check "says its signature is not on the access list" has "is not on the item's access list"
-check "names the command that deletes the item" has "security delete-generic-password -s 'ai.spice.spiceio.smb' -a 'smb://svc-spiceio@nas.example' '$ITEMS'"
+check "names the command that deletes the item" has "security delete-generic-password -s 'ai.spice.spiceio.smb' -a 'smb://<user>@nas.example' '$ITEMS'"
+check "with a placeholder, not the SMB user" lacks "svc-spiceio"
 stdin_run "attacker-chosen" smb "$WORK/unsigned" --store-smb-password
 check "store from it exits 1" [ "$RC" -eq 1 ]
 check "warns that it is ad-hoc" has "warning: this spiceio binary is ad-hoc signed"
@@ -236,14 +254,14 @@ run env -i PATH=/usr/bin:/bin HOME="$WORK" SPICEIO_SMB_SERVER=attacker.example S
     SPICEIO_SMB_PASS_KEYCHAIN=ai.spice.spiceio.smb SPICEIO_SMB_PASS_KEYCHAIN_PATH="$ITEMS" \
     "$WORK/a" --check-smb-password
 check "a changed server finds no item" [ "$RC" -eq 1 ]
-check "and says so" has "no keychain item \"ai.spice.spiceio.smb\" for smb://svc-spiceio@attacker.example"
+check "and says so" has "no keychain item \"ai.spice.spiceio.smb\" for smb://****@attacker.example"
 
 echo "--- interactive store"
 run_tty "$SECRET" env -i PATH=/usr/bin:/bin HOME="$WORK" SPICEIO_SMB_SERVER=nas.example SPICEIO_SMB_USER=svc-spiceio \
     SPICEIO_SMB_PASS_KEYCHAIN=ai.spice.spiceio.smb SPICEIO_SMB_PASS_KEYCHAIN_PATH="$ITEMS" \
     "$WORK/a" --store-smb-password
 check "exits 0" [ "$RC" -eq 0 ]
-check "asks for the password for that account" has "SMB password for smb://svc-spiceio@nas.example:"
+check "asks for the password for that server" has "SMB password for smb://****@nas.example:"
 check "asks twice" has "Retype the password:"
 check "does not echo it" lacks "$SECRET"
 check "same password: unchanged" has ": unchanged in keychain item"
@@ -253,6 +271,22 @@ run_tty "a-new-password" env -i PATH=/usr/bin:/bin HOME="$WORK" SPICEIO_SMB_SERV
 check "a changed password from the terminal: updated" has ": updated in keychain item"
 stdin_run "$SECRET" smb "$WORK/a" --store-smb-password
 check "and back again from stdin: updated" has ": updated in keychain item"
+
+echo "--- flags instead of the environment"
+flags() { env -i PATH=/usr/bin:/bin HOME="$WORK" SPICEIO_SMB_PASS_KEYCHAIN_PATH="$ITEMS" "$@"; }
+stdin_run "$SECRET" flags "$WORK/a" --store-smb-password --server nas.example --user svc-spiceio --service ai.spice.spiceio.smb
+check "--server/--user/--service find the same item" has ": unchanged in keychain item"
+run flags "$WORK/a" --check-smb-password --server=nas.example --user=svc-spiceio --service=ai.spice.spiceio.smb
+check "--check-smb-password takes them too" [ "$RC" -eq 0 ]
+run smb "$WORK/a" --check-smb-password --server attacker.example
+check "a flag overrides its variable" has "for smb://****@attacker.example"
+stdin_run "x" flags "$WORK/a" --store-smb-password --server nas.example --user svc-spiceio --password "$SECRET"
+check "--password: exits 1" [ "$RC" -eq 1 ]
+check "and says why" has "never taken from the command line"
+check "without echoing it" lacks "$SECRET"
+run flags "$WORK/a" --check-smb-password --sever nas.example
+check "an unknown flag: exits 1" [ "$RC" -eq 1 ]
+check "and names it" has "unknown argument \"--sever\""
 
 echo "--- refusals"
 stdin_run "x" smb SPICEIO_SMB_PASS=inline "$WORK/a" --store-smb-password

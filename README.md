@@ -326,11 +326,17 @@ keychain, which is encrypted at rest and readable only by binaries whose code
 signature the item's access list names:
 
 ```bash
-export SPICEIO_SMB_SERVER=nas.example SPICEIO_SMB_USER=svc-spiceio
-spiceio --store-smb-password        # asks twice, without echo (or reads stdin)
-export SPICEIO_SMB_PASS_KEYCHAIN=ai.spice.spiceio.smb
-spiceio --check-smb-password        # SMB password: keychain item "ai.spice.spiceio.smb" for smb://svc-spiceio@nas.example (the login keychain)
+spiceio --store-smb-password --server nas.example --user svc-spiceio
+#   asks twice, without echo (or reads stdin); --domain, --port and --service too
+spiceio --check-smb-password --server nas.example --user svc-spiceio --service ai.spice.spiceio.smb
+#   SMB password: keychain item "ai.spice.spiceio.smb" for smb://****@nas.example (the login keychain)
 ```
+
+Each flag falls back to its variable (`SPICEIO_SMB_SERVER`, `SPICEIO_SMB_USER`,
+`SPICEIO_SMB_DOMAIN`, `SPICEIO_SMB_PORT`, `SPICEIO_SMB_PASS_KEYCHAIN`), which is
+how spiceio itself finds the item at startup. The password is never a flag:
+other processes can read a command line from the process list. Output shows
+the destination as `smb://****@server`, never the SMB user, like the startup log.
 
 `make install` does this for the launchd agent by default (see above).
 
@@ -380,10 +386,9 @@ someone who has your login password.
 
 ### Rotation, backup and recovery
 
-- **New SMB password.** Change it on the NAS, then store it:
-  `spiceio --store-smb-password` with the agent's `SPICEIO_SMB_SERVER`,
-  `SPICEIO_SMB_USER` (and `SPICEIO_SMB_DOMAIN`/`SPICEIO_SMB_PORT` if set), run
-  from the installed (signed) binary. Then restart the agent:
+- **New SMB password.** Change it on the NAS, then store it with the installed
+  (signed) binary: `~/.local/bin/spiceio --store-smb-password --server <server>
+  --user <user>` (plus `--domain`/`--port` if the agent sets them). Then restart the agent:
   `launchctl kickstart -k gui/$(id -u)/ai.spice.spiceio`.
 - **After moving a password out of a plist.** Backups and copies of the plist
   made before the move (Time Machine, a dotfiles repo) still hold the old

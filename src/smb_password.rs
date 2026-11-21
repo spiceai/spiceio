@@ -21,8 +21,14 @@
 //!
 //! `spiceio --store-smb-password` creates or updates the item (reading the
 //! password from the terminal without echo, or from standard input), and
-//! `spiceio --check-smb-password` resolves it exactly as startup would.
-//! Neither ever prints the password.
+//! `spiceio --check-smb-password` resolves it exactly as startup would. Both
+//! take `--server`, `--user`, `--domain`, `--port` and `--service` on the
+//! command line, each falling back to its environment variable. The password
+//! is never taken from the command line: any process can read another's
+//! arguments from the process list.
+//!
+//! Nothing here prints the password, or the SMB user name: output shows the
+//! destination as `smb://****@server[:port]`, as the startup log always has.
 
 use std::ffi::{CString, c_char};
 use std::io::{IsTerminal, Read};
@@ -48,6 +54,25 @@ pub struct Destination {
     pub user: String,
     /// `SPICEIO_SMB_DOMAIN` (may be empty).
     pub domain: String,
+}
+
+/// `dest` for output: `smb://****@server[:port]`. The user name is masked, as
+/// in the startup log's `connecting to smb://****@…` line; logs can travel
+/// further than the terminal that typed the name.
+pub fn shown(dest: &Destination) -> String {
+    let mut s = String::from("smb://****@");
+    if dest.server.contains(':') && !dest.server.starts_with('[') {
+        s.push('[');
+        s.push_str(&dest.server);
+        s.push(']');
+    } else {
+        s.push_str(&dest.server);
+    }
+    if dest.port != DEFAULT_PORT {
+        s.push(':');
+        s.push_str(&dest.port.to_string());
+    }
+    s
 }
 
 /// The keychain account a password for `dest` is stored under:
@@ -123,6 +148,66 @@ impl Settings {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
+    /// Apply command-line flags over these settings: `--server`, `--user`,
+    /// `--domain`, `--port` and `--service`, as `--flag value` or
+    /// `--flag=value`. `subcommand` (the flag that chose the command) is
+    /// skipped; anything else is an error, and a password flag is refused
+    /// with the reason.
+    pub fn with_args<I, S>(mut self, args: I, subcommand: &str) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut args = args.into_iter().map(|a| a.as_ref().to_string());
+        while let Some(arg) = args.next() {
+            if arg == subcommand {
+                continue;
+            }
+            let (name, inline) = match arg.split_once('=') {
+                Some((name, value)) if name.starts_with("--") => {
+                    (name.to_string(), Some(value.to_string()))
+                }
+                _ => (arg.clone(), None),
+            };
+            match name.as_str() {
+                "--server" | "--user" | "--domain" | "--port" | "--service" => {}
+                "--password" | "--pass" | "--smb-pass" | "-p" => {
+                    return Err(format!(
+                        "{name}: the password is never taken from the command line, where any \
+                         process can read it from the process list. Leave it out and type it \
+                         when asked, or pipe it in on standard input"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown argument {arg:?} (expected --server, --user, --domain, --port \
+                         or --service)"
+                    ));
+                }
+            }
+            let value = match inline {
+                Some(v) => v,
+                None => args.next().ok_or_else(|| format!("{name} needs a value"))?,
+            };
+            if value.is_empty() {
+                return Err(format!("{name} needs a value"));
+            }
+            match name.as_str() {
+                "--server" => self.server = Some(value),
+                "--user" => self.user = Some(value),
+                "--domain" => self.domain = value,
+                "--port" => {
+                    self.port = value
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("--port {value} is not a valid port"))?;
+                }
+                _ => self.service = Some(value),
+            }
+        }
+        Ok(self)
+    }
+
     /// The destination, which a keychain lookup needs in full.
     pub fn destination(&self) -> Result<Destination, String> {
         match (&self.server, &self.user) {
@@ -133,8 +218,8 @@ impl Settings {
                 domain: self.domain.clone(),
             }),
             _ => Err(
-                "SPICEIO_SMB_SERVER and SPICEIO_SMB_USER are required: the keychain item is \
-                 keyed on them"
+                "the SMB server and user are required (--server/--user, or SPICEIO_SMB_SERVER/\
+                 SPICEIO_SMB_USER): the keychain item is keyed on them"
                     .into(),
             ),
         }
@@ -164,8 +249,14 @@ impl Settings {
 pub enum Source {
     /// `SPICEIO_SMB_PASS`.
     Env(String),
-    /// A keychain item.
-    Keychain(Item),
+    /// A keychain item, and its destination as output may show it
+    /// ([`shown`]).
+    Keychain {
+        /// The item.
+        item: Item,
+        /// `smb://****@server[:port]`.
+        shown: String,
+    },
 }
 
 impl Source {
@@ -176,7 +267,10 @@ impl Source {
                 Err("set one of SPICEIO_SMB_PASS and SPICEIO_SMB_PASS_KEYCHAIN, not both".into())
             }
             (Some(password), None) => Ok(Self::Env(password.clone())),
-            (None, Some(service)) => Ok(Self::Keychain(settings.item(service)?)),
+            (None, Some(service)) => Ok(Self::Keychain {
+                item: settings.item(service)?,
+                shown: shown(&settings.destination()?),
+            }),
             (None, None) => Err(
                 "SPICEIO_SMB_PASS or SPICEIO_SMB_PASS_KEYCHAIN is required (the password, or \
                  the keychain service it is stored under)"
@@ -189,10 +283,9 @@ impl Source {
     pub fn describe(&self) -> String {
         match self {
             Self::Env(_) => "SPICEIO_SMB_PASS (environment)".into(),
-            Self::Keychain(item) => format!(
-                "keychain item \"{}\" for {} ({})",
+            Self::Keychain { item, shown } => format!(
+                "keychain item \"{}\" for {shown} ({})",
                 item.service,
-                item.account,
                 item.location()
             ),
         }
@@ -203,18 +296,18 @@ impl Source {
     pub fn load(&self) -> Result<String, String> {
         match self {
             Self::Env(password) => Ok(password.clone()),
-            Self::Keychain(item) => {
-                let bytes = keychain::read(item).map_err(|e| explain(item, &e))?;
+            Self::Keychain { item, shown } => {
+                let bytes = keychain::read(item).map_err(|e| explain(item, shown, &e))?;
                 let password = String::from_utf8(bytes).map_err(|_| {
                     format!(
-                        "keychain item \"{}\" for {} is not UTF-8 text",
-                        item.service, item.account
+                        "keychain item \"{}\" for {shown} is not UTF-8 text",
+                        item.service
                     )
                 })?;
                 if password.is_empty() {
                     return Err(format!(
-                        "keychain item \"{}\" for {} is empty",
-                        item.service, item.account
+                        "keychain item \"{}\" for {shown} is empty",
+                        item.service
                     ));
                 }
                 Ok(password)
@@ -228,12 +321,14 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The `security delete-generic-password` command that removes `item`.
-fn delete_command(item: &Item) -> String {
+/// The `security delete-generic-password` command that removes `item`, with
+/// `<user>` standing in for the SMB user (output never shows it).
+fn delete_command(item: &Item, shown: &str) -> String {
+    let account = shown.replacen("****", "<user>", 1);
     let mut cmd = format!(
         "security delete-generic-password -s {} -a {}",
         sh_quote(&item.service),
-        sh_quote(&item.account)
+        sh_quote(&account)
     );
     if let Some(path) = &item.keychain {
         cmd.push(' ');
@@ -243,13 +338,12 @@ fn delete_command(item: &Item) -> String {
 }
 
 /// A keychain failure as a sentence that says what to do.
-fn explain(item: &Item, e: &keychain::Error) -> String {
-    let what = format!("keychain item \"{}\" for {}", item.service, item.account);
+fn explain(item: &Item, shown: &str, e: &keychain::Error) -> String {
+    let what = format!("keychain item \"{}\" for {shown}", item.service);
     match e {
         keychain::Error::NotFound => format!(
-            "no {what} in {}. Store the password with `spiceio --store-smb-password`, run with \
-             the same SPICEIO_SMB_* settings: the item is keyed on the server, user, domain and \
-             port",
+            "no {what} in {}. Store the password with `spiceio --store-smb-password` and the \
+             same server, user, domain and port: the item is keyed on them",
             item.location()
         ),
         keychain::Error::Denied { locked: true } => {
@@ -275,9 +369,10 @@ fn explain(item: &Item, e: &keychain::Error) -> String {
                 "this spiceio binary may not read {what}: its signature ({signature}) is not on \
                  the item's access list, so a binary with another signature stored it. Install \
                  with `make install`, which signs with the same local identity every time, or \
-                 delete the item ({}; macOS may ask for your login password) and run \
-                 `spiceio --store-smb-password` again",
-                delete_command(item)
+                 delete the item ({}, with your SMB user for <user>, as DOMAIN;user if a domain \
+                 is set; macOS may ask for your login password) and run `spiceio \
+                 --store-smb-password` again",
+                delete_command(item, shown)
             )
         }
         keychain::Error::NoSuchKeychain => format!(
@@ -288,11 +383,17 @@ fn explain(item: &Item, e: &keychain::Error) -> String {
     }
 }
 
-/// `spiceio --check-smb-password`: resolve the password the way startup
-/// does, report where it came from, exit 0; or say why it cannot, exit 1.
-/// Touches nothing else (no SMB, no listener, no log file).
-pub fn check_command() -> i32 {
-    let source = match Settings::from_env().and_then(|s| Source::resolve(&s)) {
+/// The settings for a subcommand: the environment, then `args` over it.
+fn settings_for(args: &[String], subcommand: &str) -> Result<Settings, String> {
+    Settings::from_env()?.with_args(args.iter().skip(1), subcommand)
+}
+
+/// `spiceio --check-smb-password [flags]`: resolve the password the way
+/// startup does, report where it came from, exit 0; or say why it cannot,
+/// exit 1. Touches nothing else (no SMB, no listener, no log file).
+pub fn check_command(args: &[String]) -> i32 {
+    let source = match settings_for(args, "--check-smb-password").and_then(|s| Source::resolve(&s))
+    {
         Ok(source) => source,
         Err(e) => {
             eprintln!("SMB password: {e}");
@@ -311,7 +412,7 @@ pub fn check_command() -> i32 {
     }
 }
 
-/// `spiceio --store-smb-password`: store the SMB password for the
+/// `spiceio --store-smb-password [flags]`: store the SMB password for the
 /// configured server and user in the keychain, then read it back.
 ///
 /// The password comes from the terminal (asked twice, without echo) or, when
@@ -320,8 +421,8 @@ pub fn check_command() -> i32 {
 /// taken from `SPICEIO_SMB_PASS`: a password in the environment is what this
 /// replaces, and taking it from there would invite putting it on a command
 /// line.
-pub fn store_command() -> i32 {
-    match store() {
+pub fn store_command(args: &[String]) -> i32 {
+    match store(args) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("spiceio --store-smb-password: {e}");
@@ -330,8 +431,8 @@ pub fn store_command() -> i32 {
     }
 }
 
-fn store() -> Result<(), String> {
-    let settings = Settings::from_env()?;
+fn store(args: &[String]) -> Result<(), String> {
+    let settings = settings_for(args, "--store-smb-password")?;
     if settings.inline.is_some() {
         return Err(
             "SPICEIO_SMB_PASS is set. This command reads the password from the terminal or \
@@ -341,6 +442,7 @@ fn store() -> Result<(), String> {
     }
     let service = settings.service.as_deref().unwrap_or(DEFAULT_SERVICE);
     let item = settings.item(service)?;
+    let place = shown(&settings.destination()?);
     let signature = keychain::own_signature().map_err(|e| format!("code signature: {e}"))?;
     if signature.adhoc {
         eprintln!(
@@ -350,26 +452,24 @@ fn store() -> Result<(), String> {
             signature.requirement
         );
     }
-    let mut password = read_password(&item.account)?;
+    let mut password = read_password(&place)?;
     let label = format!("spiceio SMB password ({})", item.account);
     let result = keychain::store(&item, &label, &password);
     wipe(&mut password);
     let stored = result.map_err(|e| match e {
         keychain::Error::Denied { locked: false } => format!(
-            "keychain item \"{service}\" for {account} exists but this binary cannot read it, \
-             so it was left alone: its signature ({sig}) is not on the item's access list. To \
-             replace it, delete it first ({cmd}; macOS may ask for your login password), then run \
-             this again",
+            "keychain item \"{service}\" for {place} exists but this binary cannot read it, so \
+             it was left alone: its signature ({sig}) is not on the item's access list. To \
+             replace it, delete it first ({cmd}, with your SMB user for <user>; macOS may ask for \
+             your login password), then run this again",
             service = item.service,
-            account = item.account,
             sig = signature.requirement,
-            cmd = delete_command(&item),
+            cmd = delete_command(&item, &place),
         ),
-        other => explain(&item, &other),
+        other => explain(&item, &place, &other),
     })?;
     println!(
-        "SMB password for {}: {stored} in keychain item \"{}\" ({})",
-        item.account,
+        "SMB password for {place}: {stored} in keychain item \"{}\" ({})",
         item.service,
         item.location()
     );
@@ -392,9 +492,9 @@ fn wipe(buf: &mut [u8]) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-fn read_password(account: &str) -> Result<Vec<u8>, String> {
+fn read_password(place: &str) -> Result<Vec<u8>, String> {
     let password = if std::io::stdin().is_terminal() {
-        let mut first = prompt(&format!("SMB password for {account}: "))?;
+        let mut first = prompt(&format!("SMB password for {place}: "))?;
         let mut second = prompt("Retype the password: ")?;
         let same = first == second;
         wipe(&mut second);
@@ -553,15 +653,19 @@ mod tests {
         let source = Source::resolve(&s).unwrap();
         assert_eq!(
             source,
-            Source::Keychain(Item {
-                service: "svc".into(),
-                account: "smb://u@nas".into(),
-                keychain: Some("/tmp/k.keychain-db".into()),
-            })
+            Source::Keychain {
+                item: Item {
+                    service: "svc".into(),
+                    account: "smb://u@nas".into(),
+                    keychain: Some("/tmp/k.keychain-db".into()),
+                },
+                shown: "smb://****@nas".into(),
+            }
         );
+        // The user name never appears in output.
         assert_eq!(
             source.describe(),
-            "keychain item \"svc\" for smb://u@nas (keychain /tmp/k.keychain-db)"
+            "keychain item \"svc\" for smb://****@nas (keychain /tmp/k.keychain-db)"
         );
     }
 
@@ -594,7 +698,7 @@ mod tests {
             ("SPICEIO_SMB_PORT", ""),
         ])
         .unwrap();
-        assert!(matches!(Source::resolve(&s), Ok(Source::Keychain(_))));
+        assert!(matches!(Source::resolve(&s), Ok(Source::Keychain { .. })));
     }
 
     #[test]
@@ -625,15 +729,132 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_quote_for_the_shell() {
+    fn shown_masks_the_user_and_domain() {
+        assert_eq!(
+            shown(&dest("nas.local", 445, "alice", "CORP")),
+            "smb://****@nas.local"
+        );
+        assert_eq!(
+            shown(&dest("fe80::1", 4455, "alice", "")),
+            "smb://****@[fe80::1]:4455"
+        );
+    }
+
+    #[test]
+    fn suggestions_quote_for_the_shell_and_leave_out_the_user() {
         let item = Item {
-            service: "svc".into(),
-            account: "smb://CORP;o'neil@nas".into(),
+            service: "it's".into(),
+            account: "smb://CORP;alice@nas".into(),
             keychain: None,
         };
         assert_eq!(
-            delete_command(&item),
-            r"security delete-generic-password -s 'svc' -a 'smb://CORP;o'\''neil@nas'"
+            delete_command(&item, "smb://****@nas"),
+            r"security delete-generic-password -s 'it'\''s' -a 'smb://<user>@nas'"
+        );
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_override_the_environment() {
+        let env = settings(&[
+            ("SPICEIO_SMB_SERVER", "env-nas"),
+            ("SPICEIO_SMB_USER", "env-user"),
+            ("SPICEIO_SMB_PORT", "4455"),
+        ])
+        .unwrap();
+        let s = env
+            .with_args(
+                args(&[
+                    "--store-smb-password",
+                    "--server",
+                    "flag-nas",
+                    "--user=flag-user",
+                    "--domain",
+                    "CORP",
+                    "--service=svc",
+                ]),
+                "--store-smb-password",
+            )
+            .unwrap();
+        assert_eq!(s.server.as_deref(), Some("flag-nas"));
+        assert_eq!(s.user.as_deref(), Some("flag-user"));
+        assert_eq!(s.domain, "CORP");
+        assert_eq!(s.service.as_deref(), Some("svc"));
+        assert_eq!(
+            s.port, 4455,
+            "an unflagged setting keeps its environment value"
+        );
+        assert_eq!(
+            account(&s.destination().unwrap()),
+            "smb://CORP;flag-user@flag-nas:4455"
+        );
+    }
+
+    #[test]
+    fn flags_alone_are_enough() {
+        let s = Settings::default()
+            .with_args(
+                args(&["--server", "nas", "--user", "u", "--port", "445"]),
+                "-",
+            )
+            .unwrap();
+        assert_eq!(account(&s.destination().unwrap()), "smb://u@nas");
+    }
+
+    #[test]
+    fn password_flags_are_refused() {
+        for flag in ["--password", "--pass", "--smb-pass", "-p"] {
+            let err = Settings::default()
+                .with_args(args(&[flag, "hunter2"]), "-")
+                .unwrap_err();
+            assert!(
+                err.contains("never taken from the command line"),
+                "{flag}: {err}"
+            );
+        }
+        let err = Settings::default()
+            .with_args(args(&["--password=hunter2"]), "-")
+            .unwrap_err();
+        assert!(
+            !err.contains("hunter2"),
+            "the refusal must not echo it: {err}"
+        );
+    }
+
+    #[test]
+    fn bad_flags_are_errors() {
+        assert!(
+            Settings::default()
+                .with_args(args(&["--server"]), "-")
+                .unwrap_err()
+                .contains("needs a value")
+        );
+        assert!(
+            Settings::default()
+                .with_args(args(&["--server="]), "-")
+                .unwrap_err()
+                .contains("needs a value")
+        );
+        assert!(
+            Settings::default()
+                .with_args(args(&["--port", "smb"]), "-")
+                .unwrap_err()
+                .contains("not a valid port")
+        );
+        assert!(
+            Settings::default()
+                .with_args(args(&["--serverr", "x"]), "-")
+                .unwrap_err()
+                .contains("unknown argument")
+        );
+        assert!(
+            Settings::default()
+                .with_args(args(&["nas"]), "-")
+                .unwrap_err()
+                .contains("unknown argument")
         );
     }
 }

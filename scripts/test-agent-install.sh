@@ -59,30 +59,47 @@ install -m 0755 "$ROOT/scripts/sccache-spiceio" "$WORK/adhocbin/sccache-spiceio"
 # that identity rather than one build. Made here with a known password; the
 # interactive path is test-codesign-local.sh's job.
 SIGNING_KC="$WORK/signing.keychain-db"
-security create-keychain -p signing-pw "$SIGNING_KC"
-security set-keychain-settings "$SIGNING_KC"
+# setup WHAT CMD...: run a setup step, quiet on success; on failure say which
+# step and show its output, then stop (set -e) with that reason.
+setup() {
+    local what=$1 out
+    shift
+    if ! out=$("$@" 2>&1); then
+        echo "setup failed: $what ($*):" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+}
+setup "create the signing keychain" security create-keychain -p signing-pw "$SIGNING_KC"
+setup "configure the signing keychain" security set-keychain-settings "$SIGNING_KC"
 printf '[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ext\n[dn]\nCN=spiceio local code signing\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' >"$WORK/req.cnf"
-/usr/bin/openssl req -x509 -newkey rsa:2048 -days 2 -nodes -config "$WORK/req.cnf" \
-    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" 2>/dev/null
-/usr/bin/openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" -out "$WORK/id.p12" -passout pass:x
-security import "$WORK/id.p12" -k "$SIGNING_KC" -P x -x -T /usr/bin/codesign >/dev/null
-security set-key-partition-list -S apple-tool:,apple: -s -k signing-pw "$SIGNING_KC" >/dev/null
+setup "create the certificate" /usr/bin/openssl req -x509 -newkey rsa:2048 -days 2 -nodes -config "$WORK/req.cnf" \
+    -keyout "$WORK/key.pem" -out "$WORK/cert.pem"
+setup "package the identity" /usr/bin/openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
+    -out "$WORK/id.p12" -passout pass:x
+setup "import the identity" security import "$WORK/id.p12" -k "$SIGNING_KC" -P x -x -T /usr/bin/codesign
+setup "let codesign use the key" security set-key-partition-list -S apple-tool:,apple: -s -k signing-pw "$SIGNING_KC"
 rm -f "$WORK/key.pem" "$WORK/id.p12"
 SIGNING_HASH=$(security find-identity -p codesigning "$SIGNING_KC" | awk '/Matching identities/ {m=1} m && /spiceio local/ {print $2; exit}')
+[[ -n "$SIGNING_HASH" ]] || {
+    echo "setup failed: no signing identity in $SIGNING_KC:" >&2
+    security find-identity -p codesigning "$SIGNING_KC" >&2
+    exit 1
+}
 # sign DST [extra -o flags]: a copy of the binary under test, signed with it.
 sign() {
     cp "$SPICEIO_BIN" "$1"
-    codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" -i ai.spice.spiceio -o "runtime${2:+,$2}" \
-        --timestamp=none "$1" 2>/dev/null
+    setup "sign $1" codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" -i ai.spice.spiceio \
+        -o "runtime${2:+,$2}" --timestamp=none "$1"
 }
 sign "$WORK/bindir/spiceio"
 cp "$SPICEIO_BIN" "$WORK/adhocbin/spiceio"
-codesign -f -s - -i ai.spice.spiceio "$WORK/adhocbin/spiceio" 2>/dev/null
+setup "ad-hoc sign" codesign -f -s - -i ai.spice.spiceio "$WORK/adhocbin/spiceio"
 
 # Where every test agent keeps its SMB password.
 ITEMS="$WORK/items.keychain-db"
-security create-keychain -p items-pw "$ITEMS"
-security set-keychain-settings "$ITEMS"
+setup "create the item keychain" security create-keychain -p items-pw "$ITEMS"
+setup "configure the item keychain" security set-keychain-settings "$ITEMS"
 
 # ── stubs ────────────────────────────────────────────────────────────────
 # launchctl: one job whose state lives in $LD_STATE. `bootstrap` snapshots
@@ -280,6 +297,7 @@ check "the reloaded job no longer holds it" loaded_job_lacks_password
 check "says it moved it" has "SMB password moved to the keychain"
 check "warns that older copies of the plist still hold it" has "still hold the SMB password"
 check "never prints the SMB password" lacks "$SMB_PASS"
+check "nor the SMB user" lacks "svc$CASES"
 check "keeps the plist's mode" [ "$(mode_of "$PLIST")" = 600 ]
 check "leaves no temp file beside the plist" [ "$(find "$(dirname "$PLIST")" -name '.*' -type f | wc -l | tr -d ' ')" = 0 ]
 check "reloads rather than kickstarts (kickstart keeps the old env)" [ "$(calls)" = "bootout bootstrap" ]
