@@ -95,6 +95,14 @@ where
     for attempt in 1..=max_attempts {
         match op().await {
             Ok(v) => return Ok(v),
+            // Never retried: the same credentials get the same answer, and
+            // each attempt is one more failed logon toward an account lockout.
+            Err(e) if super::client::credentials_rejected(&e).is_some() => {
+                crate::serr!(
+                    "[spiceio] {label} attempt {attempt}: {e}; not retrying (each attempt is another failed logon)"
+                );
+                return Err(e);
+            }
             Err(e) => {
                 if attempt < max_attempts {
                     let delay = backoff[attempt - 1];
@@ -211,6 +219,10 @@ pub struct SmbPool {
     /// round trip per copy. Pool-wide: every connection talks to the same
     /// server, so one answer applies to all of them.
     copychunk_ok: AtomicBool,
+    /// Set the first time the server refuses the credentials on a reconnect
+    /// (a password changed on the NAS while spiceio runs). From then on `heal`
+    /// makes no attempt at all: every one would be another failed logon.
+    credentials_rejected: OnceLock<super::client::CredentialsRejected>,
     /// Serializes connection healing so a burst of concurrent retries triggers
     /// one reconnect pass, not N competing ones that pile reconnect load onto an
     /// already-struggling server (a retry storm). The per-slot `is_poisoned`
@@ -381,6 +393,7 @@ impl SmbPool {
             read_inflight: AtomicU32::new(INFLIGHT_MAX),
             reset_since_grow: AtomicBool::new(false),
             copychunk_ok: AtomicBool::new(true),
+            credentials_rejected: OnceLock::new(),
             heal_lock: tokio::sync::Mutex::new(()),
             overload_until_ms: AtomicU64::new(0),
             admission: Arc::new(Semaphore::new(admission_n)),
@@ -646,6 +659,9 @@ impl SmbPool {
         let Some(share) = self.share.get() else {
             return;
         };
+        if self.credentials_rejected.get().is_some() {
+            return;
+        }
         // Coalesce concurrent heals: serialize the reconnect pass so a burst of
         // retrying requests doesn't fan out into competing reconnect storms.
         // Callers that queue behind a heal find the slots it restored already
@@ -702,7 +718,14 @@ impl SmbPool {
                         }
                     },
                     Err(e) => {
-                        if super::client::is_capacity_error(&e) {
+                        if let Some(refused) = super::client::credentials_rejected(&e) {
+                            if self.credentials_rejected.set(refused).is_ok() {
+                                crate::serr!(
+                                    "[spiceio] heal reconnect: {refused}; no further reconnects (each would be another failed logon). Fix the SMB credentials and restart spiceio"
+                                );
+                            }
+                            break;
+                        } else if super::client::is_capacity_error(&e) {
                             self.shrink_by_one();
                             self.mark_overloaded();
                             crate::slog!(
@@ -809,6 +832,7 @@ impl SmbPool {
             read_inflight: AtomicU32::new(INFLIGHT_MAX),
             reset_since_grow: AtomicBool::new(false),
             copychunk_ok: AtomicBool::new(false),
+            credentials_rejected: OnceLock::new(),
             heal_lock: tokio::sync::Mutex::new(()),
             overload_until_ms: AtomicU64::new(0),
             admission: Arc::new(Semaphore::new(16)),
@@ -963,6 +987,29 @@ mod tests {
         .await;
         assert!(matches!(r, Ok("ok")));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_stops_at_once_when_the_credentials_are_refused() {
+        // One attempt, not backoff.len() + 1: each retry of a refused login is
+        // another failed logon toward the account's lockout threshold.
+        let calls = AtomicU32::new(0);
+        let backoff = &[Duration::from_millis(1); 5];
+        let r: io::Result<u32> = retry_with_backoff("test", backoff, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<u32, _>(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    super::super::client::CredentialsRejected {
+                        status: 0xC000006D,
+                        name: "STATUS_LOGON_FAILURE",
+                    },
+                ))
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(super::super::client::credentials_rejected(&r.unwrap_err()).is_some());
     }
 
     #[tokio::test]

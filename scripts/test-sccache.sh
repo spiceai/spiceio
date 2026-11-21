@@ -423,6 +423,16 @@ verify_nas_durability() {
     fi
 }
 
+# ── One SMB login, as `make install` checks it ─────────────────────────────
+# One attempt, no retry, and the server's signature on the final session
+# setup response must verify: the real server has to pass, or `make install`
+# would refuse to restart an agent pointed at it.
+LOGIN=$(env SPICEIO_SMB_SERVER="$SMB_SERVER" SPICEIO_SMB_PORT="$SMB_PORT" \
+    SPICEIO_SMB_SHARE="$SMB_SHARE" SPICEIO_SMB_USER="$SPICEIO_SMB_USER" \
+    SPICEIO_SMB_PASS="$SPICEIO_SMB_PASS" "$SPICEIO_BIN" --check-smb-login 2>&1 || true)
+echo "[test] $(grep '^SMB ' <<<"$LOGIN" | tail -1)"
+assert_contains "check-smb-login: one signed login to the real server" "SMB login: ok" "$LOGIN"
+
 # ── Start spiceio ───────────────────────────────────────────────────────────
 
 echo "[test] starting spiceio -> smb://${SPICEIO_SMB_USER}@${SMB_SERVER}:${SMB_PORT}/${SMB_SHARE}"

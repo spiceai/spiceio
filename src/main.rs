@@ -470,6 +470,7 @@ async fn main() {
         "-V",
         "--check-auth",
         "--check-smb-password",
+        "--check-smb-login",
         "--store-smb-password",
         "--create-signing-identity",
         "--keychain-status",
@@ -513,6 +514,11 @@ async fn main() {
     // cannot read the keychain item stops the install instead of the agent.
     if has("--check-smb-password") {
         std::process::exit(smb_password::check_command(&args));
+    }
+    // `--check-smb-login [flags] [--share S]`: log in once with that password
+    // and connect to the share; never retried (see `smb_password::login_command`).
+    if has("--check-smb-login") {
+        std::process::exit(smb_password::login_command(&args).await);
     }
     // `--store-smb-password [--server H] [--user U] [--domain D] [--port P]
     // [--service S]`: put the SMB password for that server and user into the
@@ -674,6 +680,11 @@ async fn main() {
     // refused" during a slow NAS connect — they get a 503 SlowDown they can
     // retry instead of a hard TCP error that aborts server startup.
     let ready: Arc<OnceLock<Arc<AppState>>> = Arc::new(OnceLock::new());
+    // Set, with the server's answer, when the SMB server refuses the
+    // credentials. The connect loop then stops for good (each attempt would be
+    // another failed logon toward an account lockout), and requests are told
+    // why instead of "still connecting".
+    let login_refused: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
 
     if let Some(endpoint) = env::var("SPICEIO_OTEL_ENDPOINT")
         .ok()
@@ -728,8 +739,12 @@ async fn main() {
     // Connect SMB in the background with unbounded retry. A flaky or rebooting
     // NAS must not take the HTTP listener down — that is the connection-refused
     // failure mode sccache hits when spiceio exits (or has not yet bound).
+    // Unbounded for failures that can heal, never for refused credentials.
+    // Nor does spiceio exit on those: under launchd's KeepAlive a restart would
+    // only log in, and fail, again.
     {
         let ready = Arc::clone(&ready);
+        let login_refused = Arc::clone(&login_refused);
         let smb_config = SmbConfig {
             server: config.smb_server.clone(),
             port: config.smb_port,
@@ -769,6 +784,20 @@ async fn main() {
                 .await
                 {
                     Ok(state) => break state,
+                    Err(e) if smb::client::credentials_rejected(&e).is_some() => {
+                        serr!(
+                            "[spiceio] SMB login refused ({}:{} / {}): {e}. Not retrying: each attempt \
+                             is another failed logon, and enough of them lock the account. Fix the \
+                             SMB user or password (`spiceio --check-smb-login` tries once) and \
+                             restart spiceio",
+                            smb_server,
+                            smb_port,
+                            smb_share,
+                        );
+                        let _ = login_refused.set(e.to_string());
+                        log::flush(Duration::from_millis(100));
+                        return;
+                    }
                     Err(e) => {
                         slog!(
                             "[spiceio] SMB not ready ({}:{} / {}): {e}; retrying in {}s",
@@ -1070,15 +1099,22 @@ async fn main() {
         shutdown,
         move |req: Request<Incoming>| {
             let ready = Arc::clone(&ready);
+            let login_refused = Arc::clone(&login_refused);
             async move {
                 // `begin` returns None (and costs one atomic load) unless the
                 // access log is on; `finish` then hands the body straight back.
                 let observed = access_log::begin(&req);
                 let response = match ready.get() {
                     Some(state) => s3::router::handle_request(req, state).await,
-                    None => s3::router::service_unavailable(
-                        "spiceio is still connecting to the SMB backend; please retry.",
-                    ),
+                    None => match login_refused.get() {
+                        Some(reason) => s3::router::service_unavailable(&format!(
+                            "spiceio cannot log in to the SMB backend: {reason}. Fix the SMB \
+                             credentials and restart spiceio."
+                        )),
+                        None => s3::router::service_unavailable(
+                            "spiceio is still connecting to the SMB backend; please retry.",
+                        ),
+                    },
                 };
                 let (parts, body) = response.into_parts();
                 let body = access_log::finish(observed, parts.status, body);

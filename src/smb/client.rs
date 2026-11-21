@@ -596,7 +596,20 @@ impl SmbClient {
             }
         }
         // `read_buf` cannot overshoot `capacity`, which we set to `msg_len`.
-        Ok(msg.freeze())
+        let msg = msg.freeze();
+        // Once the session is set up every request is signed, so every
+        // response must be too. A response that is not, or whose signature
+        // does not verify, may come from anything on the network path rather
+        // than the server: drop the connection rather than trust it.
+        if let Some(key) = &self.signing_key
+            && let Err(e) = verify_frame(&msg, key)
+        {
+            crate::serr!("[spiceio] smb {e}; dropping the connection");
+            self.poisoned.store(true, Ordering::Relaxed);
+            let _ = stream.shutdown().await;
+            return Err(e);
+        }
+        Ok(msg)
     }
 
     /// Write all of `buf` to the stream with a timeout. A server that stops
@@ -874,7 +887,7 @@ impl SmbClient {
         // Hash session setup request 2 (this is the final hash for key derivation)
         update_preauth_hash(&mut preauth_hash, &packet[4..]);
 
-        let (resp_hdr, _) = self.send_recv(&packet).await?;
+        let (resp_hdr, resp_raw) = self.send_recv_inner(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             return Err(handshake_error(
                 "session setup",
@@ -882,10 +895,40 @@ impl SmbClient {
                 io::ErrorKind::PermissionDenied,
             ));
         }
+        // A guest or anonymous session proves nothing about who logged in, and
+        // cannot be signed with a key derived from this password. Some servers
+        // give a guest session to a user they do not know (Samba's
+        // `map to guest = bad user`): that is a refused login.
+        let session_flags = resp_raw
+            .get(SMB2_HEADER_SIZE + 2..SMB2_HEADER_SIZE + 4)
+            .map_or(0, |f| u16::from_le_bytes([f[0], f[1]]));
+        for (flag, name) in [
+            (SMB2_SESSION_FLAG_IS_GUEST, "SMB2_SESSION_FLAG_IS_GUEST"),
+            (SMB2_SESSION_FLAG_IS_NULL, "SMB2_SESSION_FLAG_IS_NULL"),
+        ] {
+            if session_flags & flag != 0 {
+                crate::serr!("[spiceio] smb session setup gave a {name} session, not the user's");
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    CredentialsRejected { status: 0, name },
+                ));
+            }
+        }
 
         // Derive the signing key
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
-        crate::slog!("[spiceio] authenticated, signing key derived");
+
+        // MS-SMB2 3.2.5.3.1: on 3.1.1 the final SESSION_SETUP success MUST be
+        // signed, and it is signed with the key just derived. Only a server
+        // that knows the password can derive that key, so this signature is
+        // what proves the server is the server. Without the check, anything
+        // that can answer for its address could accept any password and then
+        // serve whatever it likes.
+        verify_frame(&resp_raw, &signing_key).map_err(|e| {
+            crate::serr!("[spiceio] smb final session setup: {e}");
+            io::Error::new(io::ErrorKind::InvalidData, ServerUnproven(e.to_string()))
+        })?;
+        crate::slog!("[spiceio] authenticated, signing key derived and verified");
 
         self.session_id = resp_hdr.session_id;
         let io_cap = if self.config.max_io_size > 0 {
@@ -2785,13 +2828,96 @@ pub(crate) fn is_capacity_error(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::ResourceBusy
 }
 
+/// The name of an NTSTATUS with which a server refuses the credentials
+/// themselves: the account, its password, or whether it may log in at all.
+/// Retrying never fixes one of these, and each retry of a bad password is one
+/// more failed logon toward the account's lockout threshold (MS-ERREF 2.3.1).
+pub fn credential_rejection(status: u32) -> Option<&'static str> {
+    Some(match status {
+        0xC000006D => "STATUS_LOGON_FAILURE",
+        0xC000006A => "STATUS_WRONG_PASSWORD",
+        0xC0000064 => "STATUS_NO_SUCH_USER",
+        0xC000006E => "STATUS_ACCOUNT_RESTRICTION",
+        0xC000006F => "STATUS_INVALID_LOGON_HOURS",
+        0xC0000070 => "STATUS_INVALID_WORKSTATION",
+        0xC0000071 => "STATUS_PASSWORD_EXPIRED",
+        0xC0000072 => "STATUS_ACCOUNT_DISABLED",
+        0xC000015B => "STATUS_LOGON_TYPE_NOT_GRANTED",
+        0xC0000193 => "STATUS_ACCOUNT_EXPIRED",
+        0xC0000224 => "STATUS_PASSWORD_MUST_CHANGE",
+        0xC0000234 => "STATUS_ACCOUNT_LOCKED_OUT",
+        _ => return None,
+    })
+}
+
+/// The error inside the `io::Error` a session setup returns when the server
+/// refused the credentials ([`credential_rejection`]). The connect retries,
+/// the startup loop and the pool healer all stop on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialsRejected {
+    pub status: u32,
+    pub name: &'static str,
+}
+
+impl std::fmt::Display for CredentialsRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the SMB server rejected the login: {}", self.name)?;
+        if self.status != 0 {
+            write!(f, " (0x{:08X})", self.status)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CredentialsRejected {}
+
+/// The error inside the `io::Error` a session setup returns when the server's
+/// final SESSION_SETUP response is not validly signed: whatever answered has
+/// not shown it holds the session key, which only the real server can derive
+/// from the password. Unlike a refusal, retrying is harmless (no logon
+/// failed), but nothing it says can be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerUnproven(pub String);
+
+impl std::fmt::Display for ServerUnproven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the SMB server did not prove it holds the session key (final session setup: {})",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ServerUnproven {}
+
+/// Whether `e` is a [`ServerUnproven`].
+pub fn server_unproven(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<ServerUnproven>())
+}
+
+/// The credential rejection `e` carries, if it is one.
+pub fn credentials_rejected(e: &io::Error) -> Option<CredentialsRejected> {
+    e.get_ref()?.downcast_ref::<CredentialsRejected>().copied()
+}
+
 /// Build the `io::Error` for a failed SMB handshake step (negotiate, session
 /// setup, tree connect). Server-capacity statuses become retryable
 /// `ResourceBusy` and are logged quietly — they are expected back-pressure, not
-/// bugs, and the pool shrinks / retries on them. `STATUS_ACCESS_DENIED` maps to
-/// `PermissionDenied`; every other status uses `fallback`. Non-capacity errors
-/// are logged at error level. `context` names the step for the log/message.
+/// bugs, and the pool shrinks / retries on them. A refusal of the credentials
+/// is a [`CredentialsRejected`] (kind `PermissionDenied`), which nothing
+/// retries. `STATUS_ACCESS_DENIED` maps to `PermissionDenied`; every other
+/// status uses `fallback`. Non-capacity errors are logged at error level.
+/// `context` names the step for the log/message.
 fn handshake_error(context: &str, status: u32, fallback: io::ErrorKind) -> io::Error {
+    if let Some(name) = credential_rejection(status) {
+        crate::serr!("[spiceio] smb {context} refused the credentials: {name} (0x{status:08X})");
+        return io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            CredentialsRejected { status, name },
+        );
+    }
     if is_server_capacity_status(status) {
         crate::slog!("[spiceio] smb {context} rejected by server capacity: 0x{status:08X}");
         return io::Error::new(
@@ -2809,6 +2935,70 @@ fn handshake_error(context: &str, status: u32, fallback: io::ErrorKind) -> io::E
         fallback
     };
     io::Error::new(kind, format!("{context} failed: status=0x{status:08X}"))
+}
+
+/// STATUS_PENDING: an interim response to a request the server finishes
+/// asynchronously. Servers never sign one (MS-SMB2 3.3.4.1.1).
+const STATUS_PENDING: u32 = 0x0000_0103;
+
+/// Verify the signature of every response in `frame` (one SMB2 message, or a
+/// compounded chain) under the session's signing key: MS-SMB2 3.2.5.1.3, with
+/// the algorithm of 3.1.5.1.
+///
+/// spiceio signs every request, so it requires a valid signature on every
+/// response except the two kinds a server never signs: an interim
+/// STATUS_PENDING, and an unsolicited notification (MessageId all ones). Each
+/// response in a chain is checked on its own bytes, from its header to the
+/// next one's (padding included), the last to the end of the frame. The
+/// signature field is hashed as zeros without copying or changing the frame.
+fn verify_frame(frame: &[u8], key: &[u8; 16]) -> io::Result<()> {
+    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
+    let mut rest = frame;
+    loop {
+        if rest.len() < SMB2_HEADER_SIZE {
+            return Err(invalid("an SMB2 response is shorter than its header"));
+        }
+        let u32_at = |at: usize| u32::from_le_bytes(rest[at..at + 4].try_into().unwrap());
+        let status = u32_at(8);
+        let flags = u32_at(16);
+        let next = u32_at(20) as usize;
+        let message_id = u64::from_le_bytes(rest[24..32].try_into().unwrap());
+        let len = match next {
+            0 => rest.len(),
+            n if n >= SMB2_HEADER_SIZE && n <= rest.len() && n % 8 == 0 => n,
+            _ => {
+                return Err(invalid(
+                    "an SMB2 response chain has an invalid NextCommand offset",
+                ));
+            }
+        };
+        let msg = &rest[..len];
+        if status != STATUS_PENDING && message_id != u64::MAX {
+            if flags & SMB2_FLAGS_SIGNED == 0 {
+                return Err(invalid(
+                    "an SMB2 response is not signed on a signed session",
+                ));
+            }
+            let expected =
+                crate::crypto::aes128_cmac_parts(key, &[&msg[..48], &[0u8; 16], &msg[64..]]);
+            if !ct_eq16(&expected, msg[48..64].try_into().unwrap()) {
+                return Err(invalid("an SMB2 response's signature does not verify"));
+            }
+        }
+        if next == 0 {
+            return Ok(());
+        }
+        rest = &rest[len..];
+    }
+}
+
+/// Compare two signatures in time independent of where they differ.
+fn ct_eq16(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..16 {
+        diff |= a[i] ^ b[i];
+    }
+    std::hint::black_box(diff) == 0
 }
 
 /// Sign a single SMB2 message in-place (no NetBIOS header prefix).
@@ -3020,6 +3210,93 @@ mod tests {
         let e = handshake_error("session setup", 0xC00000CE, io::ErrorKind::PermissionDenied);
         assert_eq!(e.kind(), io::ErrorKind::ResourceBusy);
         assert!(e.to_string().contains("0xC00000CE"), "expected hex in {e}");
+    }
+
+    /// One SMB2 response: header (status, MessageId) and body.
+    fn response(status: u32, message_id: u64, body: &[u8]) -> Vec<u8> {
+        let mut header = Header::new(Command::Read, message_id);
+        header.status = status;
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        buf.extend_from_slice(body);
+        buf.to_vec()
+    }
+
+    const KEY: [u8; 16] = *b"0123456789abcdef";
+
+    #[test]
+    fn verify_frame_accepts_only_validly_signed_responses() {
+        let mut ok = response(0, 7, b"file contents");
+        sign_message(&mut ok, &KEY);
+        assert!(verify_frame(&ok, &KEY).is_ok());
+
+        let err = |frame: &[u8], key: &[u8; 16]| verify_frame(frame, key).unwrap_err().to_string();
+        let mut body = ok.clone();
+        *body.last_mut().unwrap() ^= 1;
+        assert!(err(&body, &KEY).contains("does not verify"));
+        let mut sig = ok.clone();
+        sig[50] ^= 1;
+        assert!(err(&sig, &KEY).contains("does not verify"));
+        assert!(err(&ok, b"fedcba9876543210").contains("does not verify"));
+
+        // Unsigned: refused for anything but the two kinds a server never signs.
+        assert!(err(&response(0, 7, b"x"), &KEY).contains("not signed"));
+        assert!(err(&response(0xC000_0034, 7, b""), &KEY).contains("not signed"));
+        assert!(verify_frame(&response(STATUS_PENDING, 7, b""), &KEY).is_ok());
+        assert!(verify_frame(&response(0, u64::MAX, b"break"), &KEY).is_ok());
+        assert!(err(&response(0, 7, b"")[..40], &KEY).contains("shorter than its header"));
+    }
+
+    #[test]
+    fn verify_frame_checks_each_response_in_a_chain() {
+        // First response padded to 8 bytes; its signature covers the padding.
+        let mut first = response(0, 1, b"abc");
+        first.resize(first.len().next_multiple_of(8), 0);
+        let next = first.len() as u32;
+        first[20..24].copy_from_slice(&next.to_le_bytes());
+        sign_message(&mut first, &KEY);
+        let mut second = response(0, 2, b"defg");
+        sign_message(&mut second, &KEY);
+        let chain = [first.clone(), second.clone()].concat();
+        assert!(verify_frame(&chain, &KEY).is_ok());
+
+        let mut padding = chain.clone();
+        padding[next as usize - 1] ^= 1;
+        assert!(verify_frame(&padding, &KEY).is_err(), "padding is signed");
+        let mut later = chain.clone();
+        *later.last_mut().unwrap() ^= 1;
+        assert!(
+            verify_frame(&later, &KEY).is_err(),
+            "the second response is checked too"
+        );
+
+        let mut misaligned = chain.clone();
+        misaligned[20..24].copy_from_slice(&(next - 1).to_le_bytes());
+        assert!(
+            verify_frame(&misaligned, &KEY)
+                .unwrap_err()
+                .to_string()
+                .contains("NextCommand")
+        );
+    }
+
+    #[test]
+    fn handshake_error_marks_refused_credentials_permanent() {
+        for status in [
+            0xC000006D, 0xC000006A, 0xC0000064, 0xC0000071, 0xC0000072, 0xC0000234,
+        ] {
+            let e = handshake_error("session setup", status, io::ErrorKind::PermissionDenied);
+            let refused = credentials_rejected(&e).expect("a typed credential refusal");
+            assert_eq!(refused.status, status);
+            assert!(e.to_string().contains(refused.name), "{e}");
+            assert!(!is_capacity_error(&e), "a refusal is not back-pressure");
+        }
+        // Server capacity, an ACL denial and a bad parameter are not refusals
+        // of the credentials.
+        for status in [0xC00000CE, 0xC0000022, 0xC000000D] {
+            let e = handshake_error("session setup", status, io::ErrorKind::PermissionDenied);
+            assert_eq!(credentials_rejected(&e), None, "0x{status:08X}");
+        }
     }
 
     #[test]
