@@ -255,9 +255,20 @@ impl Settings {
                      --server, --user, --domain, --port or --service)"
                 ));
             }
+            // `--name=value`, and a short flag with its value glued on
+            // (`-pvalue`, `-p=value`) the way getopt reads one: the flag is
+            // its first two characters.
             let (name, inline) = match arg.split_once('=') {
-                Some((name, value)) => (name.to_string(), Some(value.to_string())),
-                None => (arg, None),
+                Some((name, value)) if name.starts_with("--") => {
+                    (name.to_string(), Some(value.to_string()))
+                }
+                _ if !arg.starts_with("--") && arg.chars().count() > 2 => {
+                    let at = arg.char_indices().nth(2).map_or(arg.len(), |(i, _)| i);
+                    let rest = &arg[at..];
+                    let rest = rest.strip_prefix('=').unwrap_or(rest);
+                    (arg[..at].to_string(), Some(rest.to_string()))
+                }
+                _ => (arg, None),
             };
             let mut value = || {
                 let value = match inline.clone() {
@@ -429,20 +440,26 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The keychain file a suggested `security` command must name, quoted. With
+/// no file, `security` falls back to the default keychain or the search list,
+/// which any process running as the user can rearrange, so a pasted command
+/// could unlock or delete in a keychain spiceio never reads.
+fn keychain_arg(item: &Item) -> String {
+    item.file()
+        .map(|path| sh_quote(&path.display().to_string()))
+        .unwrap_or_else(|_| "<keychain file>".into())
+}
+
 /// The `security delete-generic-password` command that removes `item`, with
 /// `<user>` standing in for the SMB user (output never shows it).
 fn delete_command(item: &Item, shown: &str) -> String {
     let account = shown.replacen("****", "<user>", 1);
-    let mut cmd = format!(
-        "security delete-generic-password -s {} -a {}",
+    format!(
+        "security delete-generic-password -s {} -a {} {}",
         sh_quote(&item.service),
-        sh_quote(&account)
-    );
-    if let Some(path) = &item.keychain {
-        cmd.push(' ');
-        cmd.push_str(&sh_quote(&path.display().to_string()));
-    }
-    cmd
+        sh_quote(&account),
+        keychain_arg(item)
+    )
 }
 
 /// A keychain failure as a sentence that says what to do. `storing`: the
@@ -457,13 +474,7 @@ fn explain(item: &Item, shown: &str, e: &keychain::Error, storing: bool) -> Stri
             item.location()
         ),
         keychain::Error::Denied { locked: true } => {
-            let unlock = match &item.keychain {
-                Some(path) => format!(
-                    "security unlock-keychain {}",
-                    sh_quote(&path.display().to_string())
-                ),
-                None => "security unlock-keychain".into(),
-            };
+            let unlock = format!("security unlock-keychain {}", keychain_arg(item));
             format!(
                 "{} is locked, and spiceio never prompts for it. The login keychain unlocks \
                  when you log in to the Mac (a launchd agent in that session can read it); from \
@@ -942,10 +953,47 @@ mod tests {
             account: "smb://CORP;alice@nas".into(),
             keychain: None,
         };
+        let login = keychain::login_keychain().unwrap();
         assert_eq!(
             delete_command(&item, "smb://****@nas"),
-            r"security delete-generic-password -s 'it'\''s' -a 'smb://<user>@nas'"
+            format!(
+                r"security delete-generic-password -s 'it'\''s' -a 'smb://<user>@nas' '{}'",
+                login.display()
+            )
         );
+    }
+
+    /// Every suggested command names the keychain file: with none, `security`
+    /// acts on the default keychain or the search list, not the file spiceio
+    /// reads.
+    #[test]
+    fn suggestions_always_name_the_keychain_file() {
+        let login = Item {
+            service: "svc".into(),
+            account: "smb://alice@nas".into(),
+            keychain: None,
+        };
+        let file = Item {
+            keychain: Some(PathBuf::from("/k/it's.keychain-db")),
+            ..login.clone()
+        };
+        let login_path = format!("'{}'", keychain::login_keychain().unwrap().display());
+        for (item, path) in [
+            (&login, login_path.as_str()),
+            (&file, r"'/k/it'\''s.keychain-db'"),
+        ] {
+            assert!(delete_command(item, "smb://****@nas").ends_with(&format!(" {path}")));
+            let locked = explain(
+                item,
+                "smb://****@nas",
+                &keychain::Error::Denied { locked: true },
+                false,
+            );
+            assert!(
+                locked.ends_with(&format!("security unlock-keychain {path}")),
+                "{locked}"
+            );
+        }
     }
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1027,6 +1075,9 @@ mod tests {
     fn refusals_never_echo_a_value() {
         for list in [
             &["-p=hunter2"][..],
+            &["-phunter2"],
+            &["-shunter2"],
+            &["-ühunter2"],
             &["--password=hunter2"],
             &["--pasword=hunter2"],
             &["hunter2"],
@@ -1035,10 +1086,15 @@ mod tests {
             let err = Settings::default().with_args(args(list), "-").unwrap_err();
             assert!(!err.contains("hunter2"), "{list:?}: {err}");
         }
-        let err = Settings::default()
-            .with_args(args(&["-p=hunter2"]), "-")
-            .unwrap_err();
-        assert!(err.contains("never taken from the command line"), "{err}");
+        for glued in ["-p=hunter2", "-phunter2"] {
+            let err = Settings::default()
+                .with_args(args(&[glued]), "-")
+                .unwrap_err();
+            assert!(
+                err.contains("never taken from the command line"),
+                "{glued}: {err}"
+            );
+        }
     }
 
     #[test]

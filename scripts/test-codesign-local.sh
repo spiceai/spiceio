@@ -133,6 +133,17 @@ check "says how to unlock it first" has "security unlock-keychain '$KC'"
 check "leaves no output binary" [ ! -e "$WORK/b" ]
 check "still locked" [ "$(state "$KC")" = locked ]
 
+echo "--- a suggested command names that keychain exactly, even through a quote"
+QKC="$WORK/it's here.kc"
+ln -s "$KC" "$QKC"
+run env SIGNING_KEYCHAIN="$QKC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/q"
+check "exits 1" [ "$RC" -eq 1 ]
+SUGGESTED=$(grep -m1 'security unlock-keychain' <<<"$OUT" | sed 's/^ *//')
+# Run the line as pasted, with a `security` that only prints its arguments.
+PASTED=$(sh -c 'security() { printf "%s\n" "$@"; }; '"$SUGGESTED")
+check "the pasted command unlocks that keychain and nothing else" [ "$PASTED" = "unlock-keychain"$'\n'"$QKC" ]
+rm -f "$QKC"
+
 echo "--- locked, in a terminal: asks once, signs, locks again"
 run_tty "$PW" env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/b"
 check "exits 0" [ "$RC" -eq 0 ]

@@ -411,11 +411,15 @@ someone who has your login password.
   2. `make release && scripts/codesign-local.sh target/release/spiceio /tmp/spiceio-new`
      (creates the new identity and signs a temporary copy with it)
   3. Delete exactly the agent's item: its service (`SPICEIO_SMB_PASS_KEYCHAIN`,
-     usually `ai.spice.spiceio.smb`), its account, and its keychain file if
-     the plist names one (`SPICEIO_SMB_PASS_KEYCHAIN_PATH`; otherwise the login
-     keychain). macOS may ask for your login password:
-     `security delete-generic-password -s <service> -a 'smb://[<domain>;]<user>@<server>[:<port>]' [<keychain file>]`.
-     `--check-smb-password` prints the account with the user masked.
+     usually `ai.spice.spiceio.smb`), its account, and its keychain file
+     (`SPICEIO_SMB_PASS_KEYCHAIN_PATH`, or else the login keychain,
+     `~/Library/Keychains/login.keychain-db`). Always name the file: without
+     one, `security` searches your keychain search list, which any process
+     running as you can rearrange, and can delete a matching item in another
+     keychain. macOS may ask for your login password:
+     `security delete-generic-password -s <service> -a 'smb://[<domain>;]<user>@<server>[:<port>]' <keychain file>`.
+     `--check-smb-password` prints the account with the user masked, and the
+     error for an item it cannot read prints this command with the file filled in.
   4. `/tmp/spiceio-new --store-smb-password`, with all of the agent's lookup
      settings, as under **New SMB password** above.
   5. `make install`, then `rm /tmp/spiceio-new`

@@ -110,6 +110,10 @@ die() {
     exit 1
 }
 
+# $1 single-quoted, for a command printed as a suggestion: a path holding a
+# quote must not turn a pasted command into one on another keychain.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
 [ -f "$SRC" ] || die "$SRC does not exist"
 
 case "$CODESIGN" in
@@ -207,7 +211,7 @@ else
     locked)
         [ -t 0 ] || die "the signing keychain is locked, and there is no terminal to ask for its
        password. Run \`make install\` in a terminal, or unlock it first:
-         security unlock-keychain '$kc'
+         security unlock-keychain $(shq "$kc")
        (install locks it again when it is done)."
         security unlock-keychain "$kc" || die "could not unlock $kc"
         ;;
@@ -218,7 +222,7 @@ fi
 
 hash=$(identity_hash)
 [ -n "$hash" ] || die "$kc has no \"$CN\" identity. To start over, delete the keychain
-       (security delete-keychain '$kc') and run \`make install\` again. A new identity
+       (security delete-keychain $(shq "$kc")) and run \`make install\` again. A new identity
        cannot read keychain items the old one stored: see README, \"New signing identity\"."
 
 stage

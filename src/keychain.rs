@@ -364,6 +364,15 @@ impl Item {
             None => "the login keychain".into(),
         }
     }
+
+    /// The one keychain file every operation on this item names: the
+    /// configured one, or the login keychain by path.
+    pub fn file(&self) -> Result<PathBuf, Error> {
+        match &self.keychain {
+            Some(path) => Ok(path.clone()),
+            None => login_keychain(),
+        }
+    }
 }
 
 /// How [`store`] left the item.
@@ -532,11 +541,7 @@ struct Target {
 
 impl Target {
     fn new(item: &Item) -> Result<Self, Error> {
-        let path = match &item.keychain {
-            Some(path) => path.clone(),
-            None => login_keychain()?,
-        };
-        let keychain = open_keychain(&path)?;
+        let keychain = open_keychain(&item.file()?)?;
         // A file that does not exist opens fine and only fails later with a
         // vaguer status; ask now so the error names the real problem.
         keychain_locked(keychain.0)?;
