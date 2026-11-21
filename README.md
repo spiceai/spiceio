@@ -128,7 +128,9 @@ All configuration is via environment variables:
 | ----------------------------- | -------- | ------------------- | ------------------------- |
 | `SPICEIO_SMB_SERVER`          | yes      |                     | SMB server hostname or IP |
 | `SPICEIO_SMB_USER`            | yes      |                     | SMB username              |
-| `SPICEIO_SMB_PASS`            | yes      |                     | SMB password              |
+| `SPICEIO_SMB_PASS`            | one of   |                     | SMB password. Set this or `SPICEIO_SMB_PASS_KEYCHAIN`, not both |
+| `SPICEIO_SMB_PASS_KEYCHAIN`   | one of   |                     | Keychain service the SMB password is stored under (`ai.spice.spiceio.smb` is what `make install` and `--store-smb-password` use). See [SMB password in the keychain](#smb-password-in-the-keychain) |
+| `SPICEIO_SMB_PASS_KEYCHAIN_PATH` | no    | login keychain      | Absolute path of a keychain file to read the item from instead |
 | `SPICEIO_SMB_SHARE`           | yes      |                     | SMB share name            |
 | `SPICEIO_BIND`                | no       | `127.0.0.1:8333`    | Listen address. Loopback only by default: the S3 endpoint is unauthenticated, so set this (`0.0.0.0:8333`, `*:8333`, or a specific interface) to accept other hosts |
 | `SPICEIO_SMB_PORT`            | no       | `445`               | SMB port                  |
@@ -256,8 +258,14 @@ or loopback.
 
 ### The local launchd agent (`make install`)
 
-`make install` sets up SigV4 for a launchd agent (`ai.spice.spiceio`) running
-the installed binary, and checks that it works:
+`make install` signs the binary, sets up SigV4 for a launchd agent
+(`ai.spice.spiceio`) running it, moves the agent's SMB password from its plist
+into the keychain, and checks that it works:
+
+0. install signs the build with a local, self-signed identity and checks that
+   the signed build can read the agent's SMB password before it replaces the
+   running binary. See [SMB password in the keychain](#smb-password-in-the-keychain)
+   for why, and for the password it asks for.
 
 1. If the agent's plist names no credentials file, the agent gets
    `~/.config/spiceio/credentials` (mode 0600, in a 0700 directory). If that
@@ -269,10 +277,14 @@ the installed binary, and checks that it works:
    place, and the plist keeps its mode, its format and its symlink. First,
    `spiceio --check-auth` validates the result exactly as startup would, so a
    bad key file stops the install, not the agent.
-3. install restarts the agent. If the plist's environment differs from what
+3. If the plist holds `SPICEIO_SMB_PASS`, install stores it in the keychain
+   with the installed `spiceio --store-smb-password` (piped from `plutil`, never
+   through an argument list), checks that `spiceio --check-smb-password` reads
+   it back, then replaces `SPICEIO_SMB_PASS` with `SPICEIO_SMB_PASS_KEYCHAIN`.
+4. install restarts the agent. If the plist's environment differs from what
    launchd loaded, it does a full reload instead, because `kickstart` would
    keep the old environment.
-4. install checks the result. An unsigned request must be refused, and a
+5. install checks the result. An unsigned request must be refused, and a
    request signed through `sccache-spiceio` must be served. Otherwise the
    install fails.
 
@@ -280,7 +292,9 @@ the installed binary, and checks that it works:
 make install                    # SPICEIO_S3_AUTH=enforce
 make install AGENT_AUTH=log     # verify and log, but still serve unsigned requests
 make install AGENT_AUTH=keep    # leave the agent's auth settings alone
+make install AGENT_SMB_PASS=keep  # leave the SMB password where it is
 make install RESTART_AGENT=0    # stage the binary and the plist edit; a later install reloads it
+make install CODESIGN=adhoc     # no signing identity (then the password stays in the plist)
 ```
 
 sccache has to sign too, and once the agent enforces, an sccache that does not
@@ -302,6 +316,101 @@ The wrapper signs with the *last* key in the file (or in
 2. Run `make install` so the agent accepts both keys.
 3. Run `sccache --stop-server` so sccache starts signing with the new key.
 4. Delete the old line and run `make install` again.
+
+## SMB password in the keychain
+
+A password in a launchd plist is plaintext on disk and in every backup of it,
+and `launchctl print` shows a loaded job's environment to any process running
+as you. spiceio can instead read it from a generic-password item in the macOS
+keychain, which is encrypted at rest and readable only by binaries whose code
+signature the item's access list names:
+
+```bash
+export SPICEIO_SMB_SERVER=nas.example SPICEIO_SMB_USER=svc-spiceio
+spiceio --store-smb-password        # asks twice, without echo (or reads stdin)
+export SPICEIO_SMB_PASS_KEYCHAIN=ai.spice.spiceio.smb
+spiceio --check-smb-password        # SMB password: keychain item "ai.spice.spiceio.smb" for smb://svc-spiceio@nas.example (the login keychain)
+```
+
+`make install` does this for the launchd agent by default (see above).
+
+**The item is bound to the server.** Its account is derived, not configured:
+`smb://[domain;]user@server[:port]`. Anything running as you can edit the
+agent's plist. If the item were found by service alone, pointing
+`SPICEIO_SMB_SERVER` at a host that process controls would make spiceio
+authenticate to it with the real password, handing over an NTLMv2 response that
+can be cracked offline. A changed server finds no item, and nothing is sent.
+
+**The item follows a signing identity, not a build.** Its access list holds
+the designated requirement of the binary that stored it. cargo signs ad-hoc, so
+that requirement is the binary's cdhash and every rebuild is a different
+identity. `make install` therefore signs every build with one self-signed
+certificate (`scripts/codesign-local.sh`), giving the requirement
+`identifier "ai.spice.spiceio" and certificate leaf = H"…"`. No Apple Developer
+account is involved, and macOS does not need to trust the certificate for this.
+The signature also enables the hardened runtime, so other processes cannot
+attach to spiceio or inject a library into it to read the password from memory.
+
+**The signing key is locked away.** Anything signed with that key can read the
+password, so the key lives in its own keychain
+(`~/Library/Keychains/spiceio-signing.keychain-db`, `SIGNING_KEYCHAIN=`), off
+the keychain search list, with its own password, locked except while install
+signs. The private key is imported non-extractable. The first `make install`
+creates it and asks you to choose that password (twice, then once more to let
+`codesign` use the key). Every later install asks for it once in the terminal.
+To install without a terminal, unlock it first:
+`security unlock-keychain ~/Library/Keychains/spiceio-signing.keychain-db`.
+install locks it again when done. install never raises a dialog: it checks the
+lock state with `spiceio --keychain-status`, which does not prompt.
+
+**spiceio never prompts.** It reads the item with keychain interaction off, so
+a locked keychain or a binary not on the access list fails startup at once with
+the reason, instead of waiting on a dialog nobody may be there to answer. The
+login keychain unlocks when you log in to the Mac, which is when a launchd agent
+in your session starts. A Mac reached only over SSH, with no GUI login, keeps it
+locked.
+
+What it does **not** protect against: the keychain lets any application
+*replace* an item's data. It only restricts reading. Something running as you
+cannot read the password, but it can overwrite it and stop spiceio
+authenticating. `--store-smb-password` reads an item before writing it and
+refuses to touch one it cannot read, so it never replaces a password it could
+not read back. The keychain also does not protect against root, or against
+someone who has your login password.
+
+### Rotation, backup and recovery
+
+- **New SMB password.** Change it on the NAS, then store it:
+  `spiceio --store-smb-password` with the agent's `SPICEIO_SMB_SERVER`,
+  `SPICEIO_SMB_USER` (and `SPICEIO_SMB_DOMAIN`/`SPICEIO_SMB_PORT` if set), run
+  from the installed (signed) binary. Then restart the agent:
+  `launchctl kickstart -k gui/$(id -u)/ai.spice.spiceio`.
+- **After moving a password out of a plist.** Backups and copies of the plist
+  made before the move (Time Machine, a dotfiles repo) still hold the old
+  password. If any of them could have been read, rotate it as above.
+- **New signing identity** (it expires after 10 years, or the signing keychain
+  is lost or compromised). Items the old identity stored cannot be read by
+  builds the new one signs, and cannot be deleted by them either. Delete the
+  signing keychain (`security delete-keychain ~/Library/Keychains/spiceio-signing.keychain-db`)
+  and the SMB password item
+  (`security delete-generic-password -s ai.spice.spiceio.smb -a 'smb://user@server'`;
+  macOS may ask for your login password). Then run `make install`, which creates a
+  new identity, and store the password again with `--store-smb-password`.
+  install refuses to replace the binary until the new build can read the item,
+  so the running agent keeps working until you do.
+- **Forgotten signing keychain password.** Same as a new identity. Nothing
+  else depends on that keychain.
+- **Backup.** The SMB password item is in the login keychain, and the signing
+  key in the signing keychain. Time Machine backs both up, each encrypted under
+  its own keychain password. Keep them together: the item's access list names
+  the signing certificate, so a restored item is readable only by builds signed
+  with the restored signing key. Restoring the login keychain without the
+  signing keychain means a new signing identity, as above.
+- **Another Mac.** Each Mac has its own signing identity. Store the SMB password
+  there with that Mac's installed binary.
+- **Release builds** from GitHub are ad-hoc signed. To keep the password in the
+  keychain with one, re-sign it with your local identity:
+  `scripts/codesign-local.sh path/to/spiceio ~/.local/bin/spiceio`.
 
 ## OTEL metrics (Spice Cloud)
 
@@ -558,13 +667,14 @@ behind), then the log file is flushed before exit. Startup/config errors
 
 ## Architecture
 
-Five modules:
+The main modules:
 
 - **`s3`** -- HTTP layer. Parses S3 requests, produces XML responses. Router dispatches to the appropriate handler. Small files (<64KB) use compound fast paths; large files stream.
 - **`smb`** -- Wire protocol client. Manages TCP connection, negotiate/session-setup handshake, and file operations. Supports SMB2 compounding for batching multiple operations in a single round trip.
 - **`crypto`** -- FFI bindings to macOS CommonCrypto. MD4, SHA-256, SHA-512, HMAC-MD5, HMAC-SHA256, AES-128-CMAC. No Rust crypto crates.
 - **`http`** -- HTTP front-end tuning for the listener: HTTP/1.1 connection builder, header-read timeout, accept backoff, and shutdown grace. Factored out of the accept loop so the integration tests exercise the same settings the server runs with.
 - **`crash`** -- Crash reporting. Panic hook plus async-signal-safe fatal-signal handler; reports go to stderr and the log file synchronously, bypassing the async logger.
+- **`keychain`** / **`smb_password`** -- Security.framework FFI for keychain items (read, store, lock state, this binary's code signature), and where the SMB password comes from (`SPICEIO_SMB_PASS` or a keychain item keyed on the server), with `--store-smb-password` and `--check-smb-password`.
 
 ```
 HTTP request
@@ -580,7 +690,7 @@ HTTP request
 make                   # fmt + full CI-local gate
 make ci                # parity with GitHub Actions (lint + unit + live SMB suites)
 make release           # optimized release build
-make install           # install the release build (+ dSYM, sccache-spiceio) into ~/.local/bin; set up SigV4 for the launchd agent, restart it, check its auth
+make install           # sign the release build and install it (+ dSYM, sccache-spiceio) into ~/.local/bin; set up SigV4 for the launchd agent, move its SMB password into the keychain, restart it, check its auth
 make lint              # static only — not sufficient to claim CI will pass
 make test-unit         # cargo test (no SMB)
 make test              # sccache integration (requires SPICEIO_SMB_USER/PASS)

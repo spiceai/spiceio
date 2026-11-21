@@ -19,6 +19,7 @@ use spiceio::s3;
 use spiceio::serr;
 use spiceio::slog;
 use spiceio::smb;
+use spiceio::smb_password;
 
 use s3::multipart::MultipartStore;
 use s3::object_cache::ObjectCache;
@@ -39,7 +40,8 @@ struct Config {
     smb_port: u16,
     /// SMB username
     smb_username: String,
-    /// SMB password
+    /// SMB password, from `SPICEIO_SMB_PASS` or the keychain item named by
+    /// `SPICEIO_SMB_PASS_KEYCHAIN` (see `smb_password`)
     smb_password: String,
     /// SMB domain (default empty)
     smb_domain: String,
@@ -121,8 +123,47 @@ fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// Resolve the SMB password the way `--check-smb-password` does, or exit
+/// with the reason. A keychain that is locked or will not let this binary
+/// read the item is a configuration error, like a missing variable: it never
+/// fixes itself, so retrying it behind a 503 would only hide it.
+fn load_smb_password(server: &str, port: u16, user: &str, domain: &str) -> String {
+    let nonempty = |name: &str| env::var(name).ok().filter(|v| !v.is_empty());
+    let settings = smb_password::Settings {
+        server: Some(server.to_string()),
+        port,
+        user: Some(user.to_string()),
+        domain: domain.to_string(),
+        inline: nonempty("SPICEIO_SMB_PASS"),
+        service: nonempty("SPICEIO_SMB_PASS_KEYCHAIN"),
+        keychain_path: nonempty("SPICEIO_SMB_PASS_KEYCHAIN_PATH").map(Into::into),
+    };
+    let source = match smb_password::Source::resolve(&settings) {
+        Ok(source) => source,
+        Err(e) => {
+            serr!("[spiceio] SMB password: {e}");
+            flush_and_exit(1);
+        }
+    };
+    match source.load() {
+        Ok(password) => {
+            slog!("[spiceio] SMB password: {}", source.describe());
+            password
+        }
+        Err(e) => {
+            serr!("[spiceio] SMB password: {e}");
+            flush_and_exit(1);
+        }
+    }
+}
+
 impl Config {
     fn from_env() -> Self {
+        let smb_server = require_env("SPICEIO_SMB_SERVER");
+        let smb_port = parse_env_or("SPICEIO_SMB_PORT", smb_password::DEFAULT_PORT);
+        let smb_username = require_env("SPICEIO_SMB_USER");
+        let smb_domain = env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default();
+        let smb_password = load_smb_password(&smb_server, smb_port, &smb_username, &smb_domain);
         Self {
             bind_addr: match env::var("SPICEIO_BIND") {
                 Err(_) => DEFAULT_BIND,
@@ -137,11 +178,11 @@ impl Config {
                     }
                 },
             },
-            smb_server: require_env("SPICEIO_SMB_SERVER"),
-            smb_port: parse_env_or("SPICEIO_SMB_PORT", 445),
-            smb_username: require_env("SPICEIO_SMB_USER"),
-            smb_password: require_env("SPICEIO_SMB_PASS"),
-            smb_domain: env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
+            smb_server,
+            smb_port,
+            smb_username,
+            smb_password,
+            smb_domain,
             smb_share: require_env("SPICEIO_SMB_SHARE"),
             bucket_name: env::var("SPICEIO_BUCKET").unwrap_or_else(|_| {
                 env::var("SPICEIO_SMB_SHARE").unwrap_or_else(|_| "data".into())
@@ -445,6 +486,41 @@ async fn main() {
             }
         }
         return;
+    }
+
+    // `--check-smb-password`: resolve the SMB password from the environment
+    // (or the keychain item it names) exactly as startup does, say where it
+    // came from, and exit. Like `--check-auth`, it touches nothing else.
+    // `make install` runs it with the agent's settings, so a binary that
+    // cannot read the keychain item stops the install instead of the agent.
+    if env::args().any(|a| a == "--check-smb-password") {
+        std::process::exit(smb_password::check_command());
+    }
+    // `--store-smb-password`: put the SMB password for the configured server
+    // and user into the keychain (read from the terminal or stdin).
+    if env::args().any(|a| a == "--store-smb-password") {
+        std::process::exit(smb_password::store_command());
+    }
+    // Hidden: `--keychain-status <path>` prints `locked` or `unlocked`
+    // without prompting. `make install` asks before signing, because
+    // codesign would raise an unlock dialog for a locked keychain.
+    {
+        let args: Vec<String> = env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--keychain-status") {
+            let Some(path) = args.get(i + 1) else {
+                eprintln!("--keychain-status needs a keychain path");
+                std::process::exit(2);
+            };
+            match spiceio::keychain::keychain_unlocked(std::path::Path::new(path)) {
+                Ok(true) => println!("unlocked"),
+                Ok(false) => println!("locked"),
+                Err(e) => {
+                    eprintln!("keychain {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
     }
 
     // Treat an empty SPICEIO_LOG_FILE as unset: CI and the test scripts may

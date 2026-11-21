@@ -3,8 +3,11 @@
 # and the sccache-spiceio wrapper. No launchd agent is touched: `launchctl`
 # and `lsof` are stubs on PATH that record what they were asked to do. A small
 # local HTTP server stands in for the agent when the post-restart check needs
-# answers. plutil, curl, openssl and `spiceio --check-auth` are the real ones,
-# so the plist edits and the auth validation are exactly what an install does.
+# answers. plutil, curl, openssl, codesign, `spiceio --check-auth` and the
+# keychain are the real ones, so the plist edits, the auth validation and the
+# move of the SMB password into the keychain are exactly what an install does.
+# The keychains are throwaway files (every test plist names one in
+# SPICEIO_SMB_PASS_KEYCHAIN_PATH); the login keychain is never touched.
 # Real SigV4 verification against a running agent is test-auth.sh's job.
 #
 # Usage: scripts/test-agent-install.sh [path/to/spiceio]   (default target/debug/spiceio)
@@ -20,6 +23,9 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/spiceio-agent-install.XXXXXX")
 SERVER_PID=""
 cleanup() {
     [[ -z "$SERVER_PID" ]] || kill "$SERVER_PID" 2>/dev/null || true
+    for kc in "$WORK"/*.keychain-db; do
+        [[ -e "$kc" ]] && security delete-keychain "$kc" 2>/dev/null || true
+    done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -44,9 +50,39 @@ has() { grep -qF -- "$1" <<<"$OUT"; }
 lacks() { ! grep -qF -- "$1" <<<"$OUT"; }
 
 LABEL=ai.spice.spiceio-test
-mkdir -p "$WORK/bin" "$WORK/bindir"
-ln -s "$SPICEIO_BIN" "$WORK/bindir/spiceio"
+mkdir -p "$WORK/bin" "$WORK/bindir" "$WORK/adhocbin"
 install -m 0755 "$ROOT/scripts/sccache-spiceio" "$WORK/bindir/sccache-spiceio"
+install -m 0755 "$ROOT/scripts/sccache-spiceio" "$WORK/adhocbin/sccache-spiceio"
+
+# The installed spiceio is signed the way `make install` signs it (a
+# self-signed identity in its own keychain), so keychain items it stores pin
+# that identity rather than one build. Made here with a known password; the
+# interactive path is test-codesign-local.sh's job.
+SIGNING_KC="$WORK/signing.keychain-db"
+security create-keychain -p signing-pw "$SIGNING_KC"
+security set-keychain-settings "$SIGNING_KC"
+printf '[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ext\n[dn]\nCN=spiceio local code signing\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' >"$WORK/req.cnf"
+/usr/bin/openssl req -x509 -newkey rsa:2048 -days 2 -nodes -config "$WORK/req.cnf" \
+    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" 2>/dev/null
+/usr/bin/openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" -out "$WORK/id.p12" -passout pass:x
+security import "$WORK/id.p12" -k "$SIGNING_KC" -P x -x -T /usr/bin/codesign >/dev/null
+security set-key-partition-list -S apple-tool:,apple: -s -k signing-pw "$SIGNING_KC" >/dev/null
+rm -f "$WORK/key.pem" "$WORK/id.p12"
+SIGNING_HASH=$(security find-identity -p codesigning "$SIGNING_KC" | awk '/Matching identities/ {m=1} m && /spiceio local/ {print $2; exit}')
+# sign DST [extra -o flags]: a copy of the binary under test, signed with it.
+sign() {
+    cp "$SPICEIO_BIN" "$1"
+    codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" -i ai.spice.spiceio -o "runtime${2:+,$2}" \
+        --timestamp=none "$1" 2>/dev/null
+}
+sign "$WORK/bindir/spiceio"
+cp "$SPICEIO_BIN" "$WORK/adhocbin/spiceio"
+codesign -f -s - -i ai.spice.spiceio "$WORK/adhocbin/spiceio" 2>/dev/null
+
+# Where every test agent keeps its SMB password.
+ITEMS="$WORK/items.keychain-db"
+security create-keychain -p items-pw "$ITEMS"
+security set-keychain-settings "$ITEMS"
 
 # ── stubs ────────────────────────────────────────────────────────────────
 # launchctl: one job whose state lives in $LD_STATE. `bootstrap` snapshots
@@ -149,7 +185,9 @@ fresh_agent() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>SPICEIO_SMB_SERVER</key><string>nas.local</string>
+    <key>SPICEIO_SMB_USER</key><string>svc$CASES</string>
     <key>SPICEIO_SMB_PASS</key><string>p@ss w0rd&amp;&lt;amp&gt;"</string>
+    <key>SPICEIO_SMB_PASS_KEYCHAIN_PATH</key><string>$ITEMS</string>
   </dict>
 </dict>
 </plist>
@@ -174,6 +212,27 @@ install_agent() {
     RC=$?
     set -e
 }
+# preflight_agent BIN [VAR=value ...]: agent-install.sh --preflight BIN.
+preflight_agent() {
+    local bin=$1
+    shift
+    set +e
+    OUT=$(env -i PATH="$WORK/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME_DIR" TMPDIR="$CASE" \
+        LD_STATE="$LD_STATE" BINDIR="$WORK/bindir" LAUNCHD_LABEL="$LABEL" \
+        "$@" "$ROOT/scripts/agent-install.sh" --preflight "$bin" 2>&1)
+    RC=$?
+    set -e
+}
+# case_smb CMD...: CMD with the SMB settings this case's item is keyed on.
+case_smb() {
+    env -i PATH=/usr/bin:/bin HOME="$HOME_DIR" SPICEIO_SMB_SERVER=nas.local SPICEIO_SMB_USER="svc$CASES" \
+        SPICEIO_SMB_PASS_KEYCHAIN="${SERVICE:-ai.spice.spiceio.smb}" SPICEIO_SMB_PASS_KEYCHAIN_PATH="$ITEMS" "$@"
+}
+# The case's item holds exactly $SMB_PASS (storing it again changes nothing).
+item_holds_password() {
+    printf '%s' "$SMB_PASS" | case_smb "$WORK/bindir/spiceio" --store-smb-password 2>&1 | grep -q ': unchanged in'
+}
+loaded_job_lacks_password() { ! grep -q 'SPICEIO_SMB_PASS =>' "$LD_STATE/env"; }
 calls() { grep -v '^print' "$LD_STATE/calls" | cut -d' ' -f1 | tr '\n' ' ' | sed 's/ $//'; }
 env_of() { plutil -extract "EnvironmentVariables.$1" raw -o - "$PLIST" 2>/dev/null; }
 mode_of() { stat -f '%Lp' "$1"; }
@@ -213,7 +272,14 @@ check "creates its directory 0700" [ "$(mode_of "$(dirname "$CREDS")")" = 700 ]
 check "with exactly one key" [ "$(grep -cv '^#' "$CREDS")" -eq 1 ]
 check "points the agent at it" [ "$(env_of SPICEIO_S3_CREDENTIALS_FILE)" = "$CREDS" ]
 check "sets SPICEIO_S3_AUTH=enforce" [ "$(env_of SPICEIO_S3_AUTH)" = enforce ]
-check "keeps the SMB password byte for byte" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+check "takes the SMB password out of the plist" [ -z "$(env_of SPICEIO_SMB_PASS)" ]
+check "points the agent at the keychain item" [ "$(env_of SPICEIO_SMB_PASS_KEYCHAIN)" = ai.spice.spiceio.smb ]
+check "keeps the keychain path it names" [ "$(env_of SPICEIO_SMB_PASS_KEYCHAIN_PATH)" = "$ITEMS" ]
+check "stores it byte for byte" item_holds_password
+check "the reloaded job no longer holds it" loaded_job_lacks_password
+check "says it moved it" has "SMB password moved to the keychain"
+check "warns that older copies of the plist still hold it" has "still hold the SMB password"
+check "never prints the SMB password" lacks "$SMB_PASS"
 check "keeps the plist's mode" [ "$(mode_of "$PLIST")" = 600 ]
 check "leaves no temp file beside the plist" [ "$(find "$(dirname "$PLIST")" -name '.*' -type f | wc -l | tr -d ' ')" = 0 ]
 check "reloads rather than kickstarts (kickstart keeps the old env)" [ "$(calls)" = "bootout bootstrap" ]
@@ -278,7 +344,7 @@ check "says so" has "is not listening yet"
 echo "--- AGENT_AUTH=keep"
 fresh_agent
 cp -p "$PLIST" "$CASE/plist.before"
-install_agent AGENT_AUTH=keep
+install_agent AGENT_AUTH=keep AGENT_SMB_PASS=keep
 check "exits 0" [ "$RC" -eq 0 ]
 check "plist untouched" cmp -s "$PLIST" "$CASE/plist.before"
 check "no key created" [ ! -e "$CREDS" ]
@@ -312,6 +378,8 @@ fresh_agent binary1
 install_agent
 check "a binary plist stays binary" grep -q "Apple binary property list" <<<"$(file "$PLIST")"
 check "and is wired" [ "$(env_of SPICEIO_S3_AUTH)" = enforce ]
+check "and its SMB password moved" [ "$(env_of SPICEIO_SMB_PASS_KEYCHAIN)" = ai.spice.spiceio.smb ]
+check "out of the binary plist" [ -z "$(env_of SPICEIO_SMB_PASS)" ]
 fresh_agent
 mkdir -p "$CASE/dotfiles"
 mv "$PLIST" "$CASE/dotfiles/agent.plist"
@@ -329,6 +397,85 @@ check "says so" has "no launchd agent $LABEL is loaded"
 check "creates no key" [ ! -e "$CREDS" ]
 install_agent AGENT_AUTH=sometimes
 check "unknown AGENT_AUTH: fails" [ "$RC" -eq 1 ]
+install_agent AGENT_SMB_PASS=sometimes
+check "unknown AGENT_SMB_PASS: fails" [ "$RC" -eq 1 ]
+preflight_agent "$WORK/adhocbin/spiceio"
+check "preflight with no agent loaded: passes" [ "$RC" -eq 0 ]
+
+echo "--- AGENT_SMB_PASS=keep"
+fresh_agent
+install_agent AGENT_SMB_PASS=keep
+check "exits 0" [ "$RC" -eq 0 ]
+check "the password stays in the plist" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+check "no keychain service set" [ -z "$(env_of SPICEIO_SMB_PASS_KEYCHAIN)" ]
+OUT=$(case_smb "$WORK/bindir/spiceio" --check-smb-password 2>&1 || true)
+check "and no item stored" has "no keychain item"
+
+echo "--- the plist names its own keychain service"
+fresh_agent
+plutil -replace EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN -string ai.spice.custom "$PLIST"
+install_agent
+check "exits 0" [ "$RC" -eq 0 ]
+check "keeps that service" [ "$(env_of SPICEIO_SMB_PASS_KEYCHAIN)" = ai.spice.custom ]
+check "and drops the inline password (both set is a startup error)" [ -z "$(env_of SPICEIO_SMB_PASS)" ]
+SERVICE=ai.spice.custom
+check "stores it under that service" item_holds_password
+unset SERVICE
+
+echo "--- an item that already holds an older password"
+fresh_agent
+printf 'an-old-password' | case_smb "$WORK/bindir/spiceio" --store-smb-password >/dev/null
+install_agent
+check "exits 0" [ "$RC" -eq 0 ]
+check "the plist's password wins" has ": updated in keychain item"
+check "and is what the item holds now" item_holds_password
+
+echo "--- the keychain cannot take it"
+fresh_agent
+security lock-keychain "$ITEMS"
+cp -p "$PLIST" "$CASE/plist.before"
+install_agent
+check "fails" [ "$RC" -eq 1 ]
+check "says it could not store it" has "could not be stored in the keychain"
+check "and why" has "is locked"
+check "plist untouched: the password stays where it was" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+check "no restart" [ -z "$(calls)" ]
+check "never prints the SMB password" lacks "$SMB_PASS"
+security unlock-keychain -p items-pw "$ITEMS"
+
+echo "--- an agent already on the keychain"
+fresh_agent
+install_agent
+check "migrates" [ "$RC" -eq 0 ]
+install_agent
+check "a second install leaves it" has "SMB password from keychain item \"ai.spice.spiceio.smb\" (unchanged)"
+security lock-keychain "$ITEMS"
+install_agent
+check "an unreadable item fails the install" [ "$RC" -eq 1 ]
+check "before any restart" [ -z "$(calls)" ]
+check "and says why" has "could not read its SMB password, so it is not being restarted"
+install_agent AGENT_SMB_PASS=keep
+check "even with AGENT_SMB_PASS=keep" [ "$RC" -eq 1 ]
+check "which restarts nothing either" [ -z "$(calls)" ]
+security unlock-keychain -p items-pw "$ITEMS"
+
+echo "--- preflight: a new build must read the agent's password before it is installed"
+sign "$WORK/rebuilt" kill
+preflight_agent "$WORK/rebuilt"
+check "another build signed with the same identity: passes" [ "$RC" -eq 0 ]
+preflight_agent "$WORK/adhocbin/spiceio"
+check "an ad-hoc build: fails" [ "$RC" -eq 1 ]
+check "says the running binary is unchanged" has "The running binary is unchanged"
+check "and why" has "is not on the item's access list"
+fresh_agent
+preflight_agent "$WORK/adhocbin/spiceio"
+check "an agent still holding its password inline: nothing to check" [ "$RC" -eq 0 ]
+
+echo "--- an ad-hoc installed binary does not take the password"
+install_agent BINDIR="$WORK/adhocbin"
+check "exits 0" [ "$RC" -eq 0 ]
+check "says why not" has "is ad-hoc"
+check "the password stays in the plist" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
 
 echo ""
 echo "agent-install: $PASS passed, $FAIL failed"
