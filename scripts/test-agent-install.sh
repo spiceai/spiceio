@@ -28,7 +28,6 @@ cleanup() {
     [[ -z "$SERVER_PID" ]] || kill "$SERVER_PID" 2>/dev/null || true
     for kc in "$WORK"/*.keychain-db; do
         [[ -e "$kc" ]] || continue
-        unlist "$kc" 2>/dev/null || true
         security delete-keychain "$kc" 2>/dev/null || true
     done
     rm -rf "$WORK"
@@ -95,7 +94,7 @@ source "$ROOT/scripts/test-keychain-lib.sh"
 # sign DST [extra -o flags]: a copy of the binary under test, signed with it.
 sign() {
     cp "$SPICEIO_BIN" "$1"
-    listed "$SIGNING_KC" setup "sign $1" codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" \
+    signing "$SIGNING_KC" setup "sign $1" codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" \
         -i ai.spice.spiceio -o "runtime${2:+,$2}" --timestamp=none "$1" || {
         signing_diagnostics "$SIGNING_KC"
         return 1
@@ -557,7 +556,7 @@ check "exits 0" [ "$RC" -eq 0 ]
 check "says why not" has "is ad-hoc"
 check "the password stays in the plist" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
 
-check "leaves the keychain search list as it found it" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
+check "leaves the keychain search list as it found it" search_list_kept "$SEARCH_LIST_BEFORE" "$WORK"
 
 echo ""
 echo "agent-install: $PASS passed, $FAIL failed"

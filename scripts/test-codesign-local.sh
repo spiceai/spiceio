@@ -4,9 +4,10 @@
 # another build signed with the same identity, and by nothing else.
 #
 # Everything happens in throwaway keychain files under a temp directory; the
-# login keychain is never touched. A signing keychain is on the search list
-# only while something signs with it, and the run checks the list is left as
-# it was found.
+# login keychain is never touched, and neither is the user's keychain search
+# list: codesign finds the signing keychain through a private one (HOME set
+# to a scratch directory while it signs), and the run checks the user's list
+# is left exactly as it was found.
 # Password prompts are answered through a pseudo-terminal (python3 pty), the
 # way a person at a terminal would. No step can raise a keychain dialog: the
 # script checks lock state with `spiceio --keychain-status` before codesign
@@ -28,7 +29,6 @@ SEARCH_LIST_BEFORE=$(security list-keychains -d user)
 cleanup() {
     for kc in "$WORK"/*.keychain-db; do
         [[ -e "$kc" ]] || continue
-        unlist "$kc" 2>/dev/null || true
         security delete-keychain "$kc" 2>/dev/null || true
     done
     rm -rf "$WORK"
@@ -94,7 +94,7 @@ cdhash() { codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
 mode_of() { stat -f '%Lp' "$1"; }
 
 echo "--- first run creates the signing keychain and identity, then signs"
-run_tty "$PW" env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/a"
+run_tty "$PW" env TMPDIR="$WORK" SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/a"
 [ "$RC" -eq 0 ] || signing_diagnostics "$KC"
 check "exits 0" [ "$RC" -eq 0 ]
 check "asks for a new password (and to retype it)" has "retype password for new keychain"
@@ -105,7 +105,8 @@ check "the signature verifies" codesign --verify --strict "$WORK/a"
 check "says what it signed with" has "signed $WORK/a: identifier \"ai.spice.spiceio\""
 check "locks the keychain when done" [ "$(state "$KC")" = locked ]
 off_search_list() { ! security list-keychains -d user | grep -qF "$1"; }
-check "takes it off the keychain search list again" off_search_list "$KC"
+check "never puts it on your keychain search list" off_search_list "$KC"
+check "and leaves no private search list behind" [ -z "$(find "$WORK" -maxdepth 1 -name 'spiceio-sign.*')" ]
 security unlock-keychain -p "$PW" "$KC"
 # Read the key's attributes rather than attempt an export: an export is
 # checked against the key's ACL first, and that raises a dialog (it did, on
@@ -147,24 +148,28 @@ check "asks for nothing" lacks "assword"
 check "locked again" [ "$(state "$KC")" = locked ]
 
 echo "--- the keychain named through a symlinked path"
-# security prints resolved paths; the script must still take it off the list.
+# security prints resolved paths (/private/var/… for /var/…); the private
+# list's read-back must accept either spelling.
 security unlock-keychain -p "$PW" "$KC"
 ALIAS=${KC#/private}
 [[ "$ALIAS" != "$KC" && -e "$ALIAS" ]] || ALIAS="$KC" # no /private prefix here: same path
 run env SIGNING_KEYCHAIN="$ALIAS" sh "$SIGN" "$SPICEIO_BIN" "$WORK/aliased"
 check "exits 0" [ "$RC" -eq 0 ]
-check "leaves the search list as it was" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
+check "leaves the search list as it was" search_list_kept "$SEARCH_LIST_BEFORE" "$WORK"
 check "locked again" [ "$(state "$KC")" = locked ]
 
-echo "--- a signing keychain already on the search list stays there"
-security list-keychains -d user -s $(security list-keychains -d user | tr -d '"') "$KC"
+echo "--- the caller's search list, whatever it holds, is left exactly as it was"
+# A stand-in for the user's: HOME is a scratch directory whose list names the
+# signing keychain and one other entry, so this edits no real search list.
+USER_HOME="$WORK/userhome"
+mkdir -p "$USER_HOME/Library/Preferences"
+HOME=$USER_HOME security list-keychains -d user -s "$WORK/other.keychain-db" "$KC"
+LIST_BEFORE=$(HOME=$USER_HOME security list-keychains -d user)
 security unlock-keychain -p "$PW" "$KC"
-run env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/prelisted"
+run env HOME="$USER_HOME" SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/prelisted"
 check "exits 0" [ "$RC" -eq 0 ]
-on_search_list() { security list-keychains -d user | grep -qF "$1"; }
-check "and leaves the entry it found" on_search_list "$KC"
-unlist "$KC"
-check "taken off again by the test" off_search_list "$KC"
+check "the list is unchanged" [ "$(HOME=$USER_HOME security list-keychains -d user)" = "$LIST_BEFORE" ]
+check "and still names the signing keychain" grep -qF "$KC" <<<"$LIST_BEFORE"
 
 echo "--- no signing keychain and no terminal"
 run env SIGNING_KEYCHAIN="$WORK/none.keychain-db" sh "$SIGN" "$SPICEIO_BIN" "$WORK/d"
@@ -246,7 +251,7 @@ cp "$WORK/a" "$WORK/rebuilt"
 # A rebuild changes the cdhash; so does a different CodeDirectory flag, which
 # is how this stands in for one without recompiling. The keychain checks the
 # designated requirement, which names the identity, not the cdhash.
-listed "$KC" cs -f -s "$HASH" --keychain "$KC" -i ai.spice.spiceio -o runtime,kill --timestamp=none "$WORK/rebuilt" ||
+signing "$KC" cs -f -s "$HASH" --keychain "$KC" -i ai.spice.spiceio -o runtime,kill --timestamp=none "$WORK/rebuilt" ||
     { signing_diagnostics "$KC"; exit 1; }
 security lock-keychain "$KC"
 check "its cdhash differs" [ "$(cdhash "$WORK/rebuilt")" != "$(cdhash "$WORK/a")" ]
@@ -337,7 +342,7 @@ run env -i PATH=/usr/bin:/bin SPICEIO_SMB_PASS=inline "$WORK/a" --check-smb-pass
 check "an inline password still works" [ "$RC" -eq 0 ]
 check "and is reported as such" has "SMB password: SPICEIO_SMB_PASS (environment)"
 
-check "leaves the keychain search list as it found it" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
+check "leaves the keychain search list as it found it" search_list_kept "$SEARCH_LIST_BEFORE" "$WORK"
 
 echo ""
 echo "codesign-local: $PASS passed, $FAIL failed"

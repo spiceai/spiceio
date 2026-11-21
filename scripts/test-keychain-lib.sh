@@ -1,36 +1,35 @@
 # Keychain helpers shared by scripts/test-agent-install.sh and
 # scripts/test-codesign-local.sh (bash; sourced, not run).
 
-# listed KC CMD...: run CMD with keychain KC on the user's search list, as
-# codesign-local.sh does while it signs (codesign finds a --keychain identity
-# only through the list in some sessions, such as the CI runner's). The list
-# is re-read before taking KC off again, so other changes survive.
-listed() {
-    local kc=$1 rc=0 k
+# signing KC CMD...: run CMD (codesign, or a function that runs it) as
+# codesign-local.sh does: with HOME a private directory whose keychain search
+# list holds KC alone (codesign finds a --keychain identity only through the
+# list in some sessions, such as the CI runner's). The user's own search list
+# is never edited.
+signing() {
+    local kc=$1 home rc=0
     shift
-    local list=()
-    while IFS= read -r k; do
-        k=${k#*\"}
-        k=${k%\"*}
-        [[ -n "$k" ]] && list+=("$k")
-    done < <(security list-keychains -d user)
-    security list-keychains -d user -s "${list[@]}" "$kc"
-    "$@" || rc=$?
-    unlist "$kc"
+    home=$(mktemp -d "${TMPDIR:-/tmp}/spiceio-sign.XXXXXX")
+    mkdir -p "$home/Library/Preferences"
+    HOME=$home security list-keychains -d user -s "$kc"
+    HOME=$home "$@" || rc=$?
+    rm -f "$home/Library/Preferences/com.apple.security.plist"
+    rmdir "$home/Library/Preferences" "$home/Library" "$home"
     return $rc
 }
-# unlist KC: take KC off the user's search list, in either spelling
-# (`security list-keychains` prints /private/var/… for /var/…).
-unlist() {
-    local kc=$1 real k
-    real=$(cd "$(dirname "$kc")" 2>/dev/null && pwd -P)/$(basename "$kc")
-    local list=()
-    while IFS= read -r k; do
-        k=${k#*\"}
-        k=${k%\"*}
-        [[ -n "$k" && "$k" != "$kc" && "$k" != "$real" ]] && list+=("$k")
-    done < <(security list-keychains -d user)
-    security list-keychains -d user -s "${list[@]}"
+# search_list_kept BEFORE DIR: the user's keychain search list still holds
+# every entry of BEFORE (what it printed when the run began), and no keychain
+# under DIR. Entries another process adds meanwhile do not fail it: the CI
+# runner is shared, and a list compared whole failed a run for a change this
+# one never made. Sets OUT to both lists, so a failing check shows them.
+search_list_kept() {
+    local now line
+    now=$(security list-keychains -d user)
+    OUT=$(printf 'before:\n%s\nnow:\n%s' "$1" "$now")
+    while IFS= read -r line; do
+        [[ -z "$line" ]] || grep -qxF -- "$line" <<<"$now" || return 1
+    done <<<"$1"
+    ! grep -qF -- "$2" <<<"$now"
 }
 # signing_diagnostics KC: what to look at when signing with KC fails.
 signing_diagnostics() {

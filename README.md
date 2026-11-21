@@ -359,9 +359,9 @@ attach to spiceio or inject a library into it to read the password from memory.
 
 **The signing key is locked away.** Anything signed with that key can read the
 password, so the key lives in its own keychain
-(`~/Library/Keychains/spiceio-signing.keychain-db`, `SIGNING_KEYCHAIN=`), on
-the keychain search list only while install signs, with its own password, locked except while install
-signs. The key pair is generated inside that keychain, non-extractable from
+(`~/Library/Keychains/spiceio-signing.keychain-db`, `SIGNING_KEYCHAIN=`),
+never on your keychain search list, with its own password, locked except while
+install signs. The key pair is generated inside that keychain, non-extractable from
 the start, and spiceio signs its certificate itself, so the private key is
 never in a file. The first `make install`
 creates it and asks you to choose that password (twice, then once more to let

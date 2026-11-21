@@ -63,11 +63,11 @@ kc=$SIGNING_KEYCHAIN
 staged=""
 relock=0
 signed=0
-listed=0
 created=0
+sign_home=""
 cleanup() {
     [ -z "$staged" ] || rm -f "$staged"
-    search_list_remove
+    drop_sign_home
     [ "$relock" = 0 ] || security lock-keychain "$kc" 2>/dev/null
     # A keychain this run created but could not finish (an exportable key,
     # say) must not be picked up by the next install as a working one.
@@ -77,47 +77,30 @@ cleanup() {
 # codesign finds a `--keychain` identity only through the keychain search
 # list in some sessions: on a CI runner it answered "no identity found" for
 # a keychain named with --keychain but not on the list, where a login session
-# signs fine. So the signing keychain goes on the list for the signature and
-# comes off again, and only if this run put it there: an entry that was
-# already on the list stays. Removal re-reads the list instead of restoring a
-# snapshot, so an entry someone else adds meanwhile survives. Paths may hold
-# spaces, so the list is carried in "$@", never in a word-split string.
-# `security list-keychains` prints resolved paths (/private/var/… for
-# /var/…), so entries are compared against both spellings of the keychain.
-kc_real=""
-
-# The user's keychain search list, one path per line, quotes removed.
-search_list() {
-    security list-keychains -d user | while IFS= read -r line; do
-        line=${line#*\"}
-        printf '%s\n' "${line%\"*}"
-    done
+# signs fine. The user's own list is never edited for it, not even briefly:
+# other processes running as the user would see the signing keychain come and
+# go (a test that compares the list before and after, another install). codesign
+# runs with HOME set to a private directory instead. Security keeps the search
+# list in $HOME/Library/Preferences/com.apple.security.plist, so that
+# directory's list holds the signing keychain alone and the user's list never
+# changes (measured: under an empty private HOME the list reads empty, setting
+# it writes only the private file, and codesign then signs).
+make_sign_home() {
+    sign_home=$(mktemp -d "${TMPDIR:-/tmp}/spiceio-sign.XXXXXX") || die "cannot create a private keychain search list"
+    mkdir "$sign_home/Library" "$sign_home/Library/Preferences" || die "cannot create a private keychain search list"
+    # If Security ignored HOME, setting the list below would replace the
+    # user's own. An empty private HOME must read an empty list first.
+    [ -z "$(HOME=$sign_home security list-keychains -d user)" ] ||
+        die "security does not read the keychain search list from HOME here; not signing (it would edit your search list)"
+    HOME=$sign_home security list-keychains -d user -s "$kc" || die "cannot set a private keychain search list"
+    HOME=$sign_home security list-keychains -d user | grep -Fq -e "$kc" -e "$(cd "$(dirname "$kc")" && pwd -P)/$(basename "$kc")" ||
+        die "the private keychain search list does not hold $kc"
 }
-
-search_list_add() {
-    kc_real=$(cd "$(dirname "$kc")" && pwd -P)/$(basename "$kc")
-    list=$(search_list)
-    printf '%s\n' "$list" | grep -Fxq -e "$kc" -e "$kc_real" && return 0
-    set --
-    while IFS= read -r line; do
-        [ -z "$line" ] || set -- "$@" "$line"
-    done <<EOF
-$list
-EOF
-    security list-keychains -d user -s "$@" "$kc" || die "cannot add $kc to the keychain search list"
-    listed=1
-}
-
-search_list_remove() {
-    [ "$listed" = 1 ] || return 0
-    set --
-    while IFS= read -r line; do
-        [ -z "$line" ] || [ "$line" = "$kc" ] || [ "$line" = "$kc_real" ] || set -- "$@" "$line"
-    done <<EOF
-$(search_list)
-EOF
-    security list-keychains -d user -s "$@" 2>/dev/null
-    listed=0
+drop_sign_home() {
+    [ -n "$sign_home" ] || return 0
+    rm -f "$sign_home/Library/Preferences/com.apple.security.plist"
+    rmdir "$sign_home/Library/Preferences" "$sign_home/Library" "$sign_home" 2>/dev/null
+    sign_home=""
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -243,10 +226,10 @@ stage
 # self-signed signature. -o runtime: the hardened runtime, so no other
 # process running as you can attach to spiceio or inject a library into it to
 # read the password from its memory.
-search_list_add
-codesign -f -s "$hash" --keychain "$kc" -i "$IDENTIFIER" -o runtime --timestamp=none "$staged" ||
+make_sign_home
+HOME=$sign_home codesign -f -s "$hash" --keychain "$kc" -i "$IDENTIFIER" -o runtime --timestamp=none "$staged" ||
     die "codesign failed"
-search_list_remove
+drop_sign_home
 codesign --verify --strict "$staged" || die "the signature on $staged does not verify"
 publish
 requirement=$(codesign -d -r- "$DST" 2>&1 | sed -n 's/^designated => //p')
