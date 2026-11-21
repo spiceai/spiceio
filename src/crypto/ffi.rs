@@ -95,6 +95,19 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+unsafe extern "C" {
+    // libSystem's CSPRNG: never fails, never blocks.
+    fn arc4random_buf(buf: *mut u8, nbytes: usize);
+}
+
+/// `N` bytes from the system CSPRNG (`arc4random_buf`).
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    // SAFETY: `buf` is writable for `N` bytes.
+    unsafe { arc4random_buf(buf.as_mut_ptr(), N) };
+    buf
+}
+
 /// Compute MD4 digest. Used in NTLM password hashing (always small inputs).
 pub fn md4(data: &[u8]) -> [u8; 16] {
     // CommonCrypto takes a 32-bit length; callers only ever pass small buffers.

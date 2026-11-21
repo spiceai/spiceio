@@ -30,7 +30,7 @@ doc:
 lint: fmt-check check clippy doc
 
 # Unit tests only (no SMB).
-test-unit: test-clean-unit test-setup-action test-agent-install
+test-unit: test-clean-unit test-setup-action test-agent-install test-codesign-local
 	# --features loadgen so spiceio-loadgen and spiceio-sccache-nas tests run:
 	# loadgen's status classifier, and the NAS durability checker's path /
 	# listing / digest tests (no SMB). They would silently not compile without it.
@@ -39,10 +39,19 @@ test-unit: test-clean-unit test-setup-action test-agent-install
 # `make install`'s launchd half and the sccache-spiceio wrapper, against a
 # stubbed launchctl: plist edits, key creation, reload-vs-kickstart, and the
 # post-restart auth check. Touches no real agent.
-.PHONY: test-agent-install
+.PHONY: install-locked test-agent-install
 test-agent-install:
 	cargo build --locked --bin spiceio
 	bash scripts/test-agent-install.sh target/debug/spiceio
+
+# `make install`'s signing step (scripts/codesign-local.sh) and the keychain-
+# backed SMB password end to end: an item one signed build stores is readable
+# by another build with the same identity and by nothing else. Throwaway
+# keychains only; prompts are answered on a pseudo-terminal.
+.PHONY: test-codesign-local
+test-codesign-local:
+	cargo build --locked --bin spiceio
+	bash scripts/test-codesign-local.sh target/debug/spiceio
 
 # Setup-action download helper (no gh / curl-to-GitHub). Includes the
 # two-server check that Authorization is not forwarded on a host change.
@@ -131,6 +140,22 @@ RESTART_AGENT ?= 1
 # a fresh key if it does not exist. A file that exists is never rewritten.
 AGENT_AUTH ?= enforce
 S3_CREDENTIALS_FILE ?= $(HOME)/.config/spiceio/credentials
+# The agent's SMB password lives in the keychain, not its plist.
+# AGENT_SMB_PASS=keychain moves a password found in the plist into the
+# keychain item SPICEIO_SMB_PASS_KEYCHAIN names (default
+# ai.spice.spiceio.smb); keep leaves it where it is.
+AGENT_SMB_PASS ?= keychain
+# A keychain item can be read only by binaries whose signature satisfies the
+# requirement of the one that stored it, so install signs every build with
+# one local, self-signed identity kept in its own keychain (see
+# scripts/codesign-local.sh). The first install creates both and asks you to
+# choose that keychain's password; later installs ask for it once (or not at
+# all, if you unlocked it with `security unlock-keychain`). CODESIGN=adhoc
+# skips it, and then nothing the binary stores in the keychain survives the
+# next build: install will not move the password there, and refuses to
+# install an ad-hoc build over an agent that already reads it from there.
+CODESIGN ?= local
+SIGNING_KEYCHAIN ?= $(HOME)/Library/Keychains/spiceio-signing.keychain-db
 
 # The dSYM is installed alongside the binary the way the release tarball ships
 # it: release builds are stripped, so without it a crash report from the
@@ -145,14 +170,37 @@ S3_CREDENTIALS_FILE ?= $(HOME)/.config/spiceio/credentials
 #
 # sccache-spiceio is sccache with the agent's key, for RUSTC_WRAPPER (see the
 # script). scripts/agent-install.sh does the launchd half: it sets the
-# agent's SigV4 settings in its plist, restarts it (a reload if the plist
-# changed, since kickstart keeps the old environment), then reports where it
+# agent's SigV4 settings in its plist, moves its SMB password from the plist
+# into the keychain, restarts it (a reload if the plist changed, since
+# kickstart keeps the old environment), then reports where it
 # listens and checks that an unsigned request is refused and a request
 # signed through sccache-spiceio is served. It never chooses a listen
 # address; it warns when the agent's SPICEIO_BIND is reachable beyond this host.
+#
+# The binary is signed as a staged copy beside the installed one, checked
+# (`agent-install.sh --preflight`: can it read the agent's SMB password?) and
+# only then renamed over it. A rename replaces the target atomically, like
+# install(1), and a failed signature or check leaves the old binary in place.
+# The staged copy has a name unique to this run (mktemp), and signing, the
+# check and the rename happen in one shell, so a concurrent `make install`
+# cannot swap in a build between this one's check and its rename. The whole
+# install runs holding this user's install lock (scripts/install-lock.sh), so
+# a concurrent one waits instead of editing the agent's plist, moving its
+# password or restarting it at the same time.
 install: release
+	@./scripts/install-lock.sh $(MAKE) --no-print-directory install-locked
+
+# The install itself; `make install` runs it holding the lock.
+install-locked:
 	install -d "$(BINDIR)"
-	install -m 0755 target/release/spiceio "$(BINDIR)/spiceio"
+	@set -e; \
+	  staged=$$(mktemp "$(BINDIR)/.spiceio.XXXXXX"); \
+	  trap 'rm -f "$$staged"' EXIT; \
+	  CODESIGN="$(CODESIGN)" SIGNING_KEYCHAIN="$(SIGNING_KEYCHAIN)" \
+	    ./scripts/codesign-local.sh target/release/spiceio "$$staged"; \
+	  BINDIR="$(BINDIR)" LAUNCHD_LABEL="$(LAUNCHD_LABEL)" \
+	    ./scripts/agent-install.sh --preflight "$$staged"; \
+	  mv -f "$$staged" "$(BINDIR)/spiceio"
 	install -m 0755 scripts/sccache-spiceio "$(BINDIR)/sccache-spiceio"
 	rm -rf "$(BINDIR)/spiceio.dSYM.new"
 	cp -RL target/release/spiceio.dSYM "$(BINDIR)/spiceio.dSYM.new"
@@ -165,12 +213,15 @@ install: release
 	esac
 	@BINDIR="$(BINDIR)" LAUNCHD_LABEL="$(LAUNCHD_LABEL)" RESTART_AGENT="$(RESTART_AGENT)" \
 	  AGENT_AUTH="$(AGENT_AUTH)" S3_CREDENTIALS_FILE="$(S3_CREDENTIALS_FILE)" \
+	  AGENT_SMB_PASS="$(AGENT_SMB_PASS)" \
 	  ./scripts/agent-install.sh
 
-# Removes what `install` wrote. Leaves the launchd agent, its config, its log
-# and the credentials file alone. Those are configuration, not ours to remove:
-# a bootout would be a surprise from uninstalling the binary, and deleting
-# the key would lock out every client that signs with it.
+# Removes what `install` wrote. Leaves the launchd agent, its config, its log,
+# the credentials file, the signing keychain and the SMB password's keychain
+# item alone. Those are configuration, not ours to remove: a bootout would be
+# a surprise from uninstalling the binary, deleting the key would lock out
+# every client that signs with it, and deleting the signing identity would
+# strand the keychain item (no later build could read it).
 uninstall:
 	rm -f "$(BINDIR)/spiceio" "$(BINDIR)/sccache-spiceio"
 	rm -rf "$(BINDIR)/spiceio.dSYM"

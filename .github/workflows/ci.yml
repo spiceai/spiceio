@@ -20,6 +20,9 @@ jobs:
     # Skip fork PRs to prevent untrusted code execution on self-hosted runners.
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: spiceai-macos
+    # The NAS password is a secret of the `ci` environment (SMB_PASSWORD), so
+    # the job has to name the environment to read it.
+    environment: ci
     permissions:
       contents: read
     env:
@@ -99,12 +102,19 @@ jobs:
         run: mkdir -p "${{ github.workspace }}/crash-logs"
 
       - name: Check SMB credentials
+        # Fail, never skip. Fork PRs never reach this job (the job-level `if`),
+        # so every run here is one whose live suites must run. Skipping on a
+        # missing password hid a broken secret reference: the workflow read a
+        # repo secret, UNAS_SMB_PASS, that no longer existed, and from
+        # 2026-10-06 every PR passed CI without the live suites.
         run: |
-          if [[ -n "$SPICEIO_SMB_PASS" ]]; then
-            echo "HAS_SMB_PASS=true" >> "$GITHUB_ENV"
+          if [[ -z "$SPICEIO_SMB_PASS" ]]; then
+            echo "::error::secrets.SMB_PASSWORD (environment 'ci') is empty or unavailable; the live SMB suites cannot run"
+            exit 1
           fi
+          echo "HAS_SMB_PASS=true" >> "$GITHUB_ENV"
         env:
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
 
       - name: Install AWS CLI
         if: ${{ env.HAS_SMB_PASS == 'true' }}
@@ -130,12 +140,13 @@ jobs:
           done
 
       - name: Run sccache integration test
-        # Skipped when UNAS_SMB_PASS secret is not configured (e.g. fork PRs)
+        # Runs whenever the job does: "Check SMB credentials" fails the job
+        # without the password, and fork PRs never start it.
         if: ${{ env.HAS_SMB_PASS == 'true' }}
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
           SPICEIO_BUCKET: ${{ vars.SPICEIO_BUCKET || 'spiceio' }}
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
@@ -150,7 +161,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
           SPICEIO_BUCKET: extended
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
@@ -164,7 +175,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
         run: python3 scripts/test-conditional.py
 
@@ -177,7 +188,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
           SPICEIO_BUCKET: writeback
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
@@ -194,7 +205,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
           SPICEIO_BUCKET: stress
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}
@@ -211,7 +222,7 @@ jobs:
         env:
           SPICEIO_SMB_SERVER: ${{ vars.SPICEIO_SMB_SERVER || '192.168.3.148' }}
           SPICEIO_SMB_USER: ${{ vars.SPICEIO_SMB_USER || 'runner' }}
-          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_PASS: ${{ secrets.SMB_PASSWORD }}
           SPICEIO_SMB_SHARE: ${{ vars.SPICEIO_SMB_SHARE || 'ai_platform_dev' }}
           SPICEIO_BUCKET: auth
           SPICEIO_REGION: ${{ vars.SPICEIO_REGION || 'us-west-1' }}

@@ -25,9 +25,11 @@ pub mod crash;
 pub mod crypto;
 pub mod http;
 pub mod instance;
+pub mod keychain;
 pub mod otel;
 pub mod s3;
 pub mod smb;
+pub mod smb_password;
 
 #[cfg(test)]
 pub(crate) mod test_support;

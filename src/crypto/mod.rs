@@ -6,5 +6,6 @@
 mod ffi;
 
 pub use ffi::{
-    Sha256, aes128_cmac, aes128_cmac_parts, hex_encode, hmac_md5, hmac_sha256, md4, sha256, sha512,
+    Sha256, aes128_cmac, aes128_cmac_parts, hex_encode, hmac_md5, hmac_sha256, md4, random_bytes,
+    sha256, sha512,
 };

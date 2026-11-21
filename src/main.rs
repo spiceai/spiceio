@@ -19,6 +19,7 @@ use spiceio::s3;
 use spiceio::serr;
 use spiceio::slog;
 use spiceio::smb;
+use spiceio::smb_password;
 
 use s3::multipart::MultipartStore;
 use s3::object_cache::ObjectCache;
@@ -39,7 +40,8 @@ struct Config {
     smb_port: u16,
     /// SMB username
     smb_username: String,
-    /// SMB password
+    /// SMB password, from `SPICEIO_SMB_PASS` or the keychain item named by
+    /// `SPICEIO_SMB_PASS_KEYCHAIN` (see `smb_password`)
     smb_password: String,
     /// SMB domain (default empty)
     smb_domain: String,
@@ -121,8 +123,39 @@ fn parse_env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     }
 }
 
+/// Resolve the SMB password the way `--check-smb-password` does, or exit
+/// with the reason. A keychain that is locked or will not let this binary
+/// read the item is a configuration error, like a missing variable: it never
+/// fixes itself, so retrying it behind a 503 would only hide it.
+fn load_smb_password(settings: &smb_password::Settings) -> String {
+    let loaded = smb_password::Source::resolve(settings)
+        .and_then(|source| source.load().map(|password| (source, password)));
+    match loaded {
+        Ok((source, password)) => {
+            slog!("[spiceio] SMB password: {}", source.describe());
+            password
+        }
+        Err(e) => {
+            serr!("[spiceio] SMB password: {e}");
+            flush_and_exit(1);
+        }
+    }
+}
+
 impl Config {
     fn from_env() -> Self {
+        require_env("SPICEIO_SMB_SERVER");
+        require_env("SPICEIO_SMB_USER");
+        // The same parser `--check-smb-password` and `--store-smb-password`
+        // use, so startup connects to (and looks up the keychain item for)
+        // exactly the destination they check. A port that does not parse is
+        // an error here as there, not a silent fallback to 445.
+        let settings = smb_password::Settings::from_env();
+        let dest = settings.destination().unwrap_or_else(|e| {
+            serr!("[spiceio] {e}");
+            flush_and_exit(1);
+        });
+        let smb_password = load_smb_password(&settings);
         Self {
             bind_addr: match env::var("SPICEIO_BIND") {
                 Err(_) => DEFAULT_BIND,
@@ -137,11 +170,11 @@ impl Config {
                     }
                 },
             },
-            smb_server: require_env("SPICEIO_SMB_SERVER"),
-            smb_port: parse_env_or("SPICEIO_SMB_PORT", 445),
-            smb_username: require_env("SPICEIO_SMB_USER"),
-            smb_password: require_env("SPICEIO_SMB_PASS"),
-            smb_domain: env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
+            smb_server: dest.server,
+            smb_port: dest.port,
+            smb_username: dest.user,
+            smb_password,
+            smb_domain: dest.domain,
             smb_share: require_env("SPICEIO_SMB_SHARE"),
             bucket_name: env::var("SPICEIO_BUCKET").unwrap_or_else(|_| {
                 env::var("SPICEIO_SMB_SHARE").unwrap_or_else(|_| "data".into())
@@ -426,7 +459,33 @@ fn sweep_interval(stats: &spill::SweepStats) -> Duration {
 
 #[tokio::main]
 async fn main() {
-    if env::args().any(|a| a == "--version" || a == "-V") {
+    let args: Vec<String> = env::args().collect();
+    // A command is the first argument, never one found anywhere in argv: the
+    // password commands take values, and a value that happens to read like a
+    // command (`--service --version`) must not run that command instead and
+    // exit 0 having done nothing that was asked. A command flag later on with
+    // no command first is refused for the same reason.
+    const COMMANDS: &[&str] = &[
+        "--version",
+        "-V",
+        "--check-auth",
+        "--check-smb-password",
+        "--store-smb-password",
+        "--create-signing-identity",
+        "--keychain-status",
+    ];
+    let command = args
+        .get(1)
+        .map(String::as_str)
+        .filter(|a| COMMANDS.contains(a));
+    if command.is_none()
+        && let Some(flag) = args.iter().skip(2).find(|a| COMMANDS.contains(&a.as_str()))
+    {
+        eprintln!("{flag} must be the first argument");
+        std::process::exit(2);
+    }
+    let has = |flag: &str| command == Some(flag);
+    if has("--version") || has("-V") {
         println!("spiceio {}", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -436,7 +495,7 @@ async fn main() {
     // else (no SMB, no listener, no log file). `make install` runs it with
     // the agent's settings before restarting the agent, so a credentials file
     // the server would refuse stops the install instead of the agent.
-    if env::args().any(|a| a == "--check-auth") {
+    if has("--check-auth") {
         match s3::auth::Authenticator::from_env() {
             Ok(auth) => println!("S3 auth: {}", auth_summary(&auth)),
             Err(e) => {
@@ -445,6 +504,68 @@ async fn main() {
             }
         }
         return;
+    }
+
+    // `--check-smb-password`: resolve the SMB password from the environment
+    // (or the keychain item it names) exactly as startup does, say where it
+    // came from, and exit. Like `--check-auth`, it touches nothing else.
+    // `make install` runs it with the agent's settings, so a binary that
+    // cannot read the keychain item stops the install instead of the agent.
+    if has("--check-smb-password") {
+        std::process::exit(smb_password::check_command(&args));
+    }
+    // `--store-smb-password [--server H] [--user U] [--domain D] [--port P]
+    // [--service S]`: put the SMB password for that server and user into the
+    // keychain (read from the terminal or stdin, never from argv). Flags left
+    // out fall back to their SPICEIO_SMB_* variables.
+    if has("--store-smb-password") {
+        std::process::exit(smb_password::store_command(&args));
+    }
+    // Hidden: `--create-signing-identity <keychain> <common name>` makes the
+    // code-signing identity `scripts/codesign-local.sh` signs with: the key
+    // pair is generated inside the keychain (non-extractable), and the
+    // self-signed certificate is built and signed here, so the private key
+    // is never written anywhere. /usr/bin/codesign may use the key.
+    {
+        if has("--create-signing-identity") {
+            let (Some(keychain), Some(name)) = (args.get(2), args.get(3)) else {
+                eprintln!("--create-signing-identity needs a keychain path and a common name");
+                std::process::exit(2);
+            };
+            match spiceio::keychain::create_signing_identity(
+                std::path::Path::new(keychain),
+                name,
+                &[std::path::Path::new("/usr/bin/codesign")],
+                3650,
+            ) {
+                Ok(()) => println!("created signing identity \"{name}\" in {keychain}"),
+                Err(e) => {
+                    eprintln!("creating the signing identity in {keychain}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+    }
+    // Hidden: `--keychain-status <path>` prints `locked` or `unlocked`
+    // without prompting. `make install` asks before signing, because
+    // codesign would raise an unlock dialog for a locked keychain.
+    {
+        if has("--keychain-status") {
+            let Some(path) = args.get(2) else {
+                eprintln!("--keychain-status needs a keychain path");
+                std::process::exit(2);
+            };
+            match spiceio::keychain::keychain_unlocked(std::path::Path::new(path)) {
+                Ok(true) => println!("unlocked"),
+                Ok(false) => println!("locked"),
+                Err(e) => {
+                    eprintln!("keychain {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
     }
 
     // Treat an empty SPICEIO_LOG_FILE as unset: CI and the test scripts may
@@ -464,7 +585,6 @@ async fn main() {
     // Hidden: `--crash-test <panic|segv|abort>` deliberately crashes through
     // the real pipeline so the reporting path itself is testable end-to-end.
     {
-        let args: Vec<String> = env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--crash-test") {
             let mode = args.get(i + 1).map(String::as_str).unwrap_or("panic");
             crash::crash_test(mode);

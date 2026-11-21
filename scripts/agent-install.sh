@@ -4,12 +4,23 @@
 #   1. Wire SigV4 into the agent. Create an access key if the agent has no
 #      credentials file yet, then set SPICEIO_S3_CREDENTIALS_FILE and
 #      SPICEIO_S3_AUTH in the agent's plist.
-#   2. Restart the agent on the new binary. If its plist environment differs
+#   2. Move the agent's SMB password out of its plist and into the keychain:
+#      store it with the installed (signed) `spiceio --store-smb-password`,
+#      prove the agent could read it with `--check-smb-password`, then
+#      replace SPICEIO_SMB_PASS with SPICEIO_SMB_PASS_KEYCHAIN.
+#   3. Restart the agent on the new binary. If its plist environment differs
 #      from what launchd loaded, reload it instead (kickstart reuses the
 #      loaded definition).
-#   3. Report where it listens and check what it accepts: an unsigned request
+#   4. Report where it listens and check what it accepts: an unsigned request
 #      should be refused, and a request signed through sccache-spiceio
 #      should be served.
+#
+#   agent-install.sh --preflight BIN
+#
+# checks, before `make install` puts BIN in place, that BIN can read the
+# agent's SMB password from the keychain (when the agent takes it from
+# there). A build that cannot would leave the agent unable to start, so the
+# install stops and the running binary stays.
 #
 # Settings come from the environment (the Makefile passes all of them):
 #
@@ -19,26 +30,42 @@
 #   AGENT_AUTH           enforce | log | off: the SPICEIO_S3_AUTH to set.
 #                        keep: leave the agent's auth settings and key alone
 #   S3_CREDENTIALS_FILE  the key file to use when the agent names none
+#   AGENT_SMB_PASS       keychain (default): move an SMB password in the plist
+#                        into the keychain. keep: leave it where it is
+#   SMB_PASS_KEYCHAIN_SERVICE  the keychain service to use when the plist names
+#                        none (ai.spice.spiceio.smb)
 #   AGENT_WAIT_SECS      how long to wait for the agent to listen, and then for
 #                        SMB to come up, before giving up on the check (30)
 #
 # Install only fills in what is missing. It never rewrites a credentials file,
 # and it never repoints an agent that already names one: other clients may
-# sign with the keys in it. The plist holds the SMB password, so it is edited
-# on a copy in its own directory and renamed into place. A failed edit leaves
-# the original intact, and the copy keeps the original's mode.
+# sign with the keys in it. The plist can hold the SMB password, so it is
+# edited on a copy in its own directory and renamed into place. A failed edit
+# leaves the original intact, and the copy keeps the original's mode. The
+# password itself only ever travels through a pipe, from plutil to spiceio:
+# never through a shell variable, an argument list or the output.
 #
 # Exit status: nonzero when a restart fails, when the new auth configuration
 # would stop the agent from starting (checked with `spiceio --check-auth`
-# first, so the running agent is left alone), or when the check shows the
+# first, so the running agent is left alone), when the agent's SMB password
+# cannot be stored in or read from the keychain, or when the check shows the
 # agent does not behave the way AGENT_AUTH asked. "Not listening yet" and
 # "SMB still connecting" are notes, not failures.
 set -u
+
+# One install at a time for this user (scripts/install-lock.sh): two runs
+# editing the plist, moving the password and restarting the agent at once
+# could leave it with neither a password nor a keychain item. `make install`
+# already holds the lock; run on its own, the script takes it.
+[ -n "${SPICEIO_INSTALL_LOCK_HELD:-}" ] ||
+    exec /bin/sh "$(dirname "$0")/install-lock.sh" /bin/sh "$0" "$@"
 
 : "${BINDIR:?}" "${LAUNCHD_LABEL:?}"
 RESTART_AGENT="${RESTART_AGENT:-1}"
 AGENT_AUTH="${AGENT_AUTH:-enforce}"
 S3_CREDENTIALS_FILE="${S3_CREDENTIALS_FILE:-$HOME/.config/spiceio/credentials}"
+AGENT_SMB_PASS="${AGENT_SMB_PASS:-keychain}"
+SMB_PASS_KEYCHAIN_SERVICE="${SMB_PASS_KEYCHAIN_SERVICE:-ai.spice.spiceio.smb}"
 AGENT_WAIT_SECS="${AGENT_WAIT_SECS:-30}"
 
 uid=$(id -u)
@@ -58,6 +85,10 @@ die() {
 case "$AGENT_AUTH" in
 enforce | log | off | keep) ;;
 *) die "AGENT_AUTH=$AGENT_AUTH: expected enforce, log, off or keep" ;;
+esac
+case "$AGENT_SMB_PASS" in
+keychain | keep) ;;
+*) die "AGENT_SMB_PASS=$AGENT_SMB_PASS: expected keychain or keep" ;;
 esac
 
 # `launchctl print` of the loaded job, or failure when none is loaded.
@@ -162,6 +193,21 @@ check_auth() {
 }
 
 # Set SPICEIO_S3_CREDENTIALS_FILE and SPICEIO_S3_AUTH in the agent's plist.
+# edit_plist FILE NOTE EDIT: run EDIT (a function, given the copy's path) on a
+# copy of FILE in FILE's own directory, lint the copy, then rename it over
+# FILE. The plist can hold the SMB password, so it is never edited in place:
+# a failed edit leaves FILE as it was (NOTE says what else holds then), and
+# the copy keeps FILE's mode. FILE is a resolved path, so a symlinked plist
+# keeps its link and its target is what changes.
+edit_plist() {
+    dir=$(dirname "$1")
+    tmp=$(mktemp "$dir/.$(basename "$1").XXXXXX") || die "cannot create a file in $dir"
+    cp -p "$1" "$tmp" || die "cannot copy $1"
+    "$3" "$tmp" && plutil -lint -s "$tmp" || die "cannot edit $1 (left unchanged$2)"
+    mv -f "$tmp" "$1" || die "cannot replace $1 (left unchanged$2)"
+    tmp=""
+}
+
 wire_auth() {
     plist=$1
     # Edit what a symlinked plist points at (a dotfiles checkout, say). A
@@ -191,17 +237,7 @@ wire_auth() {
     summary=$(check_auth "$file" "$creds" "$AGENT_AUTH" 2>&1) ||
         die "not changing $LAUNCHD_LABEL: with these settings it would refuse to start: $summary"
 
-    tmp=$(mktemp "$dir/.$(basename "$file").XXXXXX") || die "cannot create a file in $dir"
-    cp -p "$file" "$tmp" || die "cannot copy $file"
-    if ! plist_get "$tmp" EnvironmentVariables >/dev/null; then
-        plutil -insert EnvironmentVariables -dictionary "$tmp" || die "cannot edit $file"
-    fi
-    plutil -replace EnvironmentVariables.SPICEIO_S3_CREDENTIALS_FILE -string "$creds" "$tmp" &&
-        plutil -replace EnvironmentVariables.SPICEIO_S3_AUTH -string "$AGENT_AUTH" "$tmp" &&
-        plutil -lint -s "$tmp" ||
-        die "cannot edit $file (left unchanged)"
-    mv -f "$tmp" "$file" || die "cannot replace $file (left unchanged)"
-    tmp=""
+    edit_plist "$file" "" auth_edits
     changes=""
     [ "$current_auth" = "$AGENT_AUTH" ] ||
         changes="SPICEIO_S3_AUTH ${current_auth:-(unset)} -> $AGENT_AUTH"
@@ -210,6 +246,138 @@ wire_auth() {
     echo "$LAUNCHD_LABEL plist: $changes"
     echo "  ($summary)"
 }
+
+# The SigV4 settings, applied to the plist copy $1.
+auth_edits() {
+    if ! plist_get "$1" EnvironmentVariables >/dev/null; then
+        plutil -insert EnvironmentVariables -dictionary "$1" || return
+    fi
+    plutil -replace EnvironmentVariables.SPICEIO_S3_CREDENTIALS_FILE -string "$creds" "$1" &&
+        plutil -replace EnvironmentVariables.SPICEIO_S3_AUTH -string "$AGENT_AUTH" "$1"
+}
+
+# Run a command with the SMB settings of plist $1 that decide which keychain
+# item holds the password (and none of the caller's), with
+# SPICEIO_SMB_PASS_KEYCHAIN=$2 and no SPICEIO_SMB_PASS.
+with_smb_env() {
+    p=$1
+    service=$2
+    shift 2
+    (
+        for name in SPICEIO_SMB_SERVER SPICEIO_SMB_USER SPICEIO_SMB_DOMAIN SPICEIO_SMB_PORT \
+            SPICEIO_SMB_PASS_KEYCHAIN_PATH; do
+            unset "$name"
+            if value=$(plist_get "$p" "EnvironmentVariables.$name"); then
+                export "$name=$value"
+            fi
+        done
+        unset SPICEIO_SMB_PASS
+        export SPICEIO_SMB_PASS_KEYCHAIN="$service"
+        exec "$@"
+    )
+}
+
+# True when plist $1 sets a non-empty SPICEIO_SMB_PASS. Startup treats an
+# empty value as unset, so this must too. `plutil -extract … raw` prints the
+# value and a newline (only the newline when empty, nothing when missing), so
+# more than one byte means a password, whatever it starts with. Only the count
+# leaves the pipe: the value is never held in a variable. (`-extract … json`
+# refuses a bare string, so it cannot be used here.)
+has_inline_pass() {
+    bytes=$(plutil -extract EnvironmentVariables.SPICEIO_SMB_PASS raw -o - "$1" 2>/dev/null | wc -c | tr -d ' ')
+    [ "${bytes:-0}" -gt 1 ]
+}
+
+# True when the plist takes the SMB password from the keychain (a non-empty
+# SPICEIO_SMB_PASS_KEYCHAIN and no inline password), with the service on stdout.
+keychain_service() {
+    has_inline_pass "$1" && return 1
+    service=$(plist_get "$1" EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN) || return 1
+    [ -n "$service" ] || return 1
+    printf '%s\n' "$service"
+}
+
+# Can binary $3 read the SMB password from the keychain item plist $1 names
+# (service $2)? Its report on stdout either way.
+smb_pass_readable() {
+    with_smb_env "$1" "$2" "$3" --check-smb-password 2>&1
+}
+
+# Fail (without restarting anything) unless the installed binary can read the
+# agent's SMB password from the keychain item its plist names.
+require_readable_smb_pass() {
+    summary=$(smb_pass_readable "$1" "$2" "$BINDIR/spiceio") ||
+        die "$LAUNCHD_LABEL could not read its SMB password, so it is not being restarted: $summary"
+}
+
+# Replace SPICEIO_SMB_PASS with SPICEIO_SMB_PASS_KEYCHAIN=$service in the
+# plist copy $1.
+smb_pass_edits() {
+    plutil -remove EnvironmentVariables.SPICEIO_SMB_PASS "$1" &&
+        plutil -replace EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN -string "$service" "$1"
+}
+
+# Move the plist's SMB password into the keychain.
+wire_smb_pass() {
+    file=$1
+    dir=$(dirname "$file")
+    if service=$(keychain_service "$file"); then
+        require_readable_smb_pass "$file" "$service"
+        echo "$LAUNCHD_LABEL plist: SMB password from keychain item \"$service\" (unchanged)"
+        return
+    fi
+    if ! has_inline_pass "$file"; then
+        echo "note: $LAUNCHD_LABEL's plist sets neither SPICEIO_SMB_PASS nor SPICEIO_SMB_PASS_KEYCHAIN; leaving its SMB password alone"
+        return
+    fi
+    # An item stored by an ad-hoc binary pins that binary's cdhash, so the
+    # next build could not read it and the agent would not start.
+    if codesign -dv "$BINDIR/spiceio" 2>&1 | grep -q '^CodeDirectory.*adhoc'; then
+        echo "note: not moving $LAUNCHD_LABEL's SMB password into the keychain: $BINDIR/spiceio is ad-hoc"
+        echo "      signed (CODESIGN=adhoc), so only this exact build could read it back."
+        return
+    fi
+    [ -w "$file" ] && [ -w "$dir" ] || die "$file is not writable, so its SMB password stays in it.
+       Store it yourself (spiceio --store-smb-password), then replace SPICEIO_SMB_PASS
+       with SPICEIO_SMB_PASS_KEYCHAIN = $SMB_PASS_KEYCHAIN_SERVICE in its EnvironmentVariables."
+    service=$(plist_get "$file" EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN) || service=""
+    [ -n "$service" ] || service=$SMB_PASS_KEYCHAIN_SERVICE
+
+    # plutil appends a newline, which --store-smb-password drops.
+    stored=$(plutil -extract EnvironmentVariables.SPICEIO_SMB_PASS raw -o - "$file" |
+        with_smb_env "$file" "$service" "$BINDIR/spiceio" --store-smb-password 2>&1) ||
+        die "not changing $LAUNCHD_LABEL: its SMB password could not be stored in the keychain: $stored"
+    summary=$(smb_pass_readable "$file" "$service" "$BINDIR/spiceio") ||
+        die "not changing $LAUNCHD_LABEL: the stored SMB password does not read back: $summary"
+    edit_plist "$file" "; the keychain item is in place" smb_pass_edits
+    echo "$LAUNCHD_LABEL plist: SMB password moved to the keychain (SPICEIO_SMB_PASS removed, SPICEIO_SMB_PASS_KEYCHAIN=$service)"
+    printf '%s\n' "$stored" | sed 's/^/  /'
+    echo "note: copies of the plist made before now (Time Machine, other backups, a dotfiles repo)"
+    echo "      still hold the SMB password. If any could have been read, change it on the NAS,"
+    echo "      then store the new one: $BINDIR/spiceio --store-smb-password --server <server> --user <user>"
+    echo "      (plus --domain/--port/--service if the agent sets them)"
+}
+
+# `--preflight BIN`: can BIN read the agent's SMB password? With no agent
+# loaded there is nothing to protect. With one loaded, a plist that cannot be
+# resolved, read or parsed is a failure, not a pass: whether BIN could read
+# the password is then unknown, and installing could strand the agent.
+if [ "${1:-}" = --preflight ]; then
+    [ $# -eq 2 ] || die "usage: $0 --preflight BIN"
+    agent_print >/dev/null || exit 0
+    agent_plist=$(agent_field path)
+    [ -n "$agent_plist" ] ||
+        die "not installing: cannot tell which plist $LAUNCHD_LABEL was loaded from ($target)"
+    file=$(realpath "$agent_plist" 2>/dev/null) && [ -r "$file" ] && plutil -lint -s "$file" >/dev/null 2>&1 ||
+        die "not installing: cannot read $LAUNCHD_LABEL's plist ($agent_plist), so whether the new
+       build can read its SMB password is unknown. The running binary is unchanged."
+    service=$(keychain_service "$file") || exit 0
+    summary=$(smb_pass_readable "$file" "$service" "$2") ||
+        die "not installing: the new build cannot read $LAUNCHD_LABEL's SMB password from the
+       keychain, so the agent could not start on it. The running binary is unchanged.
+       $summary"
+    exit 0
+fi
 
 # bootout returns before the job has exited: launchd sends SIGTERM and
 # reports success while the process drains. A bootstrap issued in that window
@@ -460,6 +628,15 @@ pending_reload=0
 
 if [ "$AGENT_AUTH" != keep ]; then
     wire_auth "$agent_plist"
+fi
+# The file the plist resolves to (a symlinked plist is edited at its target).
+agent_file=$(realpath "$agent_plist") || die "cannot resolve $agent_plist"
+if [ "$AGENT_SMB_PASS" = keychain ]; then
+    wire_smb_pass "$agent_file"
+elif service=$(keychain_service "$agent_file"); then
+    # Told to leave it alone, but still never restart the agent onto a
+    # binary that cannot read its password.
+    require_readable_smb_pass "$agent_file" "$service"
 fi
 
 if loaded_env_is_stale "$agent_plist"; then
