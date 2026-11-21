@@ -154,22 +154,12 @@ case "$kc" in
 *) die "SIGNING_KEYCHAIN=$kc is not an absolute path" ;;
 esac
 
-# One signing run at a time for this user. Each run unlocks the keychain (or
-# finds it unlocked), signs and locks it again, so two concurrent installs
-# would interleave: one would lock the keychain between the other's
-# lock-state check and its codesign, which then fails or, in a login session,
-# asks for the password in a dialog. The run re-executes itself under
-# lockf(1), and a second run waits for the first to finish. The lock is one
-# file per user (getconf DARWIN_USER_TEMP_DIR, which does not follow TMPDIR),
-# not one named after SIGNING_KEYCHAIN: two runs naming the same keychain by
-# different paths (a symlink, /var and /private/var) must take the same lock.
-user_tmp=$(getconf DARWIN_USER_TEMP_DIR) && [ -n "$user_tmp" ] || die "cannot find this user's temporary directory for the signing lock"
-lock="${user_tmp%/}/spiceio-codesign.lock"
-if [ "${SPICEIO_SIGN_LOCK_HELD:-}" != "$lock" ]; then
-    lockf -k -s -t 0 "$lock" true ||
-        echo "waiting for another run to finish signing" >&2
-    exec env SPICEIO_SIGN_LOCK_HELD="$lock" lockf -k -t 900 "$lock" /bin/sh "$0" "$@"
-fi
+# One install at a time for this user (scripts/install-lock.sh): each run
+# unlocks the keychain (or finds it unlocked), signs and locks it again, and
+# two concurrent runs would lock it under each other's codesign. `make
+# install` already holds the lock; run on its own, the script takes it.
+[ -n "${SPICEIO_INSTALL_LOCK_HELD:-}" ] ||
+    exec /bin/sh "$(dirname "$0")/install-lock.sh" /bin/sh "$0" "$@"
 
 keychain_state() { "$SPICEIO_HELPER_BIN" --keychain-status "$kc"; }
 
@@ -177,7 +167,7 @@ keychain_state() { "$SPICEIO_HELPER_BIN" --keychain-status "$kc"; }
 # once the keychain is unlocked.
 identity_hash() {
     security find-identity -p codesigning "$kc" 2>/dev/null |
-        awk -v cn="\"$CN\"" '/Matching identities/ { m = 1 } m && index($0, cn) { print $2; exit }'
+        awk -v cn="\"$CN\"" '/Matching identities/ { m = 1 } m && index($0, cn) { print $2 }'
 }
 
 # The value of attribute $1 of the signing keychain's private key, as
@@ -185,18 +175,22 @@ identity_hash() {
 # and no dialog).
 key_attribute() {
     security dump-keychain "$kc" 2>/dev/null |
-        awk -v a="$1" '/^class: 0x00000010/ { k = 1 } /^keychain:/ { if (k) exit } k && $1 == a { print $2; exit }'
+        awk -v a="$1" '/^keychain:/ { k = 0 } /^class: 0x00000010/ { k = 1 } k && $1 == a { print $2 }'
 }
 
-# Refuse a signing key that can be exported, on every run: a key made outside
-# this script, by hand or by a version that imported a .p12 (whose -x
-# `security import -f pkcs12` ignores), may be exportable, and a copy of it
-# could sign a binary that reads the SMB password. Reading the key's
-# Extractable attribute (0x10) touches no ACL, so it raises no dialog.
+# Refuse a signing keychain holding a key that can be exported, on every
+# run: a key made outside this script, by hand or by a version that imported
+# a .p12 (whose -x `security import -f pkcs12` ignores), may be exportable,
+# and a copy of it could sign a binary that reads the SMB password. Every
+# private key in the keychain is checked, not just one: which one signs is
+# the identity's, and the keychain holds only that one (see the identity
+# check). Reading the Extractable attribute (0x10) touches no ACL, so it
+# raises no dialog.
 require_unexportable_key() {
-    extractable=$(key_attribute 0x00000010)
-    [ "$extractable" = "<uint32>=0x00000000" ] && return 0
-    die "the signing key in $kc is exportable (Extractable ${extractable:-unknown}), so a copy of it
+    keys=$(key_attribute 0x00000010)
+    extractable=$(printf '%s\n' "$keys" | grep -v -x '<uint32>=0x00000000' | head -1)
+    [ -n "$keys" ] && [ -z "$extractable" ] && return 0
+    die "a signing key in $kc is exportable (Extractable ${extractable:-unknown}), so a copy of it
        could sign a binary that reads the SMB password. Not signing with it. To start over,
        delete the keychain (security delete-keychain $(shq "$kc")) and run \`make install\`
        again; a new identity cannot read items the old one stored (README, \"New signing identity\")."
@@ -251,7 +245,13 @@ else
     relock=1
 fi
 
-hash=$(identity_hash)
+hashes=$(identity_hash)
+hash=$(printf '%s\n' "$hashes" | head -1)
+# Exactly one: with two of the same name, which one codesign is handed
+# depends on the order security lists them.
+[ "$(printf '%s\n' "$hashes" | grep -c .)" -le 1 ] ||
+    die "$kc holds $(printf '%s\n' "$hashes" | grep -c .) \"$CN\" identities; expected one.
+       Remove the extra ones, or start over (security delete-keychain $(shq "$kc"))."
 [ -n "$hash" ] || die "$kc has no \"$CN\" identity. To start over, delete the keychain
        (security delete-keychain $(shq "$kc")) and run \`make install\` again. A new identity
        cannot read keychain items the old one stored: see README, \"New signing identity\"."

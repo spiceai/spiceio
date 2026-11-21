@@ -53,6 +53,13 @@
 # "SMB still connecting" are notes, not failures.
 set -u
 
+# One install at a time for this user (scripts/install-lock.sh): two runs
+# editing the plist, moving the password and restarting the agent at once
+# could leave it with neither a password nor a keychain item. `make install`
+# already holds the lock; run on its own, the script takes it.
+[ -n "${SPICEIO_INSTALL_LOCK_HELD:-}" ] ||
+    exec /bin/sh "$(dirname "$0")/install-lock.sh" /bin/sh "$0" "$@"
+
 : "${BINDIR:?}" "${LAUNCHD_LABEL:?}"
 RESTART_AGENT="${RESTART_AGENT:-1}"
 AGENT_AUTH="${AGENT_AUTH:-enforce}"

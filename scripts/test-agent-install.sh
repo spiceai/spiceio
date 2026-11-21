@@ -556,6 +556,35 @@ check "exits 0" [ "$RC" -eq 0 ]
 check "says why not" has "is ad-hoc"
 check "the password stays in the plist" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
 
+echo "--- a second install waits for one in progress"
+# Hold this user's install lock the way `make install` does, then install.
+LOCK="$(getconf DARWIN_USER_TEMP_DIR | sed 's#/$##')/spiceio-install.lock"
+fresh_agent
+lockf -k "$LOCK" sleep 3 &
+HOLDER=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do lockf -k -s -t 0 "$LOCK" true || break; sleep 0.1; done
+START=$(date +%s)
+install_agent
+WAITED=$(($(date +%s) - START))
+wait "$HOLDER"
+check "exits 0" [ "$RC" -eq 0 ]
+check "says it is waiting" has "waiting for another spiceio install to finish"
+check "and waits for the lock (${WAITED}s)" [ "$WAITED" -ge 2 ]
+check "then moves the password as usual" [ -z "$(env_of SPICEIO_SMB_PASS)" ]
+# Under the caller's lock (`make install` holds it): must not wait for it,
+# or it would wait forever for its own caller. An install takes about 2s, so
+# the lock is held for 8.
+lockf -k "$LOCK" sleep 8 &
+HOLDER=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do lockf -k -s -t 0 "$LOCK" true || break; sleep 0.1; done
+START=$(date +%s)
+install_agent SPICEIO_INSTALL_LOCK_HELD="$LOCK"
+WAITED=$(($(date +%s) - START))
+wait "$HOLDER"
+check "under the caller's lock: exits 0" [ "$RC" -eq 0 ]
+check "and does not wait for it (${WAITED}s)" [ "$WAITED" -lt 6 ]
+check "or say it is waiting" lacks "waiting for another spiceio install"
+
 check "leaves the keychain search list as it found it" search_list_kept "$SEARCH_LIST_BEFORE" "$WORK"
 
 echo ""

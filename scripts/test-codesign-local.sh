@@ -161,7 +161,7 @@ check "locked again" [ "$(state "$KC")" = locked ]
 echo "--- a second run waits for one that is signing, whatever path it names"
 # Hold the signing lock the way a run does, then start another run: once
 # naming the keychain directly, once through a symlink to it.
-LOCK="$(getconf DARWIN_USER_TEMP_DIR | sed 's#/$##')/spiceio-codesign.lock"
+LOCK="$(getconf DARWIN_USER_TEMP_DIR | sed 's#/$##')/spiceio-install.lock"
 ln -s "$KC" "$WORK/alias.kc"
 for named in "$KC" "$WORK/alias.kc"; do
     lockf -k "$LOCK" sleep 3 &
@@ -173,7 +173,7 @@ for named in "$KC" "$WORK/alias.kc"; do
     WAITED=$(($(date +%s) - START))
     wait "$HOLDER"
     check "$(basename "$named"): exits 0" [ "$RC" -eq 0 ]
-    check "$(basename "$named"): says it is waiting" has "waiting for another run to finish signing"
+    check "$(basename "$named"): says it is waiting" has "waiting for another spiceio install to finish"
     check "$(basename "$named"): and waits for the lock (${WAITED}s)" [ "$WAITED" -ge 2 ]
     check "$(basename "$named"): locked again" [ "$(state "$KC")" = locked ]
 done
@@ -204,6 +204,36 @@ check "never calls codesign to sign" [ -z "$(grep -e ' -s ' "$WORK/stub/calls")"
 check "leaves no output binary" [ ! -e "$WORK/exp-signed" ]
 check "locks the keychain again" [ "$(state "$EXP")" = locked ]
 security delete-keychain "$EXP"
+
+echo "--- any exportable key, or a second identity, in the signing keychain is refused"
+# The signing keychain's first key is the good one here, so a check of the
+# first key alone would pass.
+KC2="$WORK/second.keychain-db"
+run_tty "$PW" env SIGNING_KEYCHAIN="$KC2" sh "$SIGN" "$SPICEIO_BIN" "$WORK/kc2-first"
+check "a fresh signing keychain signs" [ "$RC" -eq 0 ]
+security unlock-keychain -p "$PW" "$KC2"
+# security import reads a lone key in the traditional RSA format only.
+/usr/bin/openssl rsa -in "$WORK/exp-key.pem" -out "$WORK/exp-key-rsa.pem" 2>/dev/null
+security import "$WORK/exp-key-rsa.pem" -k "$KC2" -t priv -f openssl >/dev/null
+: >"$WORK/stub/calls"
+run env PATH="$WORK/stub:$PATH" SPICEIO_HELPER_BIN="$SPICEIO_BIN" SIGNING_KEYCHAIN="$KC2" sh "$SIGN" "$SPICEIO_BIN" "$WORK/kc2-key"
+check "an exportable key beside the identity: exits 1" [ "$RC" -eq 1 ]
+check "says a key is exportable" has "is exportable"
+check "never calls codesign to sign" [ -z "$(grep -e ' -s ' "$WORK/stub/calls")" ]
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/exp2-key.pem" -out "$WORK/exp2-cert.pem" \
+    -days 1 -subj "/CN=spiceio local code signing" \
+    -addext "extendedKeyUsage=critical,codeSigning" -addext "keyUsage=critical,digitalSignature" 2>/dev/null
+/usr/bin/openssl pkcs12 -export -inkey "$WORK/exp2-key.pem" -in "$WORK/exp2-cert.pem" \
+    -out "$WORK/exp2.p12" -passout pass:exp 2>/dev/null
+security unlock-keychain -p "$PW" "$KC2"
+security import "$WORK/exp2.p12" -k "$KC2" -f pkcs12 -P exp >/dev/null
+: >"$WORK/stub/calls"
+run env PATH="$WORK/stub:$PATH" SPICEIO_HELPER_BIN="$SPICEIO_BIN" SIGNING_KEYCHAIN="$KC2" sh "$SIGN" "$SPICEIO_BIN" "$WORK/kc2-two"
+check "a second identity of the same name: exits 1" [ "$RC" -eq 1 ]
+check "says it expected one" has "identities; expected one"
+check "never calls codesign to sign" [ -z "$(grep -e ' -s ' "$WORK/stub/calls")" ]
+check "locks the keychain again" [ "$(state "$KC2")" = locked ]
+security delete-keychain "$KC2"
 
 echo "--- the keychain named through a symlinked path"
 # security prints resolved paths (/private/var/… for /var/…); the private

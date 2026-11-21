@@ -39,7 +39,7 @@ test-unit: test-clean-unit test-setup-action test-agent-install test-codesign-lo
 # `make install`'s launchd half and the sccache-spiceio wrapper, against a
 # stubbed launchctl: plist edits, key creation, reload-vs-kickstart, and the
 # post-restart auth check. Touches no real agent.
-.PHONY: test-agent-install
+.PHONY: install-locked test-agent-install
 test-agent-install:
 	cargo build --locked --bin spiceio
 	bash scripts/test-agent-install.sh target/debug/spiceio
@@ -183,8 +183,15 @@ SIGNING_KEYCHAIN ?= $(HOME)/Library/Keychains/spiceio-signing.keychain-db
 # install(1), and a failed signature or check leaves the old binary in place.
 # The staged copy has a name unique to this run (mktemp), and signing, the
 # check and the rename happen in one shell, so a concurrent `make install`
-# cannot swap in a build between this one's check and its rename.
+# cannot swap in a build between this one's check and its rename. The whole
+# install runs holding this user's install lock (scripts/install-lock.sh), so
+# a concurrent one waits instead of editing the agent's plist, moving its
+# password or restarting it at the same time.
 install: release
+	@./scripts/install-lock.sh $(MAKE) --no-print-directory install-locked
+
+# The install itself; `make install` runs it holding the lock.
+install-locked:
 	install -d "$(BINDIR)"
 	@set -e; \
 	  staged=$$(mktemp "$(BINDIR)/.spiceio.XXXXXX"); \
