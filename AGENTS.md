@@ -132,6 +132,7 @@ Rules:
   replaced by asserting against the instance that took the write — that
   instance's own cache answers either way — so it restarts and reads back
   through a second instance with write-back and the spill both off.
+- In GitHub CI the live suites read the NAS password from `secrets.SMB_PASSWORD` in the `ci` environment (the job declares `environment: ci`). "Check SMB credentials" **fails** the job when it is missing instead of skipping the suites: fork PRs never start the job, so a skip only ever hid a broken secret reference. One did, from 2026-10-06 to 2026-11-21, while the workflow read a repo secret that no longer existed.
 - If `SPICEIO_SMB_USER`/`PASS` are set, `make ci` **requires** the live suites
   (`CI_REQUIRE_LIVE=1` by default). Do not unset credentials to skip them.
 - Without credentials, `make ci` still runs lint + unit tests and prints SKIP
