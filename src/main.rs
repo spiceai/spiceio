@@ -164,7 +164,17 @@ impl Config {
             serr!("[spiceio] {e}");
             flush_and_exit(1);
         }
-        let smb_port = parse_env_or("SPICEIO_SMB_PORT", smb_password::DEFAULT_PORT);
+        // The password commands parse the port with the same function, so a
+        // keychain item they stored is found under the same account here.
+        let smb_port = match env::var("SPICEIO_SMB_PORT") {
+            Ok(raw) if !raw.trim().is_empty() => {
+                smb_password::parse_port(&raw).unwrap_or_else(|| {
+                    serr!("[spiceio] SPICEIO_SMB_PORT={raw} is not valid; using default");
+                    smb_password::DEFAULT_PORT
+                })
+            }
+            _ => smb_password::DEFAULT_PORT,
+        };
         let smb_username = require_env("SPICEIO_SMB_USER");
         let smb_domain = env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default();
         let smb_password = load_smb_password(&smb_server, smb_port, &smb_username, &smb_domain);
@@ -508,6 +518,33 @@ async fn main() {
     if env::args().any(|a| a == "--store-smb-password") {
         let args: Vec<String> = env::args().collect();
         std::process::exit(smb_password::store_command(&args));
+    }
+    // Hidden: `--create-signing-identity <keychain> <common name>` makes the
+    // code-signing identity `scripts/codesign-local.sh` signs with: the key
+    // pair is generated inside the keychain (non-extractable), and the
+    // self-signed certificate is built and signed here, so the private key
+    // is never written anywhere. /usr/bin/codesign may use the key.
+    {
+        let args: Vec<String> = env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--create-signing-identity") {
+            let (Some(keychain), Some(name)) = (args.get(i + 1), args.get(i + 2)) else {
+                eprintln!("--create-signing-identity needs a keychain path and a common name");
+                std::process::exit(2);
+            };
+            match spiceio::keychain::create_signing_identity(
+                std::path::Path::new(keychain),
+                name,
+                &[std::path::Path::new("/usr/bin/codesign")],
+                3650,
+            ) {
+                Ok(()) => println!("created signing identity \"{name}\" in {keychain}"),
+                Err(e) => {
+                    eprintln!("creating the signing identity in {keychain}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
     }
     // Hidden: `--keychain-status <path>` prints `locked` or `unlocked`
     // without prompting. `make install` asks before signing, because

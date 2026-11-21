@@ -60,13 +60,32 @@ SECRET='p@ss w0rd&<amp>"'
 # run_tty PASSWORD CMD...: run CMD on a pseudo-terminal, typing PASSWORD at
 # every password prompt. OUT gets what the terminal showed, RC the status.
 cat >"$WORK/pty.py" <<'EOF'
-import os, pty, select, sys, time
+import os, pty, select, signal, sys, time
 password = os.environ["PTY_PASSWORD"].encode()
+limit = float(os.environ.get("PTY_DEADLINE", "120"))
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(sys.argv[1], sys.argv[1:])
-seen, pending, deadline = b"", b"", time.time() + 120
-while time.time() < deadline:
+seen, pending, deadline = b"", b"", time.time() + limit
+
+
+def give_up():
+    # pty.fork made the child a session leader, so its process group is its
+    # pid: kill the whole group and reap it, instead of waiting on a child
+    # stuck at an unanswered prompt.
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    sys.stdout.write(seen.decode(errors="replace"))
+    sys.stdout.write("\npty.py: gave up after %gs\n" % limit)
+    sys.exit(124)
+
+
+while True:
+    if time.time() >= deadline:
+        give_up()
     if not select.select([fd], [], [], 0.5)[0]:
         continue
     try:
@@ -80,7 +99,15 @@ while time.time() < deadline:
     if b"assword" in pending and pending.rstrip().endswith(b":"):
         os.write(fd, password + b"\n")
         pending = b""
-_, status = os.waitpid(pid, 0)
+# The terminal closed; the child may still be running. Wait for it only
+# until the deadline.
+while True:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        break
+    if time.time() >= deadline:
+        give_up()
+    time.sleep(0.1)
 sys.stdout.write(seen.decode(errors="replace"))
 sys.exit(os.waitstatus_to_exitcode(status))
 EOF
@@ -230,6 +257,29 @@ run env SIGNING_KEYCHAIN="$WORK/empty.keychain-db" sh "$SIGN" "$SPICEIO_BIN" "$W
 check "exits 1" [ "$RC" -eq 1 ]
 check "says how to start over" has "has no \"spiceio local code signing\" identity"
 check "leaves no output binary" [ ! -e "$WORK/d" ]
+
+echo "--- a failure before signing leaves an existing destination alone"
+# The README re-signs a release build straight over the installed binary.
+printf 'previous build\n' >"$WORK/installed"
+run env SIGNING_KEYCHAIN=relative.keychain-db sh "$SIGN" "$SPICEIO_BIN" "$WORK/installed"
+check "exits 1" [ "$RC" -eq 1 ]
+check "the existing binary is untouched" [ "$(cat "$WORK/installed" 2>/dev/null)" = "previous build" ]
+check "and no temp copy is left beside it" [ -z "$(find "$WORK" -maxdepth 1 -name '.installed.*')" ]
+run env SIGNING_KEYCHAIN="$WORK/empty.keychain-db" sh "$SIGN" "$SPICEIO_BIN" "$WORK/installed"
+check "a keychain without the identity: exits 1" [ "$RC" -eq 1 ]
+check "the existing binary is still untouched" [ "$(cat "$WORK/installed" 2>/dev/null)" = "previous build" ]
+
+echo "--- the pty driver gives up at its deadline"
+start=$(date +%s)
+set +e
+OUT=$(PTY_PASSWORD=x PTY_DEADLINE=2 perl -e 'alarm 30; exec @ARGV' python3 -I "$WORK/pty.py" sleep 41.25 2>&1)
+RC=$?
+set -e
+elapsed=$(($(date +%s) - start))
+check "exits 124 (not killed by the outer 30s alarm)" [ "$RC" -eq 124 ]
+check "within a few seconds of its 2s deadline" [ "$elapsed" -lt 10 ]
+check "and says so" has "pty.py: gave up after 2s"
+check "the child is gone" sh -c '! pgrep -f "sleep 41.25" >/dev/null'
 
 echo "--- CODESIGN=adhoc"
 run env CODESIGN=adhoc SIGNING_KEYCHAIN="$WORK/none.keychain-db" sh "$SIGN" "$SPICEIO_BIN" "$WORK/adhoc"

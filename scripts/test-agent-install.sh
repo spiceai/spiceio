@@ -81,13 +81,32 @@ setup() {
 # raised a GUI keychain dialog (securityd: "displaying keychain prompt for
 # /usr/bin/security") on every run, which a test must never do.
 cat >"$WORK/pty.py" <<'EOF'
-import os, pty, select, sys, time
+import os, pty, select, signal, sys, time
 password = os.environ["PTY_PASSWORD"].encode()
+limit = float(os.environ.get("PTY_DEADLINE", "120"))
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(sys.argv[1], sys.argv[1:])
-seen, pending, deadline = b"", b"", time.time() + 120
-while time.time() < deadline:
+seen, pending, deadline = b"", b"", time.time() + limit
+
+
+def give_up():
+    # pty.fork made the child a session leader, so its process group is its
+    # pid: kill the whole group and reap it, instead of waiting on a child
+    # stuck at an unanswered prompt.
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    sys.stdout.write(seen.decode(errors="replace"))
+    sys.stdout.write("\npty.py: gave up after %gs\n" % limit)
+    sys.exit(124)
+
+
+while True:
+    if time.time() >= deadline:
+        give_up()
     if not select.select([fd], [], [], 0.5)[0]:
         continue
     try:
@@ -101,7 +120,15 @@ while time.time() < deadline:
     if b"assword" in pending and pending.rstrip().endswith(b":"):
         os.write(fd, password + b"\n")
         pending = b""
-_, status = os.waitpid(pid, 0)
+# The terminal closed; the child may still be running. Wait for it only
+# until the deadline.
+while True:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        break
+    if time.time() >= deadline:
+        give_up()
+    time.sleep(0.1)
 sys.stdout.write(seen.decode(errors="replace"))
 sys.exit(os.waitstatus_to_exitcode(status))
 EOF
@@ -562,7 +589,54 @@ fresh_agent
 preflight_agent "$WORK/adhocbin/spiceio"
 check "an agent still holding its password inline: nothing to check" [ "$RC" -eq 0 ]
 
+echo "--- an empty SPICEIO_SMB_PASS counts as unset, as it does at startup"
+fresh_agent
+install_agent
+check "migrates" [ "$RC" -eq 0 ]
+plutil -insert EnvironmentVariables.SPICEIO_SMB_PASS -string "" "$PLIST"
+preflight_agent "$WORK/adhocbin/spiceio"
+check "preflight still checks the keychain item (refuses an ad-hoc build)" [ "$RC" -eq 1 ]
+install_agent
+check "install treats the agent as keychain-backed" [ "$RC" -eq 0 ]
+check "and does not try to migrate an empty password" has "SMB password from keychain item \"ai.spice.spiceio.smb\" (unchanged)"
+
+echo "--- preflight cannot read the loaded agent's plist"
+fresh_agent
+install_agent
+mv "$PLIST" "$CASE/away.plist"
+preflight_agent "$WORK/bindir/spiceio"
+check "plist gone: fails" [ "$RC" -eq 1 ]
+check "and says why" has "cannot read $LABEL's plist"
+mv "$CASE/away.plist" "$PLIST"
+cp -p "$PLIST" "$CASE/good.plist"
+printf 'not a plist' >"$PLIST"
+preflight_agent "$WORK/bindir/spiceio"
+check "plist unparsable: fails" [ "$RC" -eq 1 ]
+cp -p "$CASE/good.plist" "$PLIST"
+preflight_agent "$WORK/bindir/spiceio"
+check "plist back: passes" [ "$RC" -eq 0 ]
+
+echo "--- a new signing identity: store with it first, then install (README)"
+fresh_agent
+install_agent
+check "migrates with the current identity" [ "$RC" -eq 0 ]
+setup "create a second signing identity" env PTY_PASSWORD=rotated-pw \
+    SIGNING_KEYCHAIN="$WORK/rotated-signing.keychain-db" python3 -I "$WORK/pty.py" \
+    sh "$ROOT/scripts/codesign-local.sh" "$SPICEIO_BIN" "$WORK/rotated"
+# Deleting the old item would ask for the login password; naming a service
+# that holds nothing is the same state for preflight.
+plutil -replace EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN -string ai.spice.rotated "$PLIST"
+preflight_agent "$WORK/rotated"
+check "with the old item gone, install refuses the new build" [ "$RC" -eq 1 ]
+OUT=$(printf '%s' "$SMB_PASS" | SERVICE=ai.spice.rotated case_smb "$WORK/rotated" --store-smb-password 2>&1)
+check "the new build stores the password" has ": added in keychain item \"ai.spice.rotated\""
+preflight_agent "$WORK/rotated"
+check "and then install accepts it" [ "$RC" -eq 0 ]
+preflight_agent "$WORK/bindir/spiceio"
+check "while the old identity's build is refused" [ "$RC" -eq 1 ]
+
 echo "--- an ad-hoc installed binary does not take the password"
+fresh_agent
 install_agent BINDIR="$WORK/adhocbin"
 check "exits 0" [ "$RC" -eq 0 ]
 check "says why not" has "is ad-hoc"

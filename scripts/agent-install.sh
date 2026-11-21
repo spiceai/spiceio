@@ -258,11 +258,24 @@ with_smb_env() {
     )
 }
 
-# True when the plist takes the SMB password from the keychain, with the
-# service on stdout.
+# True when plist $1 sets a non-empty SPICEIO_SMB_PASS. Startup treats an
+# empty value as unset, so this must too. `plutil -extract … raw` prints the
+# value and a newline (only the newline when empty, nothing when missing), so
+# the first byte, newline removed, decides. It goes through a pipe and is
+# never held in a variable. (`-extract … json` refuses a bare string, so it
+# cannot be used here.)
+has_inline_pass() {
+    plutil -extract EnvironmentVariables.SPICEIO_SMB_PASS raw -o - "$1" 2>/dev/null |
+        head -c 1 | tr -d '\n' | grep -q .
+}
+
+# True when the plist takes the SMB password from the keychain (a non-empty
+# SPICEIO_SMB_PASS_KEYCHAIN and no inline password), with the service on stdout.
 keychain_service() {
-    plist_get "$1" EnvironmentVariables.SPICEIO_SMB_PASS >/dev/null && return 1
-    plist_get "$1" EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN
+    has_inline_pass "$1" && return 1
+    service=$(plist_get "$1" EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN) || return 1
+    [ -n "$service" ] || return 1
+    printf '%s\n' "$service"
 }
 
 # Fail (without restarting anything) unless the installed binary can read the
@@ -276,7 +289,7 @@ require_readable_smb_pass() {
 wire_smb_pass() {
     file=$(realpath "$1") || die "cannot resolve $1"
     dir=$(dirname "$file")
-    if ! plist_get "$file" EnvironmentVariables.SPICEIO_SMB_PASS >/dev/null; then
+    if ! has_inline_pass "$file"; then
         if service=$(keychain_service "$file"); then
             require_readable_smb_pass "$file" "$service"
             echo "$LAUNCHD_LABEL plist: SMB password from keychain item \"$service\" (unchanged)"
@@ -295,7 +308,8 @@ wire_smb_pass() {
     [ -w "$file" ] && [ -w "$dir" ] || die "$file is not writable, so its SMB password stays in it.
        Store it yourself (spiceio --store-smb-password), then replace SPICEIO_SMB_PASS
        with SPICEIO_SMB_PASS_KEYCHAIN = $SMB_PASS_KEYCHAIN_SERVICE in its EnvironmentVariables."
-    service=$(plist_get "$file" EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN) || service=$SMB_PASS_KEYCHAIN_SERVICE
+    service=$(plist_get "$file" EnvironmentVariables.SPICEIO_SMB_PASS_KEYCHAIN) || service=""
+    [ -n "$service" ] || service=$SMB_PASS_KEYCHAIN_SERVICE
 
     # plutil appends a newline, which --store-smb-password drops.
     stored=$(plutil -extract EnvironmentVariables.SPICEIO_SMB_PASS raw -o - "$file" |
@@ -320,13 +334,19 @@ wire_smb_pass() {
     echo "      (plus --domain/--port/--service if the agent sets them)"
 }
 
-# `--preflight BIN`: can BIN read the agent's SMB password?
+# `--preflight BIN`: can BIN read the agent's SMB password? With no agent
+# loaded there is nothing to protect. With one loaded, a plist that cannot be
+# resolved, read or parsed is a failure, not a pass: whether BIN could read
+# the password is then unknown, and installing could strand the agent.
 if [ "${1:-}" = --preflight ]; then
     [ $# -eq 2 ] || die "usage: $0 --preflight BIN"
     agent_print >/dev/null || exit 0
     agent_plist=$(agent_field path)
-    [ -n "$agent_plist" ] || exit 0
-    file=$(realpath "$agent_plist") || exit 0
+    [ -n "$agent_plist" ] ||
+        die "not installing: cannot tell which plist $LAUNCHD_LABEL was loaded from ($target)"
+    file=$(realpath "$agent_plist" 2>/dev/null) && [ -r "$file" ] && plutil -lint -s "$file" >/dev/null 2>&1 ||
+        die "not installing: cannot read $LAUNCHD_LABEL's plist ($agent_plist), so whether the new
+       build can read its SMB password is unknown. The running binary is unchanged."
     service=$(keychain_service "$file") || exit 0
     summary=$(with_smb_env "$file" "$service" "$2" --check-smb-password 2>&1) ||
         die "not installing: the new build cannot read $LAUNCHD_LABEL's SMB password from the

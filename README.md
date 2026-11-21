@@ -361,7 +361,9 @@ attach to spiceio or inject a library into it to read the password from memory.
 password, so the key lives in its own keychain
 (`~/Library/Keychains/spiceio-signing.keychain-db`, `SIGNING_KEYCHAIN=`), on
 the keychain search list only while install signs, with its own password, locked except while install
-signs. The private key is imported non-extractable. The first `make install`
+signs. The key pair is generated inside that keychain, non-extractable from
+the start, and spiceio signs its certificate itself, so the private key is
+never in a file. The first `make install`
 creates it and asks you to choose that password (twice, then once more to let
 `codesign` use the key). Every later install asks for it once in the terminal.
 To install without a terminal, unlock it first:
@@ -395,14 +397,20 @@ someone who has your login password.
   password. If any of them could have been read, rotate it as above.
 - **New signing identity** (it expires after 10 years, or the signing keychain
   is lost or compromised). Items the old identity stored cannot be read by
-  builds the new one signs, and cannot be deleted by them either. Delete the
-  signing keychain (`security delete-keychain ~/Library/Keychains/spiceio-signing.keychain-db`)
-  and the SMB password item
-  (`security delete-generic-password -s ai.spice.spiceio.smb -a 'smb://user@server'`;
-  macOS may ask for your login password). Then run `make install`, which creates a
-  new identity, and store the password again with `--store-smb-password`.
-  install refuses to replace the binary until the new build can read the item,
-  so the running agent keeps working until you do.
+  builds the new one signs, and cannot be deleted by them either. The order
+  matters: while a keychain-backed agent is loaded, `make install` refuses to
+  install a build that cannot read the agent's item, so store the password
+  with a build signed by the *new* identity first. Storing it with the
+  still-installed binary would pin the item to the old identity again.
+  1. `security delete-keychain ~/Library/Keychains/spiceio-signing.keychain-db`
+  2. `make release && scripts/codesign-local.sh target/release/spiceio /tmp/spiceio-new`
+     (creates the new identity and signs a temporary copy with it)
+  3. `security delete-generic-password -s ai.spice.spiceio.smb` (macOS may ask
+     for your login password)
+  4. `/tmp/spiceio-new --store-smb-password --server <server> --user <user>`
+  5. `make install`, then `rm /tmp/spiceio-new`
+
+  The running agent keeps working until step 5 restarts it on the new build.
 - **Forgotten signing keychain password.** Same as a new identity. Nothing
   else depends on that keychain.
 - **Backup.** The SMB password item is in the login keychain, and the signing

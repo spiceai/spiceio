@@ -68,6 +68,37 @@ fn spiceio(keychain: Option<&Path>, vars: &[(&str, &str)]) -> Command {
     cmd
 }
 
+/// Read `child`'s stdout and stderr until a line contains `marker` (or
+/// `timeout` passes), kill it, and return everything it printed.
+fn read_until(child: &mut std::process::Child, marker: &str, timeout: Duration) -> String {
+    let (tx, rx) = mpsc::channel();
+    for stream in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    let mut seen = Vec::new();
+    while let Ok(line) = rx.recv_timeout(timeout) {
+        let done = line.contains(marker);
+        seen.push(line);
+        if done {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+        seen.push(line);
+    }
+    seen.join("\n")
+}
+
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -124,6 +155,45 @@ fn a_url_for_the_server_stops_startup_with_the_host_to_use() {
     );
 }
 
+/// The password commands and startup parse SPICEIO_SMB_PORT with one
+/// function, so an item stored for a padded port is found at startup.
+#[test]
+fn a_padded_port_finds_the_same_item_at_startup() {
+    let kc = TempKeychain::new("padded-port");
+    let vars = [
+        ("SPICEIO_SMB_PASS_KEYCHAIN", "ai.spice.spiceio.smb"),
+        ("SPICEIO_SMB_PORT", " 4455 "),
+    ];
+    let mut store = spiceio(Some(&kc.path), &vars)
+        .arg("--store-smb-password")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    store
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(SECRET.as_bytes())
+        .unwrap();
+    let out = store.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+
+    let mut child = spiceio(Some(&kc.path), &vars)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let log = read_until(&mut child, "connecting to smb://", Duration::from_secs(20));
+    assert!(
+        log.contains(
+            "SMB password: keychain item \"ai.spice.spiceio.smb\" for smb://****@127.0.0.1:4455"
+        ),
+        "{log}"
+    );
+}
+
 #[test]
 fn neither_source_stops_startup() {
     let out = spiceio(None, &[]).output().unwrap();
@@ -163,38 +233,9 @@ fn stored_password_is_used_and_never_logged() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (tx, rx) = mpsc::channel();
-    for stream in [
-        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
-        Box::new(child.stderr.take().unwrap()),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
-            }
-        });
-    }
-    let mut seen = Vec::new();
-    let found = loop {
-        match rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(line) => {
-                let done = line.contains("connecting to smb://");
-                seen.push(line);
-                if done {
-                    break true;
-                }
-            }
-            Err(_) => break false,
-        }
-    };
-    let _ = child.kill();
-    let _ = child.wait();
-    // Whatever arrived after the kill, too.
-    while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
-        seen.push(line);
-    }
-    let log = seen.join("\n");
+    let log = read_until(&mut child, "connecting to smb://", Duration::from_secs(20));
+    let found = log.contains("connecting to smb://");
+
     assert!(found, "startup never reached the SMB connect:\n{log}");
     assert!(
         log.contains(

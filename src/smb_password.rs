@@ -56,29 +56,63 @@ pub struct Destination {
     pub domain: String,
 }
 
+/// The SMB port in `raw`, as both startup and the password commands read it:
+/// surrounding whitespace ignored. Shared so the two can never key the
+/// keychain item on different ports.
+pub fn parse_port(raw: &str) -> Option<u16> {
+    raw.trim().parse().ok()
+}
+
+/// `value` with everything before its last `@` (user, and any password)
+/// replaced by `****`, for messages. The last `@`, not the first or the one in
+/// the authority, so a password holding `/` or `@` cannot survive either.
+fn redact_userinfo(value: &str) -> String {
+    let (scheme, rest) = match value.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, value),
+    };
+    let rest = match rest.rsplit_once('@') {
+        Some((_, host)) => format!("****@{host}"),
+        None => rest.to_string(),
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{rest}"),
+        None => rest,
+    }
+}
+
 /// Check an SMB server setting (`what` names it in the error): a host name
-/// or an IP address, nothing more. A URL (`smb://nas`) or `host:port` would
-/// otherwise be taken as a host name that never resolves, and, as part of
-/// the keychain account, file the password under a server that cannot exist.
+/// or an IP address, nothing more. A URL (`smb://nas`), `user@host` or
+/// `host:port` would otherwise be taken as a host name that never resolves,
+/// and, as part of the keychain account, file the password under a server
+/// that cannot exist. Errors never repeat user info: a mistyped server can
+/// carry a password (`smb://alice:secret@nas`), and startup logs the error.
 pub fn check_server(what: &str, value: &str) -> Result<(), String> {
-    let host_hint = |rest: &str| {
-        let host = rest.split(['/', '?']).next().unwrap_or("");
-        let host = host.rsplit('@').next().unwrap_or(host);
-        if host.is_empty() {
-            String::new()
-        } else {
-            format!(" (use {host})")
+    let shown = redact_userinfo(value);
+    let hint = || {
+        let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        match rest.split(['/', '?', '#']).next().unwrap_or("") {
+            "" => String::new(),
+            host => format!(" (use {host})"),
         }
     };
-    if let Some((_, rest)) = value.split_once("://") {
+    if value.contains("://") {
         return Err(format!(
-            "{what}={value} is a URL; expected a host name or IP address{}",
-            host_hint(rest)
+            "{what}={shown} is a URL; expected a host name or IP address{}",
+            hint()
+        ));
+    }
+    if value.contains('@') {
+        return Err(format!(
+            "{what}={shown} includes a user name; expected a host name or IP address{} \
+             (the user goes in SPICEIO_SMB_USER / --user)",
+            hint()
         ));
     }
     if value.contains('/') || value.chars().any(char::is_whitespace) {
         return Err(format!(
-            "{what}={value:?}: expected a host name or IP address, nothing else"
+            "{what}={shown:?}: expected a host name or IP address, nothing else"
         ));
     }
     // One colon followed by digits is host:port. An IPv6 literal has two or
@@ -166,12 +200,10 @@ impl Settings {
     /// Read the settings through `get` (`std::env::var` in production).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let get = |name: &str| get(name).filter(|v| !v.is_empty());
-        let port = match get("SPICEIO_SMB_PORT") {
+        let port = match get("SPICEIO_SMB_PORT").filter(|raw| !raw.trim().is_empty()) {
             None => DEFAULT_PORT,
-            Some(raw) => raw
-                .trim()
-                .parse()
-                .map_err(|_| format!("SPICEIO_SMB_PORT={raw} is not a valid port"))?,
+            Some(raw) => parse_port(&raw)
+                .ok_or_else(|| format!("SPICEIO_SMB_PORT={raw} is not a valid port"))?,
         };
         let server = get("SPICEIO_SMB_SERVER");
         if let Some(server) = &server {
@@ -245,10 +277,8 @@ impl Settings {
                 "--user" => self.user = Some(value),
                 "--domain" => self.domain = value,
                 "--port" => {
-                    self.port = value
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("--port {value} is not a valid port"))?;
+                    self.port = parse_port(&value)
+                        .ok_or_else(|| format!("--port {value} is not a valid port"))?;
                 }
                 _ => self.service = Some(value),
             }
@@ -801,6 +831,37 @@ mod tests {
             Settings::default()
                 .with_args(args(&["--server", "smb://nas"]), "-")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn server_errors_never_repeat_user_info() {
+        for value in [
+            "smb://alice:hunter2@nas.local/share",
+            "smb://alice:pa/ss@nas.local",
+            "alice:hunter2@nas.local",
+            "smb://alice@nas.local",
+        ] {
+            let err = check_server("SPICEIO_SMB_SERVER", value).unwrap_err();
+            for secret in ["alice", "hunter2", "pa/ss"] {
+                assert!(!err.contains(secret), "{value}: {err}");
+            }
+            assert!(err.contains("****@nas.local"), "{value}: {err}");
+            assert!(err.contains("(use nas.local)"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn port_parsing_is_shared_and_ignores_whitespace() {
+        assert_eq!(parse_port(" 4455 "), Some(4455));
+        assert_eq!(parse_port("smb"), None);
+        assert_eq!(
+            settings(&[("SPICEIO_SMB_PORT", " 4455 ")]).unwrap().port,
+            4455
+        );
+        assert_eq!(
+            settings(&[("SPICEIO_SMB_PORT", "   ")]).unwrap().port,
+            DEFAULT_PORT
         );
     }
 

@@ -60,6 +60,7 @@ struct CallBacks {
 }
 
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+const K_CF_NUMBER_SINT32_TYPE: CFIndex = 3;
 const K_CF_NUMBER_SINT64_TYPE: CFIndex = 4;
 
 const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
@@ -76,6 +77,7 @@ const K_SEC_CODE_SIGNATURE_ADHOC: i64 = 0x0002;
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFBooleanTrue: CFTypeRef;
+    static kCFBooleanFalse: CFTypeRef;
     static kCFTypeDictionaryKeyCallBacks: CallBacks;
     static kCFTypeDictionaryValueCallBacks: CallBacks;
     static kCFTypeArrayCallBacks: CallBacks;
@@ -112,6 +114,8 @@ unsafe extern "C" {
     fn CFStringGetMaximumSizeForEncoding(len: CFIndex, encoding: u32) -> CFIndex;
     fn CFStringGetCString(s: CFTypeRef, buf: *mut c_char, size: CFIndex, encoding: u32) -> Boolean;
     fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, out: *mut c_void) -> Boolean;
+    fn CFNumberCreate(alloc: CFTypeRef, kind: CFIndex, value: *const c_void) -> CFTypeRef;
+    fn CFErrorCopyDescription(error: CFTypeRef) -> CFTypeRef;
 }
 
 #[allow(non_upper_case_globals)]
@@ -131,6 +135,34 @@ unsafe extern "C" {
     static kSecUseAuthenticationUI: CFTypeRef;
     static kSecUseAuthenticationUIFail: CFTypeRef;
     static kSecCodeInfoFlags: CFTypeRef;
+    static kSecAttrKeyType: CFTypeRef;
+    static kSecAttrKeyTypeRSA: CFTypeRef;
+    static kSecAttrKeySizeInBits: CFTypeRef;
+    static kSecPrivateKeyAttrs: CFTypeRef;
+    static kSecPublicKeyAttrs: CFTypeRef;
+    static kSecAttrIsPermanent: CFTypeRef;
+    static kSecAttrIsExtractable: CFTypeRef;
+    static kSecAttrAccess: CFTypeRef;
+    static kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256: CFTypeRef;
+    static kSecClassCertificate: CFTypeRef;
+    static kSecValueRef: CFTypeRef;
+
+    fn SecKeyCreateRandomKey(parameters: CFTypeRef, error: *mut CFTypeRef) -> CFTypeRef;
+    fn SecKeyCopyPublicKey(key: CFTypeRef) -> CFTypeRef;
+    fn SecKeyCopyExternalRepresentation(key: CFTypeRef, error: *mut CFTypeRef) -> CFTypeRef;
+    fn SecKeyCreateSignature(
+        key: CFTypeRef,
+        algorithm: CFTypeRef,
+        data: CFTypeRef,
+        error: *mut CFTypeRef,
+    ) -> CFTypeRef;
+    fn SecCertificateCreateWithData(alloc: CFTypeRef, data: CFTypeRef) -> CFTypeRef;
+    fn SecAccessCreate(
+        descriptor: CFTypeRef,
+        trusted: CFTypeRef,
+        access: *mut CFTypeRef,
+    ) -> OSStatus;
+    fn SecTrustedApplicationCreateFromPath(path: *const c_char, app: *mut CFTypeRef) -> OSStatus;
 
     fn SecItemCopyMatching(query: CFTypeRef, result: *mut CFTypeRef) -> OSStatus;
     fn SecItemAdd(attributes: CFTypeRef, result: *mut CFTypeRef) -> OSStatus;
@@ -157,6 +189,11 @@ unsafe extern "C" {
         flags: u32,
         text: *mut CFTypeRef,
     ) -> OSStatus;
+}
+
+// CommonCrypto ships in libSystem; no framework to link.
+unsafe extern "C" {
+    fn CCRandomGenerateBytes(bytes: *mut c_void, count: usize) -> i32;
 }
 
 /// An owned CoreFoundation object, released on drop.
@@ -680,6 +717,365 @@ pub fn own_signature() -> Result<Signature, Error> {
     })
 }
 
+// ── Signing identity ─────────────────────────────────────────────────────
+
+/// The access list a key's ACL is built from: the given applications, plus
+/// this binary (it signs the key's own certificate right after creating it).
+fn access_for(label: &str, trusted_apps: &[&Path]) -> Result<Cf, Error> {
+    let mut apps: Vec<Cf> = Vec::with_capacity(trusted_apps.len() + 1);
+    let mut this: CFTypeRef = std::ptr::null();
+    // SAFETY: a null path means "this application"; out-parameter.
+    let status = unsafe { SecTrustedApplicationCreateFromPath(std::ptr::null(), &mut this) };
+    if status != 0 {
+        return Err(os_error(status));
+    }
+    apps.push(Cf::new(this).ok_or_else(|| Error::Invalid("no trusted application".into()))?);
+    for path in trusted_apps {
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| Error::Invalid(format!("{} contains NUL", path.display())))?;
+        let mut app: CFTypeRef = std::ptr::null();
+        // SAFETY: NUL-terminated path; out-parameter.
+        let status = unsafe { SecTrustedApplicationCreateFromPath(c_path.as_ptr(), &mut app) };
+        if status != 0 {
+            return Err(os_error(status));
+        }
+        apps.push(Cf::new(app).ok_or_else(|| Error::Invalid("no trusted application".into()))?);
+    }
+    let values: Vec<CFTypeRef> = apps.iter().map(|a| a.0).collect();
+    // SAFETY: valid CF objects; the array retains them.
+    let list = Cf::new(unsafe {
+        CFArrayCreate(
+            std::ptr::null(),
+            values.as_ptr(),
+            values.len() as CFIndex,
+            &raw const kCFTypeArrayCallBacks,
+        )
+    })
+    .ok_or_else(|| Error::Invalid("CFArrayCreate failed".into()))?;
+    let descriptor = cf_string(label)?;
+    let mut access: CFTypeRef = std::ptr::null();
+    // SAFETY: valid CFString and CFArray; out-parameter.
+    let status = unsafe { SecAccessCreate(descriptor.0, list.0, &mut access) };
+    if status != 0 {
+        return Err(os_error(status));
+    }
+    Cf::new(access).ok_or_else(|| Error::Invalid("SecAccessCreate returned null".into()))
+}
+
+/// The description a Security.framework `CFErrorRef` carries (and releases it).
+fn cf_error(error: CFTypeRef, what: &str) -> Error {
+    let Some(error) = Cf::new(error) else {
+        return Error::Invalid(format!("{what} failed"));
+    };
+    // SAFETY: a valid CFError; returns a new CFString or null.
+    let text =
+        Cf::new(unsafe { CFErrorCopyDescription(error.0) }).and_then(|t| string_from_cf(t.0));
+    Error::Invalid(format!(
+        "{what}: {}",
+        text.unwrap_or_else(|| "unknown error".into())
+    ))
+}
+
+/// Create a code-signing identity inside the keychain file `keychain`: an
+/// RSA-3072 key pair generated *in* the keychain, whose private key is
+/// non-extractable from the moment it exists, and a self-signed certificate
+/// for it (code signing, `valid_days` long), signed in this process with that
+/// key. The private key is never written anywhere, so no copy of it can
+/// exist. Its access list names `trusted_apps` (e.g. `/usr/bin/codesign`)
+/// and this binary, which needs it once, to sign the certificate.
+///
+/// `scripts/codesign-local.sh` runs this through `spiceio
+/// --create-signing-identity`. The keychain must be unlocked.
+pub fn create_signing_identity(
+    keychain: &Path,
+    common_name: &str,
+    trusted_apps: &[&Path],
+    valid_days: u32,
+) -> Result<(), Error> {
+    if common_name.is_empty() {
+        return Err(Error::Invalid("the identity needs a common name".into()));
+    }
+    let _no_prompts = NoPrompts::new();
+    let kc = open_keychain(keychain)?;
+    if keychain_locked(kc.0)? {
+        return Err(Error::Denied { locked: true });
+    }
+    let access = access_for(common_name, trusted_apps)?;
+    let label = cf_string(common_name)?;
+    let bits: i32 = 3072;
+    // SAFETY: the value outlives the call; CF copies it.
+    let size = Cf::new(unsafe {
+        CFNumberCreate(
+            std::ptr::null(),
+            K_CF_NUMBER_SINT32_TYPE,
+            (&raw const bits).cast::<c_void>(),
+        )
+    })
+    .ok_or_else(|| Error::Invalid("CFNumberCreate failed".into()))?;
+    // SAFETY: reading immutable framework constants.
+    let private_attrs = cf_dict(&unsafe {
+        [
+            (kSecAttrIsPermanent, kCFBooleanTrue),
+            (kSecAttrLabel, label.0),
+        ]
+    })?;
+    // The certificate carries the public key; the keychain needs only the
+    // private half for the identity.
+    // SAFETY: reading immutable framework constants.
+    let public_attrs = cf_dict(&unsafe { [(kSecAttrIsPermanent, kCFBooleanFalse)] })?;
+    // SAFETY: reading immutable framework constants.
+    let params = cf_dict(&unsafe {
+        [
+            (kSecAttrKeyType, kSecAttrKeyTypeRSA),
+            (kSecAttrKeySizeInBits, size.0),
+            (kSecUseKeychain, kc.0),
+            (kSecPrivateKeyAttrs, private_attrs.0),
+            (kSecPublicKeyAttrs, public_attrs.0),
+            // Both at the top level, not in kSecPrivateKeyAttrs: measured on
+            // macOS 27.2.1, a file keychain's key ignores them there. It came
+            // out Extractable=1, and with only its creator on its ACL, so
+            // codesign was refused (errSecInternalComponent, and a dialog).
+            // Here it is Extractable=0, NeverExtractable=1, and the ACL lists
+            // this binary and /usr/bin/codesign.
+            (kSecAttrIsExtractable, kCFBooleanFalse),
+            (kSecAttrAccess, access.0),
+        ]
+    })?;
+    let mut error: CFTypeRef = std::ptr::null();
+    // SAFETY: valid parameters dictionary; out-parameter for the error.
+    let private_key = Cf::new(unsafe { SecKeyCreateRandomKey(params.0, &mut error) })
+        .ok_or_else(|| cf_error(error, "generating the key pair"))?;
+    // SAFETY: a valid SecKeyRef; returns a new reference or null.
+    let public_key = Cf::new(unsafe { SecKeyCopyPublicKey(private_key.0) })
+        .ok_or_else(|| Error::Invalid("the new key has no public half".into()))?;
+    let mut error: CFTypeRef = std::ptr::null();
+    // SAFETY: a valid SecKeyRef; out-parameter for the error.
+    let public_der = Cf::new(unsafe { SecKeyCopyExternalRepresentation(public_key.0, &mut error) })
+        .ok_or_else(|| cf_error(error, "exporting the public key"))?;
+    let public_der = data_bytes(&public_der)?;
+
+    let mut serial = [0u8; 16];
+    // SAFETY: the buffer is writable for its length.
+    if unsafe { CCRandomGenerateBytes(serial.as_mut_ptr().cast(), serial.len()) } != 0 {
+        return Err(Error::Invalid("CCRandomGenerateBytes failed".into()));
+    }
+    // Positive (high bit clear) and never shortened by leading zeros.
+    serial[0] = (serial[0] & 0x7f) | 0x40;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Invalid("the clock is before 1970".into()))?
+        .as_secs() as i64;
+    let not_before = now - 60;
+    let not_after = now + i64::from(valid_days) * 86_400;
+    let tbs = x509::tbs_certificate(common_name, &serial, not_before, not_after, &public_der);
+
+    let tbs_data = cf_data(&tbs)?;
+    let mut error: CFTypeRef = std::ptr::null();
+    // SAFETY: valid key, algorithm constant and data; out-parameter.
+    let signature = Cf::new(unsafe {
+        SecKeyCreateSignature(
+            private_key.0,
+            kSecKeyAlgorithmRSASignatureMessagePKCS1v15SHA256,
+            tbs_data.0,
+            &mut error,
+        )
+    })
+    .ok_or_else(|| cf_error(error, "signing the certificate"))?;
+    let certificate = x509::certificate(&tbs, &data_bytes(&signature)?);
+
+    let cert_data = cf_data(&certificate)?;
+    // SAFETY: valid CFData; returns a new SecCertificateRef or null.
+    let cert = Cf::new(unsafe { SecCertificateCreateWithData(std::ptr::null(), cert_data.0) })
+        .ok_or_else(|| Error::Invalid("the generated certificate does not parse".into()))?;
+    // SAFETY: reading immutable framework constants.
+    let add = cf_dict(&unsafe {
+        [
+            (kSecClass, kSecClassCertificate),
+            (kSecValueRef, cert.0),
+            (kSecUseKeychain, kc.0),
+        ]
+    })?;
+    // SAFETY: valid dictionary; no result requested.
+    let status = unsafe { SecItemAdd(add.0, std::ptr::null_mut()) };
+    if status != 0 {
+        return Err(os_error(status));
+    }
+    Ok(())
+}
+
+/// The bytes of a CFData.
+fn data_bytes(data: &Cf) -> Result<Vec<u8>, Error> {
+    // SAFETY: `data` is a valid CF object; its type is checked first and the
+    // bytes are copied while it is alive.
+    unsafe {
+        if CFGetTypeID(data.0) != CFDataGetTypeID() {
+            return Err(Error::Invalid("expected data".into()));
+        }
+        let len = usize::try_from(CFDataGetLength(data.0)).unwrap_or(0);
+        let ptr = CFDataGetBytePtr(data.0);
+        if len == 0 || ptr.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+    }
+}
+
+/// Just enough DER to write one self-signed X.509 v3 code-signing
+/// certificate. No parser: Security.framework parses the result
+/// (`SecCertificateCreateWithData`), and codesign checks it.
+mod x509 {
+    fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else {
+            let bytes: Vec<u8> = len
+                .to_be_bytes()
+                .into_iter()
+                .skip_while(|&b| b == 0)
+                .collect();
+            out.push(0x80 | bytes.len() as u8);
+            out.extend_from_slice(&bytes);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn seq(parts: &[Vec<u8>]) -> Vec<u8> {
+        der(0x30, &parts.concat())
+    }
+
+    fn oid(arcs: &[u64]) -> Vec<u8> {
+        let mut body = vec![(arcs[0] * 40 + arcs[1]) as u8];
+        for &arc in &arcs[2..] {
+            let mut chunk = vec![(arc & 0x7f) as u8];
+            let mut rest = arc >> 7;
+            while rest > 0 {
+                chunk.push(0x80 | (rest & 0x7f) as u8);
+                rest >>= 7;
+            }
+            chunk.reverse();
+            body.extend_from_slice(&chunk);
+        }
+        der(0x06, &body)
+    }
+
+    fn integer(bytes: &[u8]) -> Vec<u8> {
+        let trimmed: Vec<u8> = bytes.iter().copied().skip_while(|&b| b == 0).collect();
+        let mut body = if trimmed.is_empty() { vec![0] } else { trimmed };
+        if body[0] & 0x80 != 0 {
+            body.insert(0, 0);
+        }
+        der(0x02, &body)
+    }
+
+    fn bit_string(bytes: &[u8]) -> Vec<u8> {
+        let mut body = vec![0];
+        body.extend_from_slice(bytes);
+        der(0x03, &body)
+    }
+
+    const NULL: [u8; 2] = [0x05, 0x00];
+    const TRUE: [u8; 3] = [0x01, 0x01, 0xff];
+
+    fn name(common_name: &str) -> Vec<u8> {
+        let attribute = seq(&[oid(&[2, 5, 4, 3]), der(0x0c, common_name.as_bytes())]);
+        seq(&[der(0x31, &attribute)])
+    }
+
+    /// The civil date of `days` since 1970-01-01 (proleptic Gregorian).
+    pub(super) fn civil_from_days(days: i64) -> (i64, u32, u32) {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        (year, month, day)
+    }
+
+    /// UTCTime before 2050, GeneralizedTime from then on (RFC 5280 4.1.2.5).
+    pub(super) fn time(unix: i64) -> Vec<u8> {
+        let (year, month, day) = civil_from_days(unix.div_euclid(86_400));
+        let secs = unix.rem_euclid(86_400);
+        let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+        if (1950..2050).contains(&year) {
+            let text = format!("{:02}{month:02}{day:02}{h:02}{m:02}{s:02}Z", year % 100);
+            der(0x17, text.as_bytes())
+        } else {
+            let text = format!("{year:04}{month:02}{day:02}{h:02}{m:02}{s:02}Z");
+            der(0x18, text.as_bytes())
+        }
+    }
+
+    fn sha256_with_rsa() -> Vec<u8> {
+        seq(&[oid(&[1, 2, 840, 113_549, 1, 1, 11]), NULL.to_vec()])
+    }
+
+    /// `pkcs1_public_key`: what `SecKeyCopyExternalRepresentation` returns
+    /// for an RSA public key (a PKCS#1 RSAPublicKey).
+    pub(super) fn tbs_certificate(
+        common_name: &str,
+        serial: &[u8],
+        not_before: i64,
+        not_after: i64,
+        pkcs1_public_key: &[u8],
+    ) -> Vec<u8> {
+        let spki = seq(&[
+            seq(&[oid(&[1, 2, 840, 113_549, 1, 1, 1]), NULL.to_vec()]),
+            bit_string(pkcs1_public_key),
+        ]);
+        let basic_constraints = seq(&[oid(&[2, 5, 29, 19]), TRUE.to_vec(), der(0x04, &seq(&[]))]);
+        // digitalSignature: bit 0 of a one-byte BIT STRING with 7 unused bits.
+        let key_usage = seq(&[
+            oid(&[2, 5, 29, 15]),
+            TRUE.to_vec(),
+            der(0x04, &der(0x03, &[0x07, 0x80])),
+        ]);
+        let ext_key_usage = seq(&[
+            oid(&[2, 5, 29, 37]),
+            TRUE.to_vec(),
+            der(0x04, &seq(&[oid(&[1, 3, 6, 1, 5, 5, 7, 3, 3])])),
+        ]);
+        seq(&[
+            der(0xa0, &integer(&[2])),
+            integer(serial),
+            sha256_with_rsa(),
+            name(common_name),
+            seq(&[time(not_before), time(not_after)]),
+            name(common_name),
+            spki,
+            der(0xa3, &seq(&[basic_constraints, key_usage, ext_key_usage])),
+        ])
+    }
+
+    pub(super) fn certificate(tbs: &[u8], signature: &[u8]) -> Vec<u8> {
+        seq(&[tbs.to_vec(), sha256_with_rsa(), bit_string(signature)])
+    }
+
+    #[cfg(test)]
+    pub(super) fn length_of(encoded: &[u8]) -> usize {
+        // For tests: the length an encoding claims, to check der() round trips.
+        let first = encoded[1];
+        if first < 0x80 {
+            usize::from(first)
+        } else {
+            encoded[2..2 + usize::from(first & 0x7f)]
+                .iter()
+                .fold(0usize, |acc, &b| (acc << 8) | usize::from(b))
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn encode(tag: u8, content: &[u8]) -> Vec<u8> {
+        der(tag, content)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +1198,84 @@ mod tests {
         );
         security(&["unlock-keychain", "-p", PASSWORD, kc.path.to_str().unwrap()]);
         assert_eq!(read(&item).unwrap(), b"one");
+    }
+
+    #[test]
+    fn der_lengths_round_trip() {
+        for len in [0usize, 1, 127, 128, 255, 256, 65_535, 65_536] {
+            let encoded = x509::encode(0x04, &vec![0u8; len]);
+            assert_eq!(x509::length_of(&encoded), len, "length {len}");
+        }
+    }
+
+    #[test]
+    fn civil_dates_and_times() {
+        assert_eq!(x509::civil_from_days(0), (1970, 1, 1));
+        assert_eq!(x509::civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(x509::civil_from_days(11_016), (2000, 2, 29));
+        // 2026-11-21T20:30:00Z: UTCTime.
+        assert_eq!(&x509::time(1_795_293_000)[2..], b"261121203000Z");
+        assert_eq!(x509::time(1_795_293_000)[0], 0x17);
+        // 2050 and later: GeneralizedTime.
+        let t = x509::time(2_524_608_000); // 2050-01-01T00:00:00Z
+        assert_eq!((t[0], &t[2..]), (0x18, &b"20500101000000Z"[..]));
+    }
+
+    #[test]
+    fn signing_identity_is_born_non_extractable_in_the_keychain() {
+        let kc = TempKeychain::new();
+        create_signing_identity(
+            &kc.path,
+            "spiceio test signing",
+            &[Path::new("/usr/bin/codesign")],
+            30,
+        )
+        .unwrap();
+        let out = Command::new("/usr/bin/security")
+            .args([
+                "find-identity",
+                "-p",
+                "codesigning",
+                kc.path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            listing.contains("\"spiceio test signing\""),
+            "no identity in the keychain:\n{listing}"
+        );
+        // Attribute 0x10 (Extractable) of the private key, read without -d:
+        // attributes only, so no ACL check and no dialog.
+        let dump = Command::new("/usr/bin/security")
+            .args(["dump-keychain", kc.path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let dump = String::from_utf8_lossy(&dump.stdout);
+        let private_key = dump
+            .split("keychain: ")
+            .find(|item| item.contains("class: 0x00000010"))
+            .expect("a private key item");
+        assert!(
+            private_key.contains("0x00000010 <uint32>=0x00000000"),
+            "the private key is extractable:\n{private_key}"
+        );
+        assert!(private_key.contains("0x00000011 <uint32>=0x00000001"));
+        // codesign is on the key's access list (dump-keychain -a reads ACLs,
+        // not the key), or it would be refused and raise a dialog.
+        let acl = Command::new("/usr/bin/security")
+            .args(["dump-keychain", "-a", kc.path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let acl = String::from_utf8_lossy(&acl.stdout);
+        let key_acl = acl
+            .split("keychain: ")
+            .find(|item| item.contains("class: 0x00000010"))
+            .expect("a private key item");
+        assert!(
+            key_acl.contains("/usr/bin/codesign (OK)"),
+            "codesign is not on the private key's access list:\n{key_acl}"
+        );
     }
 
     #[test]

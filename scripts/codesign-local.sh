@@ -4,8 +4,10 @@
 #
 #   scripts/codesign-local.sh SRC DST
 #
-# Copies SRC to DST and signs DST. Nothing is written to DST unless signing
-# succeeds; a failure leaves no DST behind.
+# Signs a copy of SRC and renames it over DST only once its signature
+# verifies. The copy is a temp file beside DST; a failure at any point
+# removes only that file, so an existing DST (an installed binary, say) is
+# never deleted or left half-written.
 #
 # Why: a keychain item's access list names the designated requirement of the
 # binary that created it. cargo signs ad-hoc, so that requirement is the
@@ -20,10 +22,13 @@
 # key can read the SMB password, so the key must not be usable by whatever
 # else runs as you. A key in the login keychain that `codesign` may use
 # without asking could be used by any of those processes to sign a binary of
-# their own. The signing keychain asks for its password in this terminal.
-# It never shows a dialog: its lock state is checked with
-# `spiceio --keychain-status`, which does not prompt, before `codesign` (which
-# would) touches it.
+# their own. The key pair is generated *inside* that keychain by `spiceio
+# --create-signing-identity`, non-extractable from birth, and spiceio signs
+# the self-signed certificate itself: the private key is never in a file, so
+# no copy of it can exist. The signing keychain asks for its password in this
+# terminal. It never shows a dialog: its lock state is checked with `spiceio
+# --keychain-status`, which does not prompt, before `codesign` (which would)
+# touches it.
 #
 # Settings (environment):
 #   CODESIGN          local (default): sign with the identity in SIGNING_KEYCHAIN,
@@ -31,15 +36,15 @@
 #                     adhoc: ad-hoc signature. A keychain item stored by an
 #                     ad-hoc binary is readable by that exact build only.
 #   SIGNING_KEYCHAIN  default ~/Library/Keychains/spiceio-signing.keychain-db
-#   SPICEIO_STATUS_BIN  a spiceio binary to ask for the keychain's lock state
-#                     (default: SRC, which is the build being installed)
+#   SPICEIO_HELPER_BIN  the spiceio binary that checks the keychain's lock state
+#                     and creates the identity (default: SRC, the build being
+#                     installed)
 #
 # First use creates the keychain and a 10-year self-signed code-signing
-# certificate (RSA-3072, private key imported non-extractable), then signs.
-# It asks for a new password twice, then once more to let codesign use the key.
-# Later installs ask for the password once, unless the keychain is already
-# unlocked (`security unlock-keychain <path>`); either way it is locked again
-# when signing finishes.
+# identity (RSA-3072), then signs. It asks for a new password twice, then once
+# more to let codesign use the key. Later installs ask for the password once,
+# unless the keychain is already unlocked (`security unlock-keychain <path>`);
+# either way it is locked again when signing finishes.
 set -u
 
 [ $# -eq 2 ] || {
@@ -50,21 +55,20 @@ SRC=$1
 DST=$2
 CODESIGN="${CODESIGN:-local}"
 SIGNING_KEYCHAIN="${SIGNING_KEYCHAIN:-$HOME/Library/Keychains/spiceio-signing.keychain-db}"
-SPICEIO_STATUS_BIN="${SPICEIO_STATUS_BIN:-$SRC}"
+SPICEIO_HELPER_BIN="${SPICEIO_HELPER_BIN:-$SRC}"
 IDENTIFIER=ai.spice.spiceio
 CN="spiceio local code signing"
 
 kc=$SIGNING_KEYCHAIN
-work=""
+staged=""
 relock=0
 signed=0
 listed=0
 created=0
 cleanup() {
-    [ -z "$work" ] || rm -rf "$work"
+    [ -z "$staged" ] || rm -f "$staged"
     [ "$listed" = 0 ] || search_list_remove
     [ "$relock" = 0 ] || security lock-keychain "$kc" 2>/dev/null
-    [ "$signed" = 1 ] || rm -f "$DST"
     # A keychain this run created but could not finish (an exportable key,
     # say) must not be picked up by the next install as a working one.
     [ "$created" = 0 ] || [ "$signed" = 1 ] || security delete-keychain "$kc" 2>/dev/null
@@ -128,19 +132,27 @@ local | adhoc) ;;
 *) die "CODESIGN=$CODESIGN: expected local or adhoc" ;;
 esac
 
-# Copy, then sign the copy: SRC (cargo's output) is left as built.
+# Copy SRC (cargo's output, left as built) to a temp file beside DST, so the
+# final rename is atomic and nothing but that temp file is ever removed.
 stage() {
-    rm -f "$DST"
-    cp "$SRC" "$DST" && chmod 0755 "$DST" || die "cannot write $DST"
+    staged=$(mktemp "$(dirname "$DST")/.$(basename "$DST").XXXXXX") || die "cannot write beside $DST"
+    cp "$SRC" "$staged" && chmod 0755 "$staged" || die "cannot write $staged"
     # Drop the linker's ad-hoc signature first, so codesign signs a clean
     # binary instead of announcing that it is replacing one.
-    codesign --remove-signature "$DST" 2>/dev/null || true
+    codesign --remove-signature "$staged" 2>/dev/null || true
+}
+
+# Put the verified copy in place.
+publish() {
+    mv -f "$staged" "$DST" || die "cannot replace $DST"
+    staged=""
+    signed=1
 }
 
 if [ "$CODESIGN" = adhoc ]; then
     stage
-    codesign -f -s - -i "$IDENTIFIER" -o runtime "$DST" || die "codesign failed"
-    signed=1
+    codesign -f -s - -i "$IDENTIFIER" -o runtime "$staged" || die "codesign failed"
+    publish
     echo "signed $DST ad-hoc (a keychain item it stores is readable by this build only)"
     exit 0
 fi
@@ -150,7 +162,7 @@ case "$kc" in
 *) die "SIGNING_KEYCHAIN=$kc is not an absolute path" ;;
 esac
 
-keychain_state() { "$SPICEIO_STATUS_BIN" --keychain-status "$kc"; }
+keychain_state() { "$SPICEIO_HELPER_BIN" --keychain-status "$kc"; }
 
 # The SHA-1 of the signing identity in the keychain, if it has one. Run only
 # once the keychain is unlocked.
@@ -186,45 +198,15 @@ EOF
     # Lock on sleep and after five idle minutes, in case a signing run is
     # interrupted before it locks the keychain itself.
     security set-keychain-settings -l -u -t 300 "$kc" || die "could not configure $kc"
-
-    work=$(mktemp -d "${TMPDIR:-/tmp}/spiceio-sign.XXXXXX") || die "mktemp failed"
-    chmod 700 "$work"
-    cat >"$work/req.cnf" <<EOF
-[req]
-distinguished_name = dn
-prompt = no
-x509_extensions = ext
-[dn]
-CN = $CN
-[ext]
-basicConstraints = critical, CA:false
-keyUsage = critical, digitalSignature
-extendedKeyUsage = critical, codeSigning
-subjectKeyIdentifier = hash
-EOF
-    # /usr/bin/openssl (LibreSSL, part of macOS): its PKCS#12 defaults are the
-    # ones `security import` reads. The key file exists only in this 0700
-    # directory, for the second it takes to import it.
-    /usr/bin/openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
-        -config "$work/req.cnf" -keyout "$work/key.pem" -out "$work/cert.pem" 2>/dev/null ||
-        die "openssl could not create the certificate"
-    p12pass=$(/usr/bin/openssl rand -hex 16) || die "openssl rand failed"
-    P12PASS=$p12pass /usr/bin/openssl pkcs12 -export -name "$CN" \
-        -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/id.p12" -passout env:P12PASS ||
-        die "openssl could not package the identity"
-    # -x: the private key can never be exported again. -T: codesign may use it
-    # (while this keychain is unlocked) without a dialog. No `-f pkcs12`:
-    # measured, it makes `security import` ignore -x and store the key
-    # extractable; the format is detected from the .p12 file anyway.
-    security import "$work/id.p12" -k "$kc" -P "$p12pass" -x -T /usr/bin/codesign >/dev/null ||
-        die "could not import the identity into $kc"
-    rm -rf "$work"
-    work=""
+    # Key pair generated in the keychain, certificate signed by spiceio: the
+    # private key is never written to a file. codesign is on its access list.
+    "$SPICEIO_HELPER_BIN" --create-signing-identity "$kc" "$CN" >/dev/null ||
+        die "could not create the signing identity in $kc"
     # Check it rather than trust the flag: the key's Extractable attribute
     # (0x10) must be 0. Reading attributes touches no ACL, so no dialog.
     extractable=$(key_attribute 0x00000010)
     [ "$extractable" = "<uint32>=0x00000000" ] ||
-        die "the imported signing key is exportable (Extractable $extractable); not using it"
+        die "the new signing key is exportable (Extractable $extractable); not using it"
     echo "Allow codesign to use the new key (asks for the signing keychain's password again):"
     security set-key-partition-list -S apple-tool:,apple: -s "$kc" >/dev/null ||
         die "could not let codesign use the key in $kc"
@@ -251,7 +233,7 @@ fi
 hash=$(identity_hash)
 [ -n "$hash" ] || die "$kc has no \"$CN\" identity. To start over, delete the keychain
        (security delete-keychain '$kc') and run \`make install\` again. A new identity
-       cannot read keychain items the old one stored: store the SMB password again."
+       cannot read keychain items the old one stored: see README, \"New signing identity\"."
 
 stage
 # --timestamp=none: nothing to ask Apple's timestamp server about a
@@ -259,10 +241,10 @@ stage
 # process running as you can attach to spiceio or inject a library into it to
 # read the password from its memory.
 search_list_add
-codesign -f -s "$hash" --keychain "$kc" -i "$IDENTIFIER" -o runtime --timestamp=none "$DST" ||
+codesign -f -s "$hash" --keychain "$kc" -i "$IDENTIFIER" -o runtime --timestamp=none "$staged" ||
     die "codesign failed"
 search_list_remove
-codesign --verify --strict "$DST" || die "the signature on $DST does not verify"
-signed=1
+codesign --verify --strict "$staged" || die "the signature on $staged does not verify"
+publish
 requirement=$(codesign -d -r- "$DST" 2>&1 | sed -n 's/^designated => //p')
 echo "signed $DST: $requirement"
