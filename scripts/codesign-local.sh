@@ -151,6 +151,22 @@ case "$kc" in
 *) die "SIGNING_KEYCHAIN=$kc is not an absolute path" ;;
 esac
 
+# One signing run at a time per signing keychain. Each run unlocks the
+# keychain (or finds it unlocked), signs and locks it again, so two
+# concurrent installs would interleave: one would lock the keychain between
+# the other's lock-state check and its codesign, which then fails or, in a
+# login session, asks for the password in a dialog. The run re-executes
+# itself under lockf(1) on a file beside the keychain, and a second run
+# waits for the first to finish.
+if [ "${SPICEIO_SIGN_LOCK_HELD:-}" != "$kc" ]; then
+    kc_dir=$(dirname "$kc")
+    [ -d "$kc_dir" ] || (umask 077 && mkdir -p "$kc_dir") || die "cannot create $kc_dir"
+    lock="$kc_dir/.$(basename "$kc").lock"
+    lockf -k -s -t 0 "$lock" true ||
+        echo "waiting for another run to finish signing with $kc" >&2
+    exec env SPICEIO_SIGN_LOCK_HELD="$kc" lockf -k -t 900 "$lock" /bin/sh "$0" "$@"
+fi
+
 keychain_state() { "$SPICEIO_HELPER_BIN" --keychain-status "$kc"; }
 
 # The SHA-1 of the signing identity in the keychain, if it has one. Run only

@@ -158,6 +158,22 @@ check "exits 0" [ "$RC" -eq 0 ]
 check "asks for nothing" lacks "assword"
 check "locked again" [ "$(state "$KC")" = locked ]
 
+echo "--- a second run waits for one that is signing"
+# Hold the signing lock the way a run does, then start another run.
+LOCK="$(dirname "$KC")/.$(basename "$KC").lock"
+lockf -k "$LOCK" sleep 3 &
+HOLDER=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do lockf -k -s -t 0 "$LOCK" true || break; sleep 0.1; done
+security unlock-keychain -p "$PW" "$KC"
+START=$(date +%s)
+run env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/waited"
+WAITED=$(($(date +%s) - START))
+wait "$HOLDER"
+check "exits 0" [ "$RC" -eq 0 ]
+check "says it is waiting" has "waiting for another run to finish signing with $KC"
+check "and waits for the lock (${WAITED}s)" [ "$WAITED" -ge 2 ]
+check "locked again" [ "$(state "$KC")" = locked ]
+
 echo "--- the keychain named through a symlinked path"
 # security prints resolved paths (/private/var/… for /var/…); the private
 # list's read-back must accept either spelling.

@@ -61,17 +61,34 @@ fn parse_port(raw: &str) -> Option<u16> {
     raw.trim().parse().ok()
 }
 
+/// `value` split into its URL scheme and the rest, when it starts with one:
+/// an RFC 3986 scheme (a letter, then letters, digits, `+`, `-` or `.`) and
+/// `://`. Not just whatever precedes the first `://`: in a value with no
+/// scheme that is user info (`alice:p://ss@nas`, a password holding `://`).
+fn split_scheme(value: &str) -> (Option<&str>, &str) {
+    if let Some((scheme, rest)) = value.split_once("://")
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return (Some(scheme), rest);
+    }
+    (None, value)
+}
+
 /// `value` with everything before its last `@` (user, and any password)
 /// replaced by `****`, for messages. The last `@`, not the first or the one in
 /// the authority, so a password holding `/` or `@` cannot survive either.
+/// With no `@`, text before a `://` that is not a scheme is replaced too.
 fn redact_userinfo(value: &str) -> String {
-    let (scheme, rest) = match value.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, value),
-    };
+    let (scheme, rest) = split_scheme(value);
     let rest = match rest.rsplit_once('@') {
         Some((_, host)) => format!("****@{host}"),
-        None => rest.to_string(),
+        None => match (scheme, rest.split_once("://")) {
+            (None, Some((_, after))) => format!("****://{after}"),
+            _ => rest.to_string(),
+        },
     };
     match scheme {
         Some(scheme) => format!("{scheme}://{rest}"),
@@ -88,8 +105,14 @@ fn redact_userinfo(value: &str) -> String {
 pub fn check_server(what: &str, value: &str) -> Result<(), String> {
     let shown = redact_userinfo(value);
     let hint = || {
-        let rest = value.split_once("://").map_or(value, |(_, rest)| rest);
-        let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        // The host is what follows the last `@`, or with no `@` and no
+        // scheme, what follows a `://` (redact_userinfo hides the rest).
+        let (scheme, rest) = split_scheme(value);
+        let rest = match rest.rsplit_once('@') {
+            Some((_, host)) => host,
+            None if scheme.is_none() => rest.split_once("://").map_or(rest, |(_, after)| after),
+            None => rest,
+        };
         match rest.split(['/', '?', '#']).next().unwrap_or("") {
             "" => String::new(),
             host => format!(" (use {host})"),
@@ -891,14 +914,24 @@ mod tests {
             "smb://alice:pa/ss@nas.local",
             "alice:hunter2@nas.local",
             "smb://alice@nas.local",
+            // No scheme: what precedes `://` is user info, not a scheme.
+            "alice:p://ss@nas.local",
+            "alice:hunter2@nas.local/x://y",
         ] {
             let err = check_server("SPICEIO_SMB_SERVER", value).unwrap_err();
-            for secret in ["alice", "hunter2", "pa/ss"] {
+            for secret in ["alice", "hunter2", "pa/ss", "p://ss"] {
                 assert!(!err.contains(secret), "{value}: {err}");
             }
             assert!(err.contains("****@nas.local"), "{value}: {err}");
             assert!(err.contains("(use nas.local)"), "{value}: {err}");
         }
+        // No `@` at all, and no scheme before the `://`.
+        let err = check_server("SPICEIO_SMB_SERVER", "alice:hunter2://nas.local").unwrap_err();
+        assert!(!err.contains("alice") && !err.contains("hunter2"), "{err}");
+        assert!(
+            err.contains("****://nas.local") && err.contains("(use nas.local)"),
+            "{err}"
+        );
     }
 
     #[test]
