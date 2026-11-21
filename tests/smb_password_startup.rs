@@ -255,6 +255,57 @@ fn the_login_keychain_does_not_follow_home() {
     );
 }
 
+/// A command is the first argument. A value that reads like a command
+/// (`--service --version`) is a value, not a different command that exits 0
+/// having done nothing, and a command flag anywhere but first is refused.
+#[test]
+fn a_flag_value_never_runs_another_command() {
+    let nowhere = std::env::temp_dir().join("spiceio-no-such.keychain-db");
+    let run = |args: &[&str]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_spiceio"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", std::env::temp_dir())
+            .env("SPICEIO_SMB_PASS_KEYCHAIN_PATH", &nowhere)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"pw\n").unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let base = ["--server", "nas.invalid", "--user", "u", "--service"];
+    for (command, value) in [
+        ("--store-smb-password", "--version"),
+        ("--store-smb-password", "--check-auth"),
+        ("--check-smb-password", "--version"),
+        ("--check-smb-password", "--check-auth"),
+    ] {
+        let mut args = vec![command];
+        args.extend(base);
+        args.push(value);
+        let out = run(&args);
+        let text = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {text}");
+        // It ran the command asked for: that command's keychain error.
+        assert!(
+            text.contains("does not exist (SPICEIO_SMB_PASS_KEYCHAIN_PATH)")
+                && !text.contains("spiceio 0.")
+                && !text.contains("S3 auth"),
+            "{args:?} ran another command: {text}"
+        );
+    }
+    let out = run(&["--server", "--version"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        text(&out).contains("--version must be the first argument"),
+        "{}",
+        text(&out)
+    );
+}
+
 #[test]
 fn neither_source_stops_startup() {
     let out = spiceio(None, &[]).output().unwrap();

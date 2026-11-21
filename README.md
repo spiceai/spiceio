@@ -334,8 +334,10 @@ spiceio --check-smb-password --server nas.example --user svc-spiceio --service a
 
 Each flag falls back to its variable (`SPICEIO_SMB_SERVER`, `SPICEIO_SMB_USER`,
 `SPICEIO_SMB_DOMAIN`, `SPICEIO_SMB_PORT`, `SPICEIO_SMB_PASS_KEYCHAIN`), which is
-how spiceio itself finds the item at startup. The password is never a flag:
-other processes can read a command line from the process list. Output shows
+how spiceio itself finds the item at startup. The command comes first: a flag
+value that reads like another command (`--service --version`) is a value, and
+a command flag anywhere else is refused. The password is never a flag: other
+processes can read a command line from the process list. Output shows
 the destination as `smb://****@server`, never the SMB user, like the startup log.
 
 `make install` does this for the launchd agent by default (see above).

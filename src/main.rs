@@ -460,7 +460,31 @@ fn sweep_interval(stats: &spill::SweepStats) -> Duration {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    let has = |flag: &str| args.iter().any(|a| a == flag);
+    // A command is the first argument, never one found anywhere in argv: the
+    // password commands take values, and a value that happens to read like a
+    // command (`--service --version`) must not run that command instead and
+    // exit 0 having done nothing that was asked. A command flag later on with
+    // no command first is refused for the same reason.
+    const COMMANDS: &[&str] = &[
+        "--version",
+        "-V",
+        "--check-auth",
+        "--check-smb-password",
+        "--store-smb-password",
+        "--create-signing-identity",
+        "--keychain-status",
+    ];
+    let command = args
+        .get(1)
+        .map(String::as_str)
+        .filter(|a| COMMANDS.contains(a));
+    if command.is_none()
+        && let Some(flag) = args.iter().skip(2).find(|a| COMMANDS.contains(&a.as_str()))
+    {
+        eprintln!("{flag} must be the first argument");
+        std::process::exit(2);
+    }
+    let has = |flag: &str| command == Some(flag);
     if has("--version") || has("-V") {
         println!("spiceio {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -503,8 +527,8 @@ async fn main() {
     // self-signed certificate is built and signed here, so the private key
     // is never written anywhere. /usr/bin/codesign may use the key.
     {
-        if let Some(i) = args.iter().position(|a| a == "--create-signing-identity") {
-            let (Some(keychain), Some(name)) = (args.get(i + 1), args.get(i + 2)) else {
+        if has("--create-signing-identity") {
+            let (Some(keychain), Some(name)) = (args.get(2), args.get(3)) else {
                 eprintln!("--create-signing-identity needs a keychain path and a common name");
                 std::process::exit(2);
             };
@@ -527,8 +551,8 @@ async fn main() {
     // without prompting. `make install` asks before signing, because
     // codesign would raise an unlock dialog for a locked keychain.
     {
-        if let Some(i) = args.iter().position(|a| a == "--keychain-status") {
-            let Some(path) = args.get(i + 1) else {
+        if has("--keychain-status") {
+            let Some(path) = args.get(2) else {
                 eprintln!("--keychain-status needs a keychain path");
                 std::process::exit(2);
             };
