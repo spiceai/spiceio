@@ -56,6 +56,47 @@ pub struct Destination {
     pub domain: String,
 }
 
+/// Check an SMB server setting (`what` names it in the error): a host name
+/// or an IP address, nothing more. A URL (`smb://nas`) or `host:port` would
+/// otherwise be taken as a host name that never resolves, and, as part of
+/// the keychain account, file the password under a server that cannot exist.
+pub fn check_server(what: &str, value: &str) -> Result<(), String> {
+    let host_hint = |rest: &str| {
+        let host = rest.split(['/', '?']).next().unwrap_or("");
+        let host = host.rsplit('@').next().unwrap_or(host);
+        if host.is_empty() {
+            String::new()
+        } else {
+            format!(" (use {host})")
+        }
+    };
+    if let Some((_, rest)) = value.split_once("://") {
+        return Err(format!(
+            "{what}={value} is a URL; expected a host name or IP address{}",
+            host_hint(rest)
+        ));
+    }
+    if value.contains('/') || value.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "{what}={value:?}: expected a host name or IP address, nothing else"
+        ));
+    }
+    // One colon followed by digits is host:port. An IPv6 literal has two or
+    // more colons (or arrives bracketed).
+    if let Some((host, port)) = value.split_once(':')
+        && !port.contains(':')
+        && !host.starts_with('[')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!(
+            "{what}={value} includes a port; give the host ({host}) and the port separately \
+             (SPICEIO_SMB_PORT / --port)"
+        ));
+    }
+    Ok(())
+}
+
 /// `dest` for output: `smb://****@server[:port]`. The user name is masked, as
 /// in the startup log's `connecting to smb://****@…` line; logs can travel
 /// further than the terminal that typed the name.
@@ -132,8 +173,12 @@ impl Settings {
                 .parse()
                 .map_err(|_| format!("SPICEIO_SMB_PORT={raw} is not a valid port"))?,
         };
+        let server = get("SPICEIO_SMB_SERVER");
+        if let Some(server) = &server {
+            check_server("SPICEIO_SMB_SERVER", server)?;
+        }
         Ok(Self {
-            server: get("SPICEIO_SMB_SERVER"),
+            server,
             port,
             user: get("SPICEIO_SMB_USER"),
             domain: get("SPICEIO_SMB_DOMAIN").unwrap_or_default(),
@@ -193,7 +238,10 @@ impl Settings {
                 return Err(format!("{name} needs a value"));
             }
             match name.as_str() {
-                "--server" => self.server = Some(value),
+                "--server" => {
+                    check_server("--server", &value)?;
+                    self.server = Some(value);
+                }
                 "--user" => self.user = Some(value),
                 "--domain" => self.domain = value,
                 "--port" => {
@@ -720,6 +768,39 @@ mod tests {
             Source::resolve(&s)
                 .unwrap_err()
                 .contains("not an absolute path")
+        );
+    }
+
+    #[test]
+    fn server_must_be_a_host() {
+        for ok in [
+            "nas.local",
+            "192.168.3.148",
+            "fe80::1",
+            "[fe80::1]",
+            "nas-01",
+        ] {
+            assert_eq!(check_server("--server", ok), Ok(()), "{ok}");
+        }
+        let err = check_server("--server", "smb://192.168.3.148").unwrap_err();
+        assert!(
+            err.contains("is a URL") && err.contains("(use 192.168.3.148)"),
+            "{err}"
+        );
+        let err = check_server("--server", "smb://alice@nas.local/share").unwrap_err();
+        assert!(err.contains("(use nas.local)"), "{err}");
+        let err = check_server("SPICEIO_SMB_SERVER", "nas.local:4455").unwrap_err();
+        assert!(
+            err.contains("includes a port") && err.contains("(nas.local)"),
+            "{err}"
+        );
+        assert!(check_server("--server", "nas.local/share").is_err());
+        assert!(check_server("--server", "nas local").is_err());
+        assert!(settings(&[("SPICEIO_SMB_SERVER", "smb://nas")]).is_err());
+        assert!(
+            Settings::default()
+                .with_args(args(&["--server", "smb://nas"]), "-")
+                .is_err()
         );
     }
 

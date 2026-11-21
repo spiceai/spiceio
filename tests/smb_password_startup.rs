@@ -111,6 +111,20 @@ fn both_sources_stop_startup() {
 }
 
 #[test]
+fn a_url_for_the_server_stops_startup_with_the_host_to_use() {
+    let out = spiceio(None, &[("SPICEIO_SMB_PASS", "x")])
+        .env("SPICEIO_SMB_SERVER", "smb://127.0.0.1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        text(&out).contains("SPICEIO_SMB_SERVER=smb://127.0.0.1 is a URL; expected a host name or IP address (use 127.0.0.1)"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
 fn neither_source_stops_startup() {
     let out = spiceio(None, &[]).output().unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));

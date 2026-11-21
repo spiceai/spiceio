@@ -160,6 +160,10 @@ fn load_smb_password(server: &str, port: u16, user: &str, domain: &str) -> Strin
 impl Config {
     fn from_env() -> Self {
         let smb_server = require_env("SPICEIO_SMB_SERVER");
+        if let Err(e) = smb_password::check_server("SPICEIO_SMB_SERVER", &smb_server) {
+            serr!("[spiceio] {e}");
+            flush_and_exit(1);
+        }
         let smb_port = parse_env_or("SPICEIO_SMB_PORT", smb_password::DEFAULT_PORT);
         let smb_username = require_env("SPICEIO_SMB_USER");
         let smb_domain = env::var("SPICEIO_SMB_DOMAIN").unwrap_or_default();
