@@ -22,9 +22,12 @@ SPICEIO_BIN=$(cd "$(dirname "${1:-$ROOT/target/debug/spiceio}")" && pwd)/$(basen
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/spiceio-codesign.XXXXXX")
 # realpath: keychain paths are compared as strings, and $TMPDIR is a symlink.
 WORK=$(cd "$WORK" && pwd -P)
+SEARCH_LIST_BEFORE=$(security list-keychains -d user)
 cleanup() {
     for kc in "$WORK"/*.keychain-db; do
-        [[ -e "$kc" ]] && security delete-keychain "$kc" 2>/dev/null || true
+        [[ -e "$kc" ]] || continue
+        unlist "$kc" 2>/dev/null || true
+        security delete-keychain "$kc" 2>/dev/null || true
     done
     rm -rf "$WORK"
 }
@@ -96,6 +99,47 @@ run() {
     RC=$?
     set -e
 }
+# listed KC CMD...: run CMD with keychain KC on the user's search list, as
+# codesign-local.sh does while it signs (codesign finds a --keychain identity
+# only through the list in some sessions, such as the CI runner's). The list
+# is re-read before taking KC off again, so other changes survive.
+listed() {
+    local kc=$1 rc=0 k
+    shift
+    local list=()
+    while IFS= read -r k; do
+        k=${k#*\"}
+        k=${k%\"*}
+        [[ -n "$k" ]] && list+=("$k")
+    done < <(security list-keychains -d user)
+    security list-keychains -d user -s "${list[@]}" "$kc"
+    "$@" || rc=$?
+    unlist "$kc"
+    return $rc
+}
+# unlist KC: take KC off the user's search list, in either spelling
+# (`security list-keychains` prints /private/var/… for /var/…).
+unlist() {
+    local kc=$1 real k
+    real=$(cd "$(dirname "$kc")" 2>/dev/null && pwd -P)/$(basename "$kc")
+    local list=()
+    while IFS= read -r k; do
+        k=${k#*\"}
+        k=${k%\"*}
+        [[ -n "$k" && "$k" != "$kc" && "$k" != "$real" ]] && list+=("$k")
+    done < <(security list-keychains -d user)
+    security list-keychains -d user -s "${list[@]}"
+}
+# signing_diagnostics KC: what to look at when signing with KC fails.
+signing_diagnostics() {
+    {
+        echo "macOS $(sw_vers -productVersion), session $(launchctl managername 2>/dev/null)"
+        echo "identities in $1:"
+        security find-identity -p codesigning "$1"
+        echo "valid identities in $1:"
+        security find-identity -v -p codesigning "$1"
+    } >&2
+}
 state() { "$SPICEIO_BIN" --keychain-status "$1"; }
 # cs ARGS...: codesign, quiet on success, its own error on failure (set -e
 # then stops the run with a reason instead of silently).
@@ -113,6 +157,7 @@ mode_of() { stat -f '%Lp' "$1"; }
 
 echo "--- first run creates the signing keychain and identity, then signs"
 run_tty "$PW" env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/a"
+[ "$RC" -eq 0 ] || signing_diagnostics "$KC"
 check "exits 0" [ "$RC" -eq 0 ]
 check "asks for a new password (and to retype it)" has "retype password for new keychain"
 check "creates the keychain 0600" [ "$(mode_of "$KC")" = 600 ]
@@ -122,13 +167,17 @@ check "the signature verifies" codesign --verify --strict "$WORK/a"
 check "says what it signed with" has "signed $WORK/a: identifier \"ai.spice.spiceio\""
 check "locks the keychain when done" [ "$(state "$KC")" = locked ]
 off_search_list() { ! security list-keychains -d user | grep -qF "$1"; }
-check "keeps it off the keychain search list" off_search_list "$KC"
+check "takes it off the keychain search list again" off_search_list "$KC"
 security unlock-keychain -p "$PW" "$KC"
-set +e
-OUT=$(security export -k "$KC" -t privKeys -f pkcs12 -P x -o "$WORK/key.p12" 2>&1)
-RC=$?
-set -e
-check "the private key cannot be exported" [ "$RC" -ne 0 ]
+# Read the key's attributes rather than attempt an export: an export is
+# checked against the key's ACL first, and that raises a dialog (it did, on
+# every run, until this read the attributes instead). 0x10 is Extractable,
+# 0x11 NeverExtractable; dump-keychain without -d reads no secret.
+key_attr() {
+    security dump-keychain "$KC" | awk -v a="$1" '/^class: 0x00000010/ { k = 1 } /^keychain:/ { if (k) exit } k && $1 == a { print $2; exit }'
+}
+check "the private key is not extractable" [ "$(key_attr 0x00000010)" = "<uint32>=0x00000000" ]
+check "and never was" [ "$(key_attr 0x00000011)" = "<uint32>=0x00000001" ]
 HASH=$(security find-identity -p codesigning "$KC" | awk '/Matching identities/ {m=1} m && /spiceio local code signing/ {print $2; exit}')
 [[ -n "$HASH" ]] || {
     echo "setup failed: no signing identity in $KC:" >&2
@@ -157,6 +206,16 @@ security unlock-keychain -p "$PW" "$KC"
 run env SIGNING_KEYCHAIN="$KC" sh "$SIGN" "$SPICEIO_BIN" "$WORK/c"
 check "exits 0" [ "$RC" -eq 0 ]
 check "asks for nothing" lacks "assword"
+check "locked again" [ "$(state "$KC")" = locked ]
+
+echo "--- the keychain named through a symlinked path"
+# security prints resolved paths; the script must still take it off the list.
+security unlock-keychain -p "$PW" "$KC"
+ALIAS=${KC#/private}
+[[ "$ALIAS" != "$KC" && -e "$ALIAS" ]] || ALIAS="$KC" # no /private prefix here: same path
+run env SIGNING_KEYCHAIN="$ALIAS" sh "$SIGN" "$SPICEIO_BIN" "$WORK/aliased"
+check "exits 0" [ "$RC" -eq 0 ]
+check "leaves the search list as it was" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
 check "locked again" [ "$(state "$KC")" = locked ]
 
 echo "--- no signing keychain and no terminal"
@@ -216,7 +275,8 @@ cp "$WORK/a" "$WORK/rebuilt"
 # A rebuild changes the cdhash; so does a different CodeDirectory flag, which
 # is how this stands in for one without recompiling. The keychain checks the
 # designated requirement, which names the identity, not the cdhash.
-cs -f -s "$HASH" --keychain "$KC" -i ai.spice.spiceio -o runtime,kill --timestamp=none "$WORK/rebuilt"
+listed "$KC" cs -f -s "$HASH" --keychain "$KC" -i ai.spice.spiceio -o runtime,kill --timestamp=none "$WORK/rebuilt" ||
+    { signing_diagnostics "$KC"; exit 1; }
 security lock-keychain "$KC"
 check "its cdhash differs" [ "$(cdhash "$WORK/rebuilt")" != "$(cdhash "$WORK/a")" ]
 check "its requirement is the same" [ "$(requirement "$WORK/rebuilt")" = "$REQ_A" ]
@@ -305,6 +365,8 @@ security unlock-keychain -p items-pw "$ITEMS"
 run env -i PATH=/usr/bin:/bin SPICEIO_SMB_PASS=inline "$WORK/a" --check-smb-password
 check "an inline password still works" [ "$RC" -eq 0 ]
 check "and is reported as such" has "SMB password: SPICEIO_SMB_PASS (environment)"
+
+check "leaves the keychain search list as it found it" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
 
 echo ""
 echo "codesign-local: $PASS passed, $FAIL failed"

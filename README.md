@@ -359,8 +359,8 @@ attach to spiceio or inject a library into it to read the password from memory.
 
 **The signing key is locked away.** Anything signed with that key can read the
 password, so the key lives in its own keychain
-(`~/Library/Keychains/spiceio-signing.keychain-db`, `SIGNING_KEYCHAIN=`), off
-the keychain search list, with its own password, locked except while install
+(`~/Library/Keychains/spiceio-signing.keychain-db`, `SIGNING_KEYCHAIN=`), on
+the keychain search list only while install signs, with its own password, locked except while install
 signs. The private key is imported non-extractable. The first `make install`
 creates it and asks you to choose that password (twice, then once more to let
 `codesign` use the key). Every later install asks for it once in the terminal.

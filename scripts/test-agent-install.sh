@@ -20,11 +20,16 @@ SPICEIO_BIN=$(cd "$(dirname "${1:-$ROOT/target/debug/spiceio}")" && pwd)/$(basen
     exit 1
 }
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/spiceio-agent-install.XXXXXX")
+# Resolved: `security list-keychains` prints /private/var/…, not /var/….
+WORK=$(cd "$WORK" && pwd -P)
 SERVER_PID=""
+SEARCH_LIST_BEFORE=$(security list-keychains -d user)
 cleanup() {
     [[ -z "$SERVER_PID" ]] || kill "$SERVER_PID" 2>/dev/null || true
     for kc in "$WORK"/*.keychain-db; do
-        [[ -e "$kc" ]] && security delete-keychain "$kc" 2>/dev/null || true
+        [[ -e "$kc" ]] || continue
+        unlist "$kc" 2>/dev/null || true
+        security delete-keychain "$kc" 2>/dev/null || true
     done
     rm -rf "$WORK"
 }
@@ -70,29 +75,97 @@ setup() {
         return 1
     fi
 }
-setup "create the signing keychain" security create-keychain -p signing-pw "$SIGNING_KC"
-setup "configure the signing keychain" security set-keychain-settings "$SIGNING_KC"
-printf '[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=ext\n[dn]\nCN=spiceio local code signing\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' >"$WORK/req.cnf"
-setup "create the certificate" /usr/bin/openssl req -x509 -newkey rsa:2048 -days 2 -nodes -config "$WORK/req.cnf" \
-    -keyout "$WORK/key.pem" -out "$WORK/cert.pem"
-setup "package the identity" /usr/bin/openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
-    -out "$WORK/id.p12" -passout pass:x
-setup "import the identity" security import "$WORK/id.p12" -k "$SIGNING_KC" -P x -x -T /usr/bin/codesign
-setup "let codesign use the key" security set-key-partition-list -S apple-tool:,apple: -s -k signing-pw "$SIGNING_KC"
-rm -f "$WORK/key.pem" "$WORK/id.p12"
+# The identity is made by scripts/codesign-local.sh itself, on a pseudo-
+# terminal that types the password at its prompts: the path `make install`
+# takes. Not by hand with `security set-key-partition-list -k`: that form
+# raised a GUI keychain dialog (securityd: "displaying keychain prompt for
+# /usr/bin/security") on every run, which a test must never do.
+cat >"$WORK/pty.py" <<'EOF'
+import os, pty, select, sys, time
+password = os.environ["PTY_PASSWORD"].encode()
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[1], sys.argv[1:])
+seen, pending, deadline = b"", b"", time.time() + 120
+while time.time() < deadline:
+    if not select.select([fd], [], [], 0.5)[0]:
+        continue
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        break
+    if not data:
+        break
+    seen += data
+    pending += data
+    if b"assword" in pending and pending.rstrip().endswith(b":"):
+        os.write(fd, password + b"\n")
+        pending = b""
+_, status = os.waitpid(pid, 0)
+sys.stdout.write(seen.decode(errors="replace"))
+sys.exit(os.waitstatus_to_exitcode(status))
+EOF
+setup "create the signing identity (scripts/codesign-local.sh)" env PTY_PASSWORD=signing-pw \
+    SIGNING_KEYCHAIN="$SIGNING_KC" python3 -I "$WORK/pty.py" sh "$ROOT/scripts/codesign-local.sh" \
+    "$SPICEIO_BIN" "$WORK/bindir/spiceio"
+# codesign-local.sh locks it when done; the variants below sign directly.
+setup "unlock the signing keychain" security unlock-keychain -p signing-pw "$SIGNING_KC"
 SIGNING_HASH=$(security find-identity -p codesigning "$SIGNING_KC" | awk '/Matching identities/ {m=1} m && /spiceio local/ {print $2; exit}')
 [[ -n "$SIGNING_HASH" ]] || {
     echo "setup failed: no signing identity in $SIGNING_KC:" >&2
     security find-identity -p codesigning "$SIGNING_KC" >&2
     exit 1
 }
+# listed KC CMD...: run CMD with keychain KC on the user's search list, as
+# codesign-local.sh does while it signs (codesign finds a --keychain identity
+# only through the list in some sessions, such as the CI runner's). The list
+# is re-read before taking KC off again, so other changes survive.
+listed() {
+    local kc=$1 rc=0 k
+    shift
+    local list=()
+    while IFS= read -r k; do
+        k=${k#*\"}
+        k=${k%\"*}
+        [[ -n "$k" ]] && list+=("$k")
+    done < <(security list-keychains -d user)
+    security list-keychains -d user -s "${list[@]}" "$kc"
+    "$@" || rc=$?
+    unlist "$kc"
+    return $rc
+}
+# unlist KC: take KC off the user's search list, in either spelling
+# (`security list-keychains` prints /private/var/… for /var/…).
+unlist() {
+    local kc=$1 real k
+    real=$(cd "$(dirname "$kc")" 2>/dev/null && pwd -P)/$(basename "$kc")
+    local list=()
+    while IFS= read -r k; do
+        k=${k#*\"}
+        k=${k%\"*}
+        [[ -n "$k" && "$k" != "$kc" && "$k" != "$real" ]] && list+=("$k")
+    done < <(security list-keychains -d user)
+    security list-keychains -d user -s "${list[@]}"
+}
+# signing_diagnostics KC: what to look at when signing with KC fails.
+signing_diagnostics() {
+    {
+        echo "macOS $(sw_vers -productVersion), session $(launchctl managername 2>/dev/null)"
+        echo "identities in $1:"
+        security find-identity -p codesigning "$1"
+        echo "valid identities in $1:"
+        security find-identity -v -p codesigning "$1"
+    } >&2
+}
 # sign DST [extra -o flags]: a copy of the binary under test, signed with it.
 sign() {
     cp "$SPICEIO_BIN" "$1"
-    setup "sign $1" codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" -i ai.spice.spiceio \
-        -o "runtime${2:+,$2}" --timestamp=none "$1"
+    listed "$SIGNING_KC" setup "sign $1" codesign -f -s "$SIGNING_HASH" --keychain "$SIGNING_KC" \
+        -i ai.spice.spiceio -o "runtime${2:+,$2}" --timestamp=none "$1" || {
+        signing_diagnostics "$SIGNING_KC"
+        return 1
+    }
 }
-sign "$WORK/bindir/spiceio"
 cp "$SPICEIO_BIN" "$WORK/adhocbin/spiceio"
 setup "ad-hoc sign" codesign -f -s - -i ai.spice.spiceio "$WORK/adhocbin/spiceio"
 
@@ -494,6 +567,8 @@ install_agent BINDIR="$WORK/adhocbin"
 check "exits 0" [ "$RC" -eq 0 ]
 check "says why not" has "is ad-hoc"
 check "the password stays in the plist" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+
+check "leaves the keychain search list as it found it" [ "$(security list-keychains -d user)" = "$SEARCH_LIST_BEFORE" ]
 
 echo ""
 echo "agent-install: $PASS passed, $FAIL failed"
