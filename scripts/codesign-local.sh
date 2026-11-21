@@ -20,9 +20,11 @@
 # Where the key lives: in its own keychain (SIGNING_KEYCHAIN), with its own
 # password, locked except while this script signs. Anything signed with this
 # key can read the SMB password, so the key must not be usable by whatever
-# else runs as you. A key in the login keychain that `codesign` may use
-# without asking could be used by any of those processes to sign a binary of
-# their own. The key pair is generated *inside* that keychain by `spiceio
+# else runs as you, except in that window: while the keychain is unlocked,
+# codesign may use the key without asking (it must, to sign unattended), and
+# so may any process running as you that calls it. The window is kept short
+# (about 0.2 s, measured): the identity checks and the signature. A key in the login keychain that `codesign` may use
+# without asking could be used by any of those processes at any time. The key pair is generated *inside* that keychain by `spiceio
 # --create-signing-identity`, non-extractable from birth, and spiceio signs
 # the self-signed certificate itself: the private key is never in a file, so
 # no copy of it can exist. The signing keychain asks for its password in this
@@ -227,6 +229,12 @@ EOF
         die "could not let codesign use the key in $kc"
 }
 
+# The copy is made before the keychain is unlocked, and the keychain is
+# locked again as soon as codesign returns: while it is unlocked, any process
+# running as you could use codesign with the key too (README, "What this
+# does not protect against").
+stage
+
 if [ ! -e "$kc" ]; then
     create_identity
 else
@@ -257,14 +265,14 @@ hash=$(printf '%s\n' "$hashes" | head -1)
        cannot read keychain items the old one stored: see README, \"New signing identity\"."
 require_unexportable_key
 
-stage
+make_sign_home
 # --timestamp=none: nothing to ask Apple's timestamp server about a
 # self-signed signature. -o runtime: the hardened runtime, so no other
 # process running as you can attach to spiceio or inject a library into it to
 # read the password from its memory.
-make_sign_home
 HOME=$sign_home codesign -f -s "$hash" --keychain "$kc" -i "$IDENTIFIER" -o runtime --timestamp=none "$staged" ||
     die "codesign failed"
+[ "$relock" = 0 ] || { security lock-keychain "$kc" && relock=0; } || die "could not lock $kc again"
 drop_sign_home
 codesign --verify --strict "$staged" || die "the signature on $staged does not verify"
 publish

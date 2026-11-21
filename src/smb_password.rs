@@ -293,16 +293,24 @@ impl Settings {
                 }
                 _ => (arg, None),
             };
+            // The flag's value: `--name=value`, or the next argument. Only
+            // `--domain` may be empty, and must be able to: no domain is a
+            // valid setting, and the only way to override SPICEIO_SMB_DOMAIN
+            // with none. A flag with nothing after it is an error either way.
+            let mut given = || {
+                inline
+                    .clone()
+                    .or_else(|| args.next())
+                    .ok_or_else(|| format!("{name} needs a value"))
+            };
             let mut value = || {
-                let value = match inline.clone() {
-                    Some(v) => v,
-                    None => args.next().unwrap_or_default(),
-                };
-                if value.is_empty() {
-                    Err(format!("{name} needs a value"))
-                } else {
-                    Ok(value)
-                }
+                given().and_then(|value| {
+                    if value.is_empty() {
+                        Err(format!("{name} needs a value"))
+                    } else {
+                        Ok(value)
+                    }
+                })
             };
             match name.as_str() {
                 "--server" => {
@@ -318,7 +326,7 @@ impl Settings {
                     });
                 }
                 "--user" => self.user = Some(value()?),
-                "--domain" => self.domain = value()?,
+                "--domain" => self.domain = given()?,
                 "--service" => self.service = Some(value()?),
                 "--password" | "--pass" | "--smb-pass" | "-p" => {
                     return Err(format!(
@@ -1127,6 +1135,28 @@ mod tests {
                 err.contains("never taken from the command line"),
                 "{glued}: {err}"
             );
+        }
+    }
+
+    /// An empty domain is a setting (no domain), and the only way to override
+    /// SPICEIO_SMB_DOMAIN with none; a flag with no value at all is an error.
+    #[test]
+    fn an_empty_domain_overrides_the_environment() {
+        let env = settings(&[("SPICEIO_SMB_DOMAIN", "CORP")]);
+        for list in [&["--domain="][..], &["--domain", ""]] {
+            let s = env.clone().with_args(args(list), "-").unwrap();
+            assert_eq!(s.domain, "", "{list:?}");
+        }
+        let err = env.clone().with_args(args(&["--domain"]), "-").unwrap_err();
+        assert!(err.contains("--domain needs a value"), "{err}");
+        for list in [
+            &["--server="][..],
+            &["--user", ""],
+            &["--service="],
+            &["--port", ""],
+        ] {
+            let err = env.clone().with_args(args(list), "-").unwrap_err();
+            assert!(err.contains("needs a value"), "{list:?}: {err}");
         }
     }
 

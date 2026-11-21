@@ -371,6 +371,19 @@ To install without a terminal, unlock it first:
 install locks it again when done. install never raises a dialog: it checks the
 lock state with `spiceio --keychain-status`, which does not prompt.
 
+**What this does not protect against.** Anything running as you can use the
+signing key while its keychain is unlocked: `codesign` is on the key's access
+list so that install can sign without a dialog, so another process could run
+`codesign` with the key and sign a binary of its own, which could then read the
+password. install keeps that window short: it copies the build before it
+unlocks the keychain and locks it again as soon as `codesign` returns (about
+0.2 s, measured; the identity checks and the signature itself). If you unlock the signing keychain yourself, the window lasts until
+install locks it, the Mac sleeps, or five idle minutes pass. A process running
+as you during an install could also change the build before it is signed. The
+protection is against reading the password at rest and against processes that
+run as you at any other time, not against one that is already watching for an
+install.
+
 **spiceio never prompts.** It reads the item with keychain interaction off, so
 a locked keychain or a binary not on the access list fails startup at once with
 the reason, instead of waiting on a dialog nobody may be there to answer. The
