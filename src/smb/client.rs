@@ -846,7 +846,7 @@ impl SmbClient {
         let status1 = NtStatus::from_u32(resp_hdr.status);
         if status1.is_error() && status1 != NtStatus::MoreProcessingRequired {
             return Err(handshake_error(
-                "session setup",
+                SESSION_SETUP,
                 resp_hdr.status,
                 io::ErrorKind::PermissionDenied,
             ));
@@ -890,7 +890,7 @@ impl SmbClient {
         let (resp_hdr, resp_raw) = self.send_recv_inner(&packet).await?;
         if NtStatus::from_u32(resp_hdr.status).is_error() {
             return Err(handshake_error(
-                "session setup",
+                SESSION_SETUP,
                 resp_hdr.status,
                 io::ErrorKind::PermissionDenied,
             ));
@@ -2828,6 +2828,10 @@ pub(crate) fn is_capacity_error(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::ResourceBusy
 }
 
+/// The handshake step that authenticates: `handshake_error` reads a denial
+/// from it as a refused login.
+const SESSION_SETUP: &str = "session setup";
+
 /// The name of an NTSTATUS with which a server refuses the credentials
 /// themselves: the account, its password, or whether it may log in at all.
 /// Retrying never fixes one of these, and each retry of a bad password is one
@@ -2911,7 +2915,13 @@ pub fn credentials_rejected(e: &io::Error) -> Option<CredentialsRejected> {
 /// status uses `fallback`. Non-capacity errors are logged at error level.
 /// `context` names the step for the log/message.
 fn handshake_error(context: &str, status: u32, fallback: io::ErrorKind) -> io::Error {
-    if let Some(name) = credential_rejection(status) {
+    // STATUS_ACCESS_DENIED from session setup refuses the login (the account
+    // may not log in over the network, say); from a later step it is an ACL
+    // on the share or a file, and stays an ordinary PermissionDenied.
+    let refused = credential_rejection(status).or((context == SESSION_SETUP
+        && NtStatus::from_u32(status) == NtStatus::AccessDenied)
+        .then_some("STATUS_ACCESS_DENIED"));
+    if let Some(name) = refused {
         crate::serr!("[spiceio] smb {context} refused the credentials: {name} (0x{status:08X})");
         return io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -3333,19 +3343,24 @@ mod tests {
     fn handshake_error_marks_refused_credentials_permanent() {
         for status in [
             0xC000006D, 0xC000006A, 0xC0000064, 0xC0000071, 0xC0000072, 0xC0000234,
+            // Access denied, at session setup only (below: not at tree connect).
+            0xC0000022,
         ] {
-            let e = handshake_error("session setup", status, io::ErrorKind::PermissionDenied);
+            let e = handshake_error(SESSION_SETUP, status, io::ErrorKind::PermissionDenied);
             let refused = credentials_rejected(&e).expect("a typed credential refusal");
             assert_eq!(refused.status, status);
             assert!(e.to_string().contains(refused.name), "{e}");
             assert!(!is_capacity_error(&e), "a refusal is not back-pressure");
         }
-        // Server capacity, an ACL denial and a bad parameter are not refusals
-        // of the credentials.
-        for status in [0xC00000CE, 0xC0000022, 0xC000000D] {
-            let e = handshake_error("session setup", status, io::ErrorKind::PermissionDenied);
+        // Server capacity and a bad parameter are not refusals of the
+        // credentials, and nor is an ACL denial at tree connect.
+        for status in [0xC00000CE, 0xC000000D] {
+            let e = handshake_error(SESSION_SETUP, status, io::ErrorKind::PermissionDenied);
             assert_eq!(credentials_rejected(&e), None, "0x{status:08X}");
         }
+        let acl = handshake_error("tree connect to 's'", 0xC0000022, io::ErrorKind::NotFound);
+        assert_eq!(credentials_rejected(&acl), None);
+        assert_eq!(acl.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

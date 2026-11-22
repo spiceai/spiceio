@@ -133,20 +133,36 @@ fn an_unsigned_success_is_not_a_login() {
 }
 
 #[test]
-fn access_denied_at_login_is_not_reported_as_a_share_refusal() {
+fn access_denied_at_login_is_a_refused_login() {
     // STATUS_ACCESS_DENIED at session setup: the login itself was refused,
-    // so nothing may claim it succeeded.
+    // once, and nothing may claim it succeeded.
     let fake = Fake::start(&["--status", "0xC0000022"]);
     let out = check_login(&fake);
     let text = text(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("the server refused the login"), "{text}");
+    assert!(
+        text.contains("rejected the login: STATUS_ACCESS_DENIED"),
+        "{text}"
+    );
     assert!(!text.contains("logged in"), "{text}");
+    assert_eq!(fake.events(), ["auth"], "{text}");
 }
 
 #[test]
 fn startup_stops_after_a_refused_login_and_says_why() {
-    let fake = Fake::start(&[]);
+    startup_stops_after(&[], "STATUS_LOGON_FAILURE");
+}
+
+#[test]
+fn startup_stops_after_access_denied_at_login() {
+    startup_stops_after(&["--status", "0xC0000022"], "STATUS_ACCESS_DENIED");
+}
+
+/// Start the server against a fake that refuses the login with `fake_args`'s
+/// status: one attempt, no retry, the process stays up, and a request is
+/// told why (`name`).
+fn startup_stops_after(fake_args: &[&str], name: &str) {
+    let fake = Fake::start(fake_args);
     let http = TcpListener::bind("127.0.0.1:0").unwrap();
     let bind = http.local_addr().unwrap();
     drop(http);
@@ -210,7 +226,7 @@ fn startup_stops_after_a_refused_login_and_says_why() {
         "the 503 does not say spiceio cannot log in"
     );
     assert!(
-        response.contains("STATUS_LOGON_FAILURE"),
+        response.contains(name),
         "the 503 does not name the server's answer"
     );
 }
