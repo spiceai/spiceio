@@ -337,6 +337,7 @@ spiceio --check-smb-password --server nas.example --user svc-spiceio --service a
 #   SMB password: keychain item "ai.spice.spiceio.smb" for smb://****@nas.example (the login keychain)
 spiceio --check-smb-login --server nas.example --user svc-spiceio --share cache
 #   SMB login: ok, smb://****@nas.example/cache   (one attempt; exit 1 if refused, 2 if unreachable)
+#   --password-stdin: take the password from a pipe instead (how install checks a plist password)
 ```
 
 Each flag falls back to its variable (`SPICEIO_SMB_SERVER`, `SPICEIO_SMB_USER`,
@@ -356,7 +357,9 @@ healer. Each attempt with the same password would be one more failed logon,
 and enough of them lock the account, on a NAS that other machines and CI share.
 spiceio stays up and answers every request with a 503 that names the refusal,
 rather than exiting, because under launchd's `KeepAlive` a restart would only
-try, and fail, again. Fix the password (`--store-smb-password`), check it with
+try, and fail, again. The same goes for a password changed on the NAS while
+spiceio runs: once a reconnect is refused, a 503 names the refusal instead of
+inviting a retry. Fix the password (`--store-smb-password`), check it with
 `--check-smb-login`, and restart the agent.
 
 **The server proves who it is.** spiceio requires SMB signing and verifies the

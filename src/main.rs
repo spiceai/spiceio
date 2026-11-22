@@ -1105,12 +1105,22 @@ async fn main() {
                 // access log is on; `finish` then hands the body straight back.
                 let observed = access_log::begin(&req);
                 let response = match ready.get() {
-                    Some(state) => s3::router::handle_request(req, state).await,
+                    Some(state) => {
+                        let response = s3::router::handle_request(req, state).await;
+                        // After a reconnect met a refusal (the password changed
+                        // on the NAS), a 503 is that refusal: say so, instead of
+                        // the generic "retry" for a connection that will not heal.
+                        match state.share.credentials_refused() {
+                            Some(refused)
+                                if response.status() == hyper::StatusCode::SERVICE_UNAVAILABLE =>
+                            {
+                                s3::router::login_refused(&refused.to_string())
+                            }
+                            _ => response,
+                        }
+                    }
                     None => match login_refused.get() {
-                        Some(reason) => s3::router::service_unavailable(&format!(
-                            "spiceio cannot log in to the SMB backend: {reason}. Fix the SMB \
-                             credentials and restart spiceio."
-                        )),
+                        Some(reason) => s3::router::login_refused(reason),
                         None => s3::router::service_unavailable(
                             "spiceio is still connecting to the SMB backend; please retry.",
                         ),

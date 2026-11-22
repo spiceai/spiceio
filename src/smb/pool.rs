@@ -404,6 +404,12 @@ impl SmbPool {
     /// Recommended HTTP admission depth for this pool: enough concurrent S3
     /// ops to keep every connection busy with pipelined work, not enough to
     /// bury the process under a client stampede when the NAS is slow.
+    /// The refusal a reconnect met, once the server has refused the
+    /// credentials (the healer then makes no more attempts).
+    pub fn credentials_refused(&self) -> Option<super::client::CredentialsRejected> {
+        self.credentials_rejected.get().copied()
+    }
+
     pub fn admission_limit(&self) -> usize {
         self.size().saturating_mul(WORK_SLOTS_PER_CONN).max(16)
     }

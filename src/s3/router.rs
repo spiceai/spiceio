@@ -3398,6 +3398,17 @@ fn io_to_s3_write_error(e: &io::Error) -> Response<SpiceioBody> {
 /// retries. sccache classifies temporary storage errors; returning a clean
 /// retryable status (rather than dropping the TCP connection) lets a client
 /// that retries the check succeed once the NAS is up.
+/// The 503 for a server that refused spiceio's SMB login (`reason`, its
+/// answer): at startup, or on a reconnect after the password changed on the
+/// NAS. Still a 503, because to a client it is the backend that is down, but
+/// it names the refusal and what fixes it rather than inviting a retry.
+pub fn login_refused(reason: &str) -> Response<SpiceioBody> {
+    service_unavailable(&format!(
+        "spiceio cannot log in to the SMB backend: {reason}. Fix the SMB credentials and \
+         restart spiceio."
+    ))
+}
+
 pub fn service_unavailable(message: &str) -> Response<SpiceioBody> {
     let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", message);
     // hyper Response builders don't re-open; insert on the built response.
@@ -3854,6 +3865,19 @@ mod tests {
         // Traversal survives decoding for the handler's check to catch.
         let (_, k) = parse_copy_source("/bucket/%2e%2e/etc/passwd");
         assert!(key_has_traversal(&k));
+    }
+
+    #[test]
+    fn login_refused_names_the_refusal_and_the_fix() {
+        let resp = login_refused("the SMB server rejected the login: STATUS_LOGON_FAILURE");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = match resp.into_body() {
+            SpiceioBody::Full(Some(b)) => String::from_utf8(b.to_vec()).unwrap(),
+            _ => String::new(),
+        };
+        assert!(body.contains("cannot log in to the SMB backend"), "{body}");
+        assert!(body.contains("STATUS_LOGON_FAILURE"), "{body}");
+        assert!(body.contains("restart spiceio"), "{body}");
     }
 
     #[test]

@@ -233,6 +233,10 @@ pub struct Settings {
     /// `SPICEIO_SMB_SHARE` / `--share`. Only `--check-smb-login` uses it: the
     /// keychain item is keyed on the server, not the share.
     pub share: Option<String>,
+    /// `--password-stdin`: `--check-smb-login` reads the password from a pipe
+    /// (how `make install` checks an agent whose password is still in its
+    /// plist, without the password entering an argument list).
+    pub password_stdin: bool,
 }
 
 impl Settings {
@@ -249,6 +253,7 @@ impl Settings {
             service: get("SPICEIO_SMB_PASS_KEYCHAIN"),
             keychain_path: get("SPICEIO_SMB_PASS_KEYCHAIN_PATH").map(PathBuf::from),
             share: get("SPICEIO_SMB_SHARE"),
+            password_stdin: false,
         }
     }
 
@@ -334,6 +339,12 @@ impl Settings {
                 "--domain" => self.domain = given()?,
                 "--service" => self.service = Some(value()?),
                 "--share" => self.share = Some(value()?),
+                "--password-stdin" => {
+                    if inline.is_some() {
+                        return Err("--password-stdin takes no value: pipe the password in".into());
+                    }
+                    self.password_stdin = true;
+                }
                 "--password" | "--pass" | "--smb-pass" | "-p" => {
                     return Err(format!(
                         "{name}: the password is never taken from the command line, where any \
@@ -560,6 +571,16 @@ fn explain(item: &Item, shown: &str, e: &keychain::Error, storing: bool) -> Stri
 }
 
 /// The settings for a subcommand: the environment, then `args` over it.
+/// `--password-stdin` belongs to `--check-smb-login`: `--store-smb-password`
+/// already reads the password from a pipe, and `--check-smb-password` checks
+/// where startup would find it.
+fn only_login_reads_stdin(settings: Settings) -> Result<Settings, String> {
+    if settings.password_stdin {
+        return Err("--password-stdin is for --check-smb-login".into());
+    }
+    Ok(settings)
+}
+
 fn settings_for(args: &[String], subcommand: &str) -> Result<Settings, String> {
     Settings::from_env().with_args(args.iter().skip(1), subcommand)
 }
@@ -604,7 +625,14 @@ pub async fn login_command(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let password = match Source::resolve(&settings).and_then(|source| source.load()) {
+    let password = if settings.password_stdin {
+        read_piped_password().and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| "the password is not UTF-8 text".to_string())
+        })
+    } else {
+        Source::resolve(&settings).and_then(|source| source.load())
+    };
+    let password = match password {
         Ok(password) => password,
         Err(e) => {
             eprintln!("SMB password: {e}");
@@ -678,7 +706,9 @@ pub async fn login_command(args: &[String]) -> i32 {
 }
 
 pub fn check_command(args: &[String]) -> i32 {
-    let source = match settings_for(args, "--check-smb-password").and_then(|s| Source::resolve(&s))
+    let source = match settings_for(args, "--check-smb-password")
+        .and_then(only_login_reads_stdin)
+        .and_then(|s| Source::resolve(&s))
     {
         Ok(source) => source,
         Err(e) => {
@@ -718,7 +748,7 @@ pub fn store_command(args: &[String]) -> i32 {
 }
 
 fn store(args: &[String]) -> Result<(), String> {
-    let settings = settings_for(args, "--store-smb-password")?;
+    let settings = settings_for(args, "--store-smb-password").and_then(only_login_reads_stdin)?;
     if settings.inline.is_some() {
         return Err(
             "SPICEIO_SMB_PASS is set. This command reads the password from the terminal or \
@@ -779,14 +809,7 @@ fn read_password(place: &str) -> Result<Vec<u8>, String> {
         }
         first
     } else {
-        let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("reading standard input: {e}"))?;
-        if buf.last() == Some(&b'\n') {
-            buf.pop();
-        }
-        buf
+        return read_piped_password();
     };
     if password.is_empty() {
         return Err("empty password".into());
@@ -795,6 +818,28 @@ fn read_password(place: &str) -> Result<Vec<u8>, String> {
         return Err("the password is not UTF-8 text".into());
     }
     Ok(password)
+}
+
+/// The password from standard input, which must be a pipe or a file: all of
+/// it, less one trailing newline (what `printf` or `plutil … raw` adds).
+fn read_piped_password() -> Result<Vec<u8>, String> {
+    if std::io::stdin().is_terminal() {
+        return Err("--password-stdin reads the password from a pipe, not a terminal".into());
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("reading standard input: {e}"))?;
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        return Err("empty password".into());
+    }
+    if std::str::from_utf8(&buf).is_err() {
+        return Err("the password is not UTF-8 text".into());
+    }
+    Ok(buf)
 }
 
 const RPP_REQUIRE_TTY: i32 = 0x02;
@@ -1237,6 +1282,7 @@ mod tests {
             &["-ühunter2"],
             &["--password=hunter2"],
             &["--pasword=hunter2"],
+            &["--password-stdin=hunter2"],
             &["hunter2"],
             &["--server", "nas", "hunter2"],
         ] {
@@ -1274,6 +1320,19 @@ mod tests {
             let err = env.clone().with_args(args(list), "-").unwrap_err();
             assert!(err.contains("needs a value"), "{list:?}: {err}");
         }
+    }
+
+    #[test]
+    fn password_stdin_is_a_bare_flag() {
+        let s = Settings::default()
+            .with_args(args(&["--password-stdin"]), "-")
+            .unwrap();
+        assert!(s.password_stdin);
+        let err = Settings::default()
+            .with_args(args(&["--password-stdin=x"]), "-")
+            .unwrap_err();
+        assert!(err.contains("takes no value"), "{err}");
+        assert!(only_login_reads_stdin(s).is_err());
     }
 
     #[test]

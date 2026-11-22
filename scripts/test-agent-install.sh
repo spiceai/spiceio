@@ -610,6 +610,19 @@ check "notes it" has "note: SMB login: could not check"
 check "and restarts the agent all the same" restarted
 install_agent
 check "AGENT_SMB_LOGIN=skip tries no login" lacks "SMB login"
+# A password still in the plist is checked too, piped from plutil.
+fresh_agent
+start_fake
+plutil -replace EnvironmentVariables.SPICEIO_SMB_SERVER -string 127.0.0.1 "$PLIST"
+plutil -insert EnvironmentVariables.SPICEIO_SMB_PORT -string "$FAKE_PORT" "$PLIST"
+plutil -insert EnvironmentVariables.SPICEIO_SMB_SHARE -string share "$PLIST"
+install_agent AGENT_SMB_LOGIN=check AGENT_SMB_PASS=keep
+check "a refused login with the password in the plist stops the install" [ "$RC" -ne 0 ]
+check "says the server refused it" has "STATUS_LOGON_FAILURE"
+check "after exactly one attempt" [ "$(attempts)" -eq 1 ]
+check "and leaves the agent alone" not_restarted
+check "and the password where it was" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+stop_fake
 
 echo "--- a second install waits for one in progress"
 # Hold this user's install lock the way `make install` does, then install.

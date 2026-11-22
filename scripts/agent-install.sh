@@ -329,12 +329,19 @@ require_readable_smb_pass() {
 # cannot be reached is a note: the agent waits for it.
 check_smb_login() {
     [ "$AGENT_SMB_LOGIN" = check ] || return 0
-    if ! login_service=$(keychain_service "$1"); then
-        echo "note: not checking $LAUNCHD_LABEL's SMB login: its password is not in the keychain"
+    if login_service=$(keychain_service "$1"); then
+        login=$(with_smb_env "$1" "$login_service" "$BINDIR/spiceio" --check-smb-login 2>&1)
+        login_rc=$?
+    elif has_inline_pass "$1"; then
+        # Still in the plist (AGENT_SMB_PASS=keep, or an ad-hoc build): checked
+        # all the same, the password piped from plutil, as for the move.
+        login=$(plutil -extract EnvironmentVariables.SPICEIO_SMB_PASS raw -o - "$1" |
+            with_smb_env "$1" "" "$BINDIR/spiceio" --check-smb-login --password-stdin 2>&1)
+        login_rc=$?
+    else
+        echo "note: not checking $LAUNCHD_LABEL's SMB login: its plist sets no SMB password"
         return 0
     fi
-    login=$(with_smb_env "$1" "$login_service" "$BINDIR/spiceio" --check-smb-login 2>&1)
-    login_rc=$?
     summary=$(printf '%s\n' "$login" | grep '^SMB ' | tail -1)
     case "$login_rc" in
     0) echo "$LAUNCHD_LABEL ${summary:-SMB login: ok}" ;;

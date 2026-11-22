@@ -114,6 +114,44 @@ fn check_smb_login_tries_a_refused_login_once() {
 }
 
 #[test]
+fn password_stdin_takes_the_password_from_a_pipe() {
+    let fake = Fake::start(&[]);
+    let port = fake.port.to_string();
+    let mut child = spiceio()
+        .env_remove("SPICEIO_SMB_PASS")
+        .args([
+            "--check-smb-login",
+            "--server",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--user",
+            "nobody",
+            "--share",
+            "share",
+            "--password-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"piped password\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = text(&out);
+    // The login is tried (and refused) with the piped password: no setting
+    // names one, so without the pipe it would stop before connecting.
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("STATUS_LOGON_FAILURE"), "{text}");
+    assert_eq!(fake.events(), ["auth"], "{text}");
+}
+
+#[test]
 fn an_unsigned_success_is_not_a_login() {
     // The fake knows no password, so it cannot sign; the client must not
     // take its "success" as the server's.
