@@ -133,6 +133,18 @@ fn an_unsigned_success_is_not_a_login() {
 }
 
 #[test]
+fn access_denied_at_login_is_not_reported_as_a_share_refusal() {
+    // STATUS_ACCESS_DENIED at session setup: the login itself was refused,
+    // so nothing may claim it succeeded.
+    let fake = Fake::start(&["--status", "0xC0000022"]);
+    let out = check_login(&fake);
+    let text = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("the server refused the login"), "{text}");
+    assert!(!text.contains("logged in"), "{text}");
+}
+
+#[test]
 fn startup_stops_after_a_refused_login_and_says_why() {
     let fake = Fake::start(&[]);
     let http = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -185,10 +197,20 @@ fn startup_stops_after_a_refused_login_and_says_why() {
     let _ = conn.read_to_string(&mut response);
     let _ = child.kill();
     let _ = child.wait();
-    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    // Only the parsed status goes into a failure message, never text read
+    // from the socket (CodeQL rust/log-injection).
+    let status: u16 = response
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(status, 503, "status of a request after the refusal");
     assert!(
-        response.contains("cannot log in to the SMB backend")
-            && response.contains("STATUS_LOGON_FAILURE"),
-        "{response}"
+        response.contains("cannot log in to the SMB backend"),
+        "the 503 does not say spiceio cannot log in"
+    );
+    assert!(
+        response.contains("STATUS_LOGON_FAILURE"),
+        "the 503 does not name the server's answer"
     );
 }

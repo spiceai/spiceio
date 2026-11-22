@@ -225,6 +225,9 @@ const AES_128_CCM: u16 = 0x0001;
 
 /// SecurityMode bit (MS-SMB2 2.2.3, 2.2.5): the client requires signing.
 pub const SMB2_NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
+/// SMB2 header Flags bit: the message is a response (MS-SMB2 2.2.1). A
+/// server sets it on every response, and a client never on a request.
+pub const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
 /// SMB2 header Flags bit: the message is signed (MS-SMB2 2.2.1).
 pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
 /// SESSION_SETUP response SessionFlags (MS-SMB2 2.2.6): a guest or an

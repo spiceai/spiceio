@@ -564,6 +564,9 @@ FAKE_LOG="$WORK/fake-smb.log"
 FAKE_PID=""
 start_fake() {
     : >"$FAKE_LOG"
+    # Emptied here, not by the background redirect: otherwise the wait below
+    # can read the previous fake's port line before the new one listens.
+    : >"$WORK/fake-smb.out"
     python3 -I "$ROOT/scripts/fake-smb.py" --port "${FAKE_PORT:-0}" --log "$FAKE_LOG" "$@" >"$WORK/fake-smb.out" 2>&1 &
     FAKE_PID=$!
     for _ in $(seq 50); do grep -q '^port' "$WORK/fake-smb.out" && break; sleep 0.1; done

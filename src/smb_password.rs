@@ -621,30 +621,36 @@ pub async fn login_command(args: &[String]) -> i32 {
         workstation: "SPICEIO".into(),
         max_io_size: 0,
     };
+    // Which step failed matters for the message: a refusal at session setup
+    // is a refused login, one at tree connect a refused share.
     let attempt = async {
-        let client = SmbClient::connect(config).await?;
-        client.tree_connect(&share).await.map(|_| ())
+        let client = SmbClient::connect(config).await.map_err(|e| (false, e))?;
+        client
+            .tree_connect(&share)
+            .await
+            .map(|_| ())
+            .map_err(|e| (true, e))
     };
     match tokio::time::timeout(LOGIN_CHECK_TIMEOUT, attempt).await {
         Ok(Ok(())) => {
             println!("SMB login: ok, {target}");
             0
         }
-        Ok(Err(e)) if credentials_rejected(&e).is_some() => {
+        Ok(Err((_, e))) if credentials_rejected(&e).is_some() => {
             eprintln!(
                 "SMB login: {target}: {e}. Fix the user or password; trying again with the same \
                  ones is another failed logon"
             );
             1
         }
-        Ok(Err(e)) if server_unproven(&e) => {
+        Ok(Err((_, e))) if server_unproven(&e) => {
             eprintln!(
                 "SMB login: {target}: {e}. Whatever answered may not be the server: check the \
                  address, and that the server signs SMB traffic"
             );
             1
         }
-        Ok(Err(e))
+        Ok(Err((true, e)))
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
@@ -653,7 +659,11 @@ pub async fn login_command(args: &[String]) -> i32 {
             eprintln!("SMB login: {target}: logged in, but the share refused: {e}");
             1
         }
-        Ok(Err(e)) => {
+        Ok(Err((false, e))) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("SMB login: {target}: the server refused the login: {e}");
+            1
+        }
+        Ok(Err((_, e))) => {
             eprintln!("SMB login: could not check {target}: {e}");
             2
         }

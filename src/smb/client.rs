@@ -2947,9 +2947,19 @@ const STATUS_PENDING: u32 = 0x0000_0103;
 ///
 /// spiceio signs every request, so it requires a valid signature on every
 /// response except the two kinds a server never signs: an interim
-/// STATUS_PENDING, and an unsolicited notification (MessageId all ones). Each
-/// response in a chain is checked on its own bytes, from its header to the
-/// next one's (padding included), the last to the end of the frame. The
+/// STATUS_PENDING, and an unsolicited notification (MessageId all ones). Both
+/// exemptions hold only for a frame that is that one message. In a chain they
+/// would let a forged, unsigned element through: the compound readers skip a
+/// pending frame only when it stands alone, and decode the elements of a
+/// chain whatever their status.
+///
+/// Every message must also be a response (`SMB2_FLAGS_SERVER_TO_REDIR`): in
+/// SMB 3.x one key signs both directions, so a request reflected back at
+/// spiceio verifies, and carries the MessageId and command of the reply it
+/// would be taken for.
+///
+/// Each response in a chain is checked on its own bytes, from its header to
+/// the next one's (padding included), the last to the end of the frame. The
 /// signature field is hashed as zeros without copying or changing the frame.
 fn verify_frame(frame: &[u8], key: &[u8; 16]) -> io::Result<()> {
     let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
@@ -2973,7 +2983,14 @@ fn verify_frame(frame: &[u8], key: &[u8; 16]) -> io::Result<()> {
             }
         };
         let msg = &rest[..len];
-        if status != STATUS_PENDING && message_id != u64::MAX {
+        if flags & SMB2_FLAGS_SERVER_TO_REDIR == 0 {
+            return Err(invalid(
+                "an SMB2 message received on a signed session is not a response",
+            ));
+        }
+        let standalone = next == 0 && len == frame.len();
+        let unsigned_allowed = standalone && (status == STATUS_PENDING || message_id == u64::MAX);
+        if !unsigned_allowed {
             if flags & SMB2_FLAGS_SIGNED == 0 {
                 return Err(invalid(
                     "an SMB2 response is not signed on a signed session",
@@ -3216,6 +3233,7 @@ mod tests {
     fn response(status: u32, message_id: u64, body: &[u8]) -> Vec<u8> {
         let mut header = Header::new(Command::Read, message_id);
         header.status = status;
+        header.flags = SMB2_FLAGS_SERVER_TO_REDIR;
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
         buf.extend_from_slice(body);
@@ -3245,6 +3263,15 @@ mod tests {
         assert!(verify_frame(&response(STATUS_PENDING, 7, b""), &KEY).is_ok());
         assert!(verify_frame(&response(0, u64::MAX, b"break"), &KEY).is_ok());
         assert!(err(&response(0, 7, b"")[..40], &KEY).contains("shorter than its header"));
+
+        // A request reflected back verifies under the same key, but is not a
+        // response.
+        let mut request = BytesMut::new();
+        Header::new(Command::Flush, 7).encode(&mut request);
+        request.extend_from_slice(b"flush body");
+        let mut request = request.to_vec();
+        sign_message(&mut request, &KEY);
+        assert!(err(&request, &KEY).contains("not a response"));
     }
 
     #[test]
@@ -3269,6 +3296,28 @@ mod tests {
             verify_frame(&later, &KEY).is_err(),
             "the second response is checked too"
         );
+
+        // The unsigned exemptions hold for a lone frame only: an unsigned
+        // "pending" or notification element in a chain is refused.
+        for (status, id) in [(STATUS_PENDING, 2), (0, u64::MAX)] {
+            let mut forged = response(status, id, b"injected bytes");
+            forged.resize(forged.len().next_multiple_of(8), 0);
+            let next = forged.len() as u32;
+            forged[20..24].copy_from_slice(&next.to_le_bytes());
+            let chain = [forged, second.clone()].concat();
+            assert!(
+                verify_frame(&chain, &KEY)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not signed"),
+                "status 0x{status:08X} id {id}"
+            );
+            let last = [first.clone(), response(status, id, b"")].concat();
+            assert!(
+                verify_frame(&last, &KEY).is_err(),
+                "as the last element too"
+            );
+        }
 
         let mut misaligned = chain.clone();
         misaligned[20..24].copy_from_slice(&(next - 1).to_le_bytes());

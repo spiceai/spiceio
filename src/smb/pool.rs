@@ -676,7 +676,10 @@ impl SmbPool {
             let _guard = self.heal_lock.lock().await;
             let current_n = self.n.load(Ordering::Relaxed);
             for idx in 0..current_n {
-                if healed >= max_heals {
+                // Checked again under the lock, before every reconnect: a heal
+                // that queued behind the one that met the refusal must not
+                // try the same credentials again.
+                if healed >= max_heals || self.credentials_rejected.get().is_some() {
                     break;
                 }
                 // Re-check current size in case a prior capacity shrink happened.
