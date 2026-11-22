@@ -3409,6 +3409,31 @@ pub fn login_refused(reason: &str) -> Response<SpiceioBody> {
     ))
 }
 
+/// `original` (a 503 the router already finished) with [`login_refused`]'s
+/// body in place of its own. The headers every response carries (request
+/// IDs, region, `Server`, CORS: `with_common_headers`) are kept, so a
+/// cross-origin client can still read the explanation; only the headers that
+/// describe the body are replaced.
+pub fn with_login_refused_body(
+    original: Response<SpiceioBody>,
+    reason: &str,
+) -> Response<SpiceioBody> {
+    let (mut parts, _) = original.into_parts();
+    let (replacement, body) = login_refused(reason).into_parts();
+    for name in [
+        http::header::CONTENT_TYPE,
+        http::header::CONTENT_LENGTH,
+        http::header::RETRY_AFTER,
+    ] {
+        parts.headers.remove(&name);
+        if let Some(value) = replacement.headers.get(&name) {
+            parts.headers.insert(name, value.clone());
+        }
+    }
+    parts.status = replacement.status;
+    Response::from_parts(parts, body)
+}
+
 pub fn service_unavailable(message: &str) -> Response<SpiceioBody> {
     let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", message);
     // hyper Response builders don't re-open; insert on the built response.
@@ -3878,6 +3903,34 @@ mod tests {
         assert!(body.contains("cannot log in to the SMB backend"), "{body}");
         assert!(body.contains("STATUS_LOGON_FAILURE"), "{body}");
         assert!(body.contains("restart spiceio"), "{body}");
+    }
+
+    #[test]
+    fn a_replaced_503_keeps_the_common_headers() {
+        let original = with_common_headers(
+            service_unavailable("generic: please retry"),
+            "req-123",
+            "us-west-2",
+        );
+        let resp = with_login_refused_body(original, "STATUS_LOGON_FAILURE");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let headers = resp.headers().clone();
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(headers.get(X_AMZ_REQUEST_ID).unwrap(), "req-123");
+        assert_eq!(headers.get(X_AMZ_BUCKET_REGION).unwrap(), "us-west-2");
+        assert!(headers.get(http::header::RETRY_AFTER).is_some());
+        let body = match resp.into_body() {
+            SpiceioBody::Full(Some(b)) => String::from_utf8(b.to_vec()).unwrap(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("STATUS_LOGON_FAILURE") && !body.contains("generic"),
+            "{body}"
+        );
+        // A length header, if there is one, describes the new body, not the old.
+        if let Some(len) = headers.get(http::header::CONTENT_LENGTH) {
+            assert_eq!(len.to_str().unwrap(), body.len().to_string());
+        }
     }
 
     #[test]

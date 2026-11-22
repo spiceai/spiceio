@@ -1114,7 +1114,7 @@ async fn main() {
                             Some(refused)
                                 if response.status() == hyper::StatusCode::SERVICE_UNAVAILABLE =>
                             {
-                                s3::router::login_refused(&refused.to_string())
+                                s3::router::with_login_refused_body(response, &refused.to_string())
                             }
                             _ => response,
                         }
