@@ -113,6 +113,11 @@ loadgen:
 bench-sccache: release loadgen
 	./scripts/bench-sccache.sh
 
+# What a ListObjectsV2 first page costs, by max-keys and by prefix size, through
+# a running spiceio (default: the launchd agent). Needs BENCH_BUCKET=.
+bench-listing:
+	./scripts/bench-listing.sh
+
 # Real cargo builds through sccache, comparing spiceio against a local-disk
 # cache (the floor) and an uncached build (the ceiling).
 bench-sccache-build: release

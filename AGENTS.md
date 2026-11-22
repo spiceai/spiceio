@@ -33,6 +33,7 @@ make clean                     # cargo clean
 make bench-sccache             # synthetic sccache-shaped load, concurrency sweep
 make bench-sccache-build       # real cargo builds: spiceio vs local-disk vs no cache
 make bench-sccache-all         # both
+make bench-listing BENCH_BUCKET=<bucket>  # ListObjectsV2 first-page cost by max-keys and prefix size, through a running spiceio
 ```
 
 ### Rust toolchain
