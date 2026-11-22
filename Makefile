@@ -1,5 +1,5 @@
 .PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback test-sccache-clean test-clean-unit test-setup-action ci clean all \
-	install uninstall loadgen bench-sccache bench-sccache-build bench-sccache-all
+	install uninstall loadgen bench-sccache bench-sccache-build bench-sccache-all bench-listing
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
 # Prefer `make ci` explicitly when validating a PR — see AGENTS.md.
