@@ -1,5 +1,5 @@
 .PHONY: build release check fmt fmt-check clippy doc lint test test-unit test-live test-extended test-writeback test-sccache-clean test-clean-unit test-setup-action ci clean all \
-	install uninstall loadgen bench-sccache bench-sccache-build bench-sccache-all
+	install uninstall loadgen bench-sccache bench-sccache-build bench-sccache-all bench-listing
 
 # Default: format + full CI-local gate (lint + unit + live when SMB creds set).
 # Prefer `make ci` explicitly when validating a PR — see AGENTS.md.
@@ -112,6 +112,11 @@ loadgen:
 # per-request server-side attribution from the access log.
 bench-sccache: release loadgen
 	./scripts/bench-sccache.sh
+
+# What a ListObjectsV2 first page costs, by max-keys and by prefix size, through
+# a running spiceio (default: the launchd agent). Needs BENCH_BUCKET=.
+bench-listing:
+	./scripts/bench-listing.sh
 
 # Real cargo builds through sccache, comparing spiceio against a local-disk
 # cache (the floor) and an uncached build (the ceiling).
