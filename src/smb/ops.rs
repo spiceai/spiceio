@@ -971,6 +971,11 @@ impl ShareSession {
     }
 
     /// Pick a pool connection that is not poisoned (see `SmbPool::pick_live`).
+    /// The server's refusal of the credentials, once a reconnect has met one.
+    pub fn credentials_refused(&self) -> Option<super::client::CredentialsRejected> {
+        self.pool.credentials_refused()
+    }
+
     async fn pick_live(&self) -> (Arc<SmbClient>, u32) {
         self.pool.pick_live().await
     }

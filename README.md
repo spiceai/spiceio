@@ -281,10 +281,14 @@ into the keychain, and checks that it works:
    with the installed `spiceio --store-smb-password` (piped from `plutil`, never
    through an argument list), checks that `spiceio --check-smb-password` reads
    it back, then replaces `SPICEIO_SMB_PASS` with `SPICEIO_SMB_PASS_KEYCHAIN`.
-4. install restarts the agent. If the plist's environment differs from what
+4. install logs in to the agent's SMB server once with the agent's settings
+   (`spiceio --check-smb-login`). A refused login, or a server that does not
+   prove it holds the session key, stops the install before the agent is
+   touched, after that single attempt. A server it cannot reach is a note.
+5. install restarts the agent. If the plist's environment differs from what
    launchd loaded, it does a full reload instead, because `kickstart` would
    keep the old environment.
-5. install checks the result. An unsigned request must be refused, and a
+6. install checks the result. An unsigned request must be refused, and a
    request signed through `sccache-spiceio` must be served. Otherwise the
    install fails.
 
@@ -293,6 +297,7 @@ make install                    # SPICEIO_S3_AUTH=enforce
 make install AGENT_AUTH=log     # verify and log, but still serve unsigned requests
 make install AGENT_AUTH=keep    # leave the agent's auth settings alone
 make install AGENT_SMB_PASS=keep  # leave the SMB password where it is
+make install AGENT_SMB_LOGIN=skip # no SMB login before the restart (installing away from the NAS)
 make install RESTART_AGENT=0    # stage the binary and the plist edit; a later install reloads it
 make install CODESIGN=adhoc     # no signing identity (then the password stays in the plist)
 ```
@@ -330,6 +335,9 @@ spiceio --store-smb-password --server nas.example --user svc-spiceio
 #   asks twice, without echo (or reads stdin); --domain, --port and --service too
 spiceio --check-smb-password --server nas.example --user svc-spiceio --service ai.spice.spiceio.smb
 #   SMB password: keychain item "ai.spice.spiceio.smb" for smb://****@nas.example (the login keychain)
+spiceio --check-smb-login --server nas.example --user svc-spiceio --share cache
+#   SMB login: ok, smb://****@nas.example/cache   (one attempt; exit 1 if refused, 2 if unreachable)
+#   --password-stdin: take the password from a pipe instead (how install checks a plist password)
 ```
 
 Each flag falls back to its variable (`SPICEIO_SMB_SERVER`, `SPICEIO_SMB_USER`,
@@ -341,6 +349,25 @@ processes can read a command line from the process list. Output shows
 the destination as `smb://****@server`, never the SMB user, like the startup log.
 
 `make install` does this for the launchd agent by default (see above).
+
+**A refused login is never retried.** When the server refuses the
+credentials (a wrong password, an unknown, disabled, expired or locked-out
+account), spiceio stops: no retry at startup, no reconnect from the pool
+healer. Each attempt with the same password would be one more failed logon,
+and enough of them lock the account, on a NAS that other machines and CI share.
+spiceio stays up and answers every request with a 503 that names the refusal,
+rather than exiting, because under launchd's `KeepAlive` a restart would only
+try, and fail, again. The same goes for a password changed on the NAS while
+spiceio runs: once a reconnect is refused, a 503 names the refusal instead of
+inviting a retry. Fix the password (`--store-smb-password`), check it with
+`--check-smb-login`, and restart the agent.
+
+**The server proves who it is.** spiceio requires SMB signing and verifies the
+signature on every response (MS-SMB2 3.2.5.1.3), including the final session
+setup response, which only a server that knows the password can sign. A
+response that is unsigned or does not verify drops the connection, and a
+server that cannot sign its session setup response is not logged in to: an
+NTLM login by itself does not show that the answering machine is the server.
 
 **The item is bound to the server.** Its account is derived, not configured:
 `smb://[domain;]user@server[:port]`. Anything running as you can edit the

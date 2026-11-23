@@ -3398,6 +3398,42 @@ fn io_to_s3_write_error(e: &io::Error) -> Response<SpiceioBody> {
 /// retries. sccache classifies temporary storage errors; returning a clean
 /// retryable status (rather than dropping the TCP connection) lets a client
 /// that retries the check succeed once the NAS is up.
+/// The 503 for a server that refused spiceio's SMB login (`reason`, its
+/// answer): at startup, or on a reconnect after the password changed on the
+/// NAS. Still a 503, because to a client it is the backend that is down, but
+/// it names the refusal and what fixes it rather than inviting a retry.
+pub fn login_refused(reason: &str) -> Response<SpiceioBody> {
+    service_unavailable(&format!(
+        "spiceio cannot log in to the SMB backend: {reason}. Fix the SMB credentials and \
+         restart spiceio."
+    ))
+}
+
+/// `original` (a 503 the router already finished) with [`login_refused`]'s
+/// body in place of its own. The headers every response carries (request
+/// IDs, region, `Server`, CORS: `with_common_headers`) are kept, so a
+/// cross-origin client can still read the explanation; only the headers that
+/// describe the body are replaced.
+pub fn with_login_refused_body(
+    original: Response<SpiceioBody>,
+    reason: &str,
+) -> Response<SpiceioBody> {
+    let (mut parts, _) = original.into_parts();
+    let (replacement, body) = login_refused(reason).into_parts();
+    for name in [
+        http::header::CONTENT_TYPE,
+        http::header::CONTENT_LENGTH,
+        http::header::RETRY_AFTER,
+    ] {
+        parts.headers.remove(&name);
+        if let Some(value) = replacement.headers.get(&name) {
+            parts.headers.insert(name, value.clone());
+        }
+    }
+    parts.status = replacement.status;
+    Response::from_parts(parts, body)
+}
+
 pub fn service_unavailable(message: &str) -> Response<SpiceioBody> {
     let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", message);
     // hyper Response builders don't re-open; insert on the built response.
@@ -3854,6 +3890,47 @@ mod tests {
         // Traversal survives decoding for the handler's check to catch.
         let (_, k) = parse_copy_source("/bucket/%2e%2e/etc/passwd");
         assert!(key_has_traversal(&k));
+    }
+
+    #[test]
+    fn login_refused_names_the_refusal_and_the_fix() {
+        let resp = login_refused("the SMB server rejected the login: STATUS_LOGON_FAILURE");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = match resp.into_body() {
+            SpiceioBody::Full(Some(b)) => String::from_utf8(b.to_vec()).unwrap(),
+            _ => String::new(),
+        };
+        assert!(body.contains("cannot log in to the SMB backend"), "{body}");
+        assert!(body.contains("STATUS_LOGON_FAILURE"), "{body}");
+        assert!(body.contains("restart spiceio"), "{body}");
+    }
+
+    #[test]
+    fn a_replaced_503_keeps_the_common_headers() {
+        let original = with_common_headers(
+            service_unavailable("generic: please retry"),
+            "req-123",
+            "us-west-2",
+        );
+        let resp = with_login_refused_body(original, "STATUS_LOGON_FAILURE");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let headers = resp.headers().clone();
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(headers.get(X_AMZ_REQUEST_ID).unwrap(), "req-123");
+        assert_eq!(headers.get(X_AMZ_BUCKET_REGION).unwrap(), "us-west-2");
+        assert!(headers.get(http::header::RETRY_AFTER).is_some());
+        let body = match resp.into_body() {
+            SpiceioBody::Full(Some(b)) => String::from_utf8(b.to_vec()).unwrap(),
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("STATUS_LOGON_FAILURE") && !body.contains("generic"),
+            "{body}"
+        );
+        // A length header, if there is one, describes the new body, not the old.
+        if let Some(len) = headers.get(http::header::CONTENT_LENGTH) {
+            assert_eq!(len.to_str().unwrap(), body.len().to_string());
+        }
     }
 
     #[test]

@@ -231,7 +231,7 @@ install_agent() {
     set +e
     OUT=$(env -i PATH="$WORK/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HOME_DIR" TMPDIR="$CASE" \
         LD_STATE="$LD_STATE" LSOF_ADDR="${LSOF_ADDR:-}" \
-        BINDIR="$WORK/bindir" LAUNCHD_LABEL="$LABEL" AGENT_WAIT_SECS=1 \
+        BINDIR="$WORK/bindir" LAUNCHD_LABEL="$LABEL" AGENT_WAIT_SECS=1 AGENT_SMB_LOGIN=skip \
         "$@" "$ROOT/scripts/agent-install.sh" 2>&1)
     RC=$?
     set -e
@@ -555,6 +555,74 @@ install_agent BINDIR="$WORK/adhocbin"
 check "exits 0" [ "$RC" -eq 0 ]
 check "says why not" has "is ad-hoc"
 check "the password stays in the plist" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+
+echo "--- the agent's SMB login is tried once before it restarts (AGENT_SMB_LOGIN=check)"
+# A fake SMB server (scripts/fake-smb.py) on one fixed port for the whole
+# section: the keychain item is keyed on the server and port, so the plist and
+# the item must keep agreeing while the fake changes how it answers.
+FAKE_LOG="$WORK/fake-smb.log"
+FAKE_PID=""
+start_fake() {
+    : >"$FAKE_LOG"
+    # Emptied here, not by the background redirect: otherwise the wait below
+    # can read the previous fake's port line before the new one listens.
+    : >"$WORK/fake-smb.out"
+    python3 -I "$ROOT/scripts/fake-smb.py" --port "${FAKE_PORT:-0}" --log "$FAKE_LOG" "$@" >"$WORK/fake-smb.out" 2>&1 &
+    FAKE_PID=$!
+    for _ in $(seq 50); do grep -q '^port' "$WORK/fake-smb.out" && break; sleep 0.1; done
+    FAKE_PORT=$(awk '/^port/ {print $2}' "$WORK/fake-smb.out")
+    [[ -n "$FAKE_PORT" ]] || { echo "setup failed: the fake SMB server did not start:" >&2; cat "$WORK/fake-smb.out" >&2; exit 1; }
+}
+stop_fake() {
+    kill "$FAKE_PID" 2>/dev/null || true
+    wait "$FAKE_PID" 2>/dev/null || true
+}
+attempts() { grep -c '^auth' "$FAKE_LOG"; }
+# Sets OUT to the launchctl calls, so a failing check shows them.
+restarted() {
+    OUT=$(cat "$LD_STATE/calls")
+    grep -qE '^(kickstart|bootout|bootstrap)' <<<"$OUT"
+}
+# (`check` runs its arguments as a command, so a `!` there would be a command
+# name, not the shell's negation.)
+not_restarted() { ! restarted; }
+fresh_agent
+start_fake
+plutil -replace EnvironmentVariables.SPICEIO_SMB_SERVER -string 127.0.0.1 "$PLIST"
+plutil -insert EnvironmentVariables.SPICEIO_SMB_PORT -string "$FAKE_PORT" "$PLIST"
+plutil -insert EnvironmentVariables.SPICEIO_SMB_SHARE -string share "$PLIST"
+install_agent AGENT_SMB_LOGIN=check
+check "a refused login stops the install" [ "$RC" -ne 0 ]
+check "says the server refused it" has "STATUS_LOGON_FAILURE"
+check "after exactly one attempt" [ "$(attempts)" -eq 1 ]
+check "and leaves the agent alone" not_restarted
+check "the password is in the keychain all the same" [ -z "$(env_of SPICEIO_SMB_PASS)" ]
+stop_fake
+start_fake --accept
+install_agent AGENT_SMB_LOGIN=check
+check "a server that signs nothing stops the install" [ "$RC" -ne 0 ]
+check "says it did not prove itself" has "did not prove it holds the session key"
+check "and leaves the agent alone" not_restarted
+stop_fake
+install_agent AGENT_SMB_LOGIN=check
+check "a server that cannot be reached: exits 0" [ "$RC" -eq 0 ]
+check "notes it" has "note: SMB login: could not check"
+check "and restarts the agent all the same" restarted
+install_agent
+check "AGENT_SMB_LOGIN=skip tries no login" lacks "SMB login"
+# A password still in the plist is checked too, piped from plutil.
+fresh_agent
+start_fake
+plutil -replace EnvironmentVariables.SPICEIO_SMB_SERVER -string 127.0.0.1 "$PLIST"
+plutil -insert EnvironmentVariables.SPICEIO_SMB_PORT -string "$FAKE_PORT" "$PLIST"
+plutil -insert EnvironmentVariables.SPICEIO_SMB_SHARE -string share "$PLIST"
+install_agent AGENT_SMB_LOGIN=check AGENT_SMB_PASS=keep
+check "a refused login with the password in the plist stops the install" [ "$RC" -ne 0 ]
+check "says the server refused it" has "STATUS_LOGON_FAILURE"
+check "after exactly one attempt" [ "$(attempts)" -eq 1 ]
+check "and leaves the agent alone" not_restarted
+check "and the password where it was" [ "$(env_of SPICEIO_SMB_PASS)" = "$SMB_PASS" ]
+stop_fake
 
 echo "--- a second install waits for one in progress"
 # Hold this user's install lock the way `make install` does, then install.

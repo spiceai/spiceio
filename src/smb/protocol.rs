@@ -223,6 +223,18 @@ const SHA_512: u16 = 0x0001;
 const AES_128_GCM: u16 = 0x0002;
 const AES_128_CCM: u16 = 0x0001;
 
+/// SecurityMode bit (MS-SMB2 2.2.3, 2.2.5): the client requires signing.
+pub const SMB2_NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
+/// SMB2 header Flags bit: the message is a response (MS-SMB2 2.2.1). A
+/// server sets it on every response, and a client never on a request.
+pub const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
+/// SMB2 header Flags bit: the message is signed (MS-SMB2 2.2.1).
+pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
+/// SESSION_SETUP response SessionFlags (MS-SMB2 2.2.6): a guest or an
+/// anonymous session, neither of which proves who logged in.
+pub const SMB2_SESSION_FLAG_IS_GUEST: u16 = 0x0001;
+pub const SMB2_SESSION_FLAG_IS_NULL: u16 = 0x0002;
+
 pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     let dialect_count = DIALECTS.len() as u16;
     let dialects_len = DIALECTS.len() * 2;
@@ -259,7 +271,10 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
 
     buf.put_u16_le(36); // StructureSize
     buf.put_u16_le(dialect_count);
-    buf.put_u16_le(0x0001); // SecurityMode: signing enabled
+    // SecurityMode: signing *required*. spiceio signs every request and
+    // refuses any response that is not validly signed (MS-SMB2 3.2.5.1.3), so
+    // it says so, and the server marks the session SigningRequired too.
+    buf.put_u16_le(SMB2_NEGOTIATE_SIGNING_REQUIRED);
     buf.put_u16_le(0); // Reserved
     // Capabilities: DFS (0x01) | LARGE_MTU (0x04) | ENCRYPTION (0x40).
     // LARGE_MTU is required to use multi-credit reads/writes (>64 KiB in one
@@ -314,7 +329,7 @@ pub fn encode_session_setup_request(buf: &mut BytesMut, security_blob: &[u8]) {
     let offset = (SMB2_HEADER_SIZE + 24) as u16; // header + fixed part of this request
     buf.put_u16_le(25); // StructureSize
     buf.put_u8(0); // Flags
-    buf.put_u8(0x01); // SecurityMode: signing enabled
+    buf.put_u8(SMB2_NEGOTIATE_SIGNING_REQUIRED as u8); // SecurityMode: signing required
     buf.put_u32_le(0); // Capabilities
     buf.put_u32_le(0); // Channel
     buf.put_u16_le(offset); // SecurityBufferOffset
