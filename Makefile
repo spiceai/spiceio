@@ -150,6 +150,9 @@ S3_CREDENTIALS_FILE ?= $(HOME)/.config/spiceio/credentials
 # keychain item SPICEIO_SMB_PASS_KEYCHAIN names (default
 # ai.spice.spiceio.smb); keep leaves it where it is.
 AGENT_SMB_PASS ?= keychain
+# check (default): log in to the agent's SMB server once before restarting it;
+# a refused login stops the install. skip: do not (installing away from the NAS).
+AGENT_SMB_LOGIN ?= check
 # A keychain item can be read only by binaries whose signature satisfies the
 # requirement of the one that stored it, so install signs every build with
 # one local, self-signed identity kept in its own keychain (see
@@ -218,7 +221,7 @@ install-locked:
 	esac
 	@BINDIR="$(BINDIR)" LAUNCHD_LABEL="$(LAUNCHD_LABEL)" RESTART_AGENT="$(RESTART_AGENT)" \
 	  AGENT_AUTH="$(AGENT_AUTH)" S3_CREDENTIALS_FILE="$(S3_CREDENTIALS_FILE)" \
-	  AGENT_SMB_PASS="$(AGENT_SMB_PASS)" \
+	  AGENT_SMB_PASS="$(AGENT_SMB_PASS)" AGENT_SMB_LOGIN="$(AGENT_SMB_LOGIN)" \
 	  ./scripts/agent-install.sh
 
 # Removes what `install` wrote. Leaves the launchd agent, its config, its log,

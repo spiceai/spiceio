@@ -35,6 +35,7 @@ use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use crate::keychain::{self, Item};
+use crate::smb::client::{SmbClient, SmbConfig, credentials_rejected, server_unproven};
 
 /// The keychain service `--store-smb-password` and `make install` use when
 /// `SPICEIO_SMB_PASS_KEYCHAIN` does not name one.
@@ -229,6 +230,13 @@ pub struct Settings {
     pub service: Option<String>,
     /// `SPICEIO_SMB_PASS_KEYCHAIN_PATH`.
     pub keychain_path: Option<PathBuf>,
+    /// `SPICEIO_SMB_SHARE` / `--share`. Only `--check-smb-login` uses it: the
+    /// keychain item is keyed on the server, not the share.
+    pub share: Option<String>,
+    /// `--password-stdin`: `--check-smb-login` reads the password from a pipe
+    /// (how `make install` checks an agent whose password is still in its
+    /// plist, without the password entering an argument list).
+    pub password_stdin: bool,
 }
 
 impl Settings {
@@ -244,6 +252,8 @@ impl Settings {
             inline: get("SPICEIO_SMB_PASS"),
             service: get("SPICEIO_SMB_PASS_KEYCHAIN"),
             keychain_path: get("SPICEIO_SMB_PASS_KEYCHAIN_PATH").map(PathBuf::from),
+            share: get("SPICEIO_SMB_SHARE"),
+            password_stdin: false,
         }
     }
 
@@ -275,7 +285,7 @@ impl Settings {
             if !arg.starts_with('-') {
                 return Err(format!(
                     "unexpected argument {position}: a value with no flag before it (expected \
-                     --server, --user, --domain, --port or --service)"
+                     --server, --user, --domain, --port, --service or --share)"
                 ));
             }
             // `--name=value`, and a short flag with its value glued on
@@ -328,6 +338,13 @@ impl Settings {
                 "--user" => self.user = Some(value()?),
                 "--domain" => self.domain = given()?,
                 "--service" => self.service = Some(value()?),
+                "--share" => self.share = Some(value()?),
+                "--password-stdin" => {
+                    if inline.is_some() {
+                        return Err("--password-stdin takes no value: pipe the password in".into());
+                    }
+                    self.password_stdin = true;
+                }
                 "--password" | "--pass" | "--smb-pass" | "-p" => {
                     return Err(format!(
                         "{name}: the password is never taken from the command line, where any \
@@ -337,8 +354,8 @@ impl Settings {
                 }
                 _ => {
                     return Err(format!(
-                        "unknown flag {name:?} (expected --server, --user, --domain, --port or \
-                         --service)"
+                        "unknown flag {name:?} (expected --server, --user, --domain, --port, --service or \
+                         --share)"
                     ));
                 }
             }
@@ -554,6 +571,16 @@ fn explain(item: &Item, shown: &str, e: &keychain::Error, storing: bool) -> Stri
 }
 
 /// The settings for a subcommand: the environment, then `args` over it.
+/// `--password-stdin` belongs to `--check-smb-login`: `--store-smb-password`
+/// already reads the password from a pipe, and `--check-smb-password` checks
+/// where startup would find it.
+fn only_login_reads_stdin(settings: Settings) -> Result<Settings, String> {
+    if settings.password_stdin {
+        return Err("--password-stdin is for --check-smb-login".into());
+    }
+    Ok(settings)
+}
+
 fn settings_for(args: &[String], subcommand: &str) -> Result<Settings, String> {
     Settings::from_env().with_args(args.iter().skip(1), subcommand)
 }
@@ -561,8 +588,127 @@ fn settings_for(args: &[String], subcommand: &str) -> Result<Settings, String> {
 /// `spiceio --check-smb-password [flags]`: resolve the password the way
 /// startup does, report where it came from, exit 0; or say why it cannot,
 /// exit 1. Touches nothing else (no SMB, no listener, no log file).
+/// How long `--check-smb-login` waits for the server's answer.
+const LOGIN_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `spiceio --check-smb-login [flags]`: log in to the SMB server once, with
+/// the password startup would use, and connect to the share. One attempt,
+/// never retried: a refused login is one failed logon toward the account's
+/// lockout threshold, and a retry with the same password would be another.
+/// `make install` runs it with the agent's settings before restarting the
+/// agent, so wrong credentials stop the install instead of the agent.
+///
+/// Exit status: 0 logged in and connected to the share; 1 the server answered
+/// and refused (the credentials, or the share), or answered without proving
+/// it holds the session key (an unsigned or badly signed final response);
+/// 2 no answer to judge by (a
+/// setting or the password could not be read, or the server was unreachable,
+/// timed out or failed otherwise).
+pub async fn login_command(args: &[String]) -> i32 {
+    let settings = match settings_for(args, "--check-smb-login") {
+        Ok(settings) => settings,
+        Err(e) => {
+            eprintln!("SMB login: {e}");
+            return 2;
+        }
+    };
+    let (dest, share) = match settings.destination().and_then(|dest| {
+        settings
+            .share
+            .clone()
+            .map(|share| (dest, share))
+            .ok_or_else(|| "SPICEIO_SMB_SHARE or --share is required".to_string())
+    }) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("SMB login: {e}");
+            return 2;
+        }
+    };
+    let password = if settings.password_stdin {
+        read_piped_password().and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| "the password is not UTF-8 text".to_string())
+        })
+    } else {
+        Source::resolve(&settings).and_then(|source| source.load())
+    };
+    let password = match password {
+        Ok(password) => password,
+        Err(e) => {
+            eprintln!("SMB password: {e}");
+            return 2;
+        }
+    };
+    let target = format!("{}/{share}", shown(&dest));
+    let config = SmbConfig {
+        server: dest.server,
+        port: dest.port,
+        username: dest.user,
+        password,
+        domain: dest.domain,
+        workstation: "SPICEIO".into(),
+        max_io_size: 0,
+    };
+    // Which step failed matters for the message: a refusal at session setup
+    // is a refused login, one at tree connect a refused share.
+    let attempt = async {
+        let client = SmbClient::connect(config).await.map_err(|e| (false, e))?;
+        client
+            .tree_connect(&share)
+            .await
+            .map(|_| ())
+            .map_err(|e| (true, e))
+    };
+    match tokio::time::timeout(LOGIN_CHECK_TIMEOUT, attempt).await {
+        Ok(Ok(())) => {
+            println!("SMB login: ok, {target}");
+            0
+        }
+        Ok(Err((_, e))) if credentials_rejected(&e).is_some() => {
+            eprintln!(
+                "SMB login: {target}: {e}. Fix the user or password; trying again with the same \
+                 ones is another failed logon"
+            );
+            1
+        }
+        Ok(Err((_, e))) if server_unproven(&e) => {
+            eprintln!(
+                "SMB login: {target}: {e}. Whatever answered may not be the server: check the \
+                 address, and that the server signs SMB traffic"
+            );
+            1
+        }
+        Ok(Err((true, e)))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            eprintln!("SMB login: {target}: logged in, but the share refused: {e}");
+            1
+        }
+        Ok(Err((false, e))) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("SMB login: {target}: the server refused the login: {e}");
+            1
+        }
+        Ok(Err((_, e))) => {
+            eprintln!("SMB login: could not check {target}: {e}");
+            2
+        }
+        Err(_) => {
+            eprintln!(
+                "SMB login: could not check {target}: no answer within {}s",
+                LOGIN_CHECK_TIMEOUT.as_secs()
+            );
+            2
+        }
+    }
+}
+
 pub fn check_command(args: &[String]) -> i32 {
-    let source = match settings_for(args, "--check-smb-password").and_then(|s| Source::resolve(&s))
+    let source = match settings_for(args, "--check-smb-password")
+        .and_then(only_login_reads_stdin)
+        .and_then(|s| Source::resolve(&s))
     {
         Ok(source) => source,
         Err(e) => {
@@ -602,7 +748,7 @@ pub fn store_command(args: &[String]) -> i32 {
 }
 
 fn store(args: &[String]) -> Result<(), String> {
-    let settings = settings_for(args, "--store-smb-password")?;
+    let settings = settings_for(args, "--store-smb-password").and_then(only_login_reads_stdin)?;
     if settings.inline.is_some() {
         return Err(
             "SPICEIO_SMB_PASS is set. This command reads the password from the terminal or \
@@ -663,14 +809,7 @@ fn read_password(place: &str) -> Result<Vec<u8>, String> {
         }
         first
     } else {
-        let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("reading standard input: {e}"))?;
-        if buf.last() == Some(&b'\n') {
-            buf.pop();
-        }
-        buf
+        return read_piped_password();
     };
     if password.is_empty() {
         return Err("empty password".into());
@@ -679,6 +818,28 @@ fn read_password(place: &str) -> Result<Vec<u8>, String> {
         return Err("the password is not UTF-8 text".into());
     }
     Ok(password)
+}
+
+/// The password from standard input, which must be a pipe or a file: all of
+/// it, less one trailing newline (what `printf` or `plutil … raw` adds).
+fn read_piped_password() -> Result<Vec<u8>, String> {
+    if std::io::stdin().is_terminal() {
+        return Err("--password-stdin reads the password from a pipe, not a terminal".into());
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("reading standard input: {e}"))?;
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        return Err("empty password".into());
+    }
+    if std::str::from_utf8(&buf).is_err() {
+        return Err("the password is not UTF-8 text".into());
+    }
+    Ok(buf)
 }
 
 const RPP_REQUIRE_TTY: i32 = 0x02;
@@ -1121,6 +1282,7 @@ mod tests {
             &["-ühunter2"],
             &["--password=hunter2"],
             &["--pasword=hunter2"],
+            &["--password-stdin=hunter2"],
             &["hunter2"],
             &["--server", "nas", "hunter2"],
         ] {
@@ -1158,6 +1320,19 @@ mod tests {
             let err = env.clone().with_args(args(list), "-").unwrap_err();
             assert!(err.contains("needs a value"), "{list:?}: {err}");
         }
+    }
+
+    #[test]
+    fn password_stdin_is_a_bare_flag() {
+        let s = Settings::default()
+            .with_args(args(&["--password-stdin"]), "-")
+            .unwrap();
+        assert!(s.password_stdin);
+        let err = Settings::default()
+            .with_args(args(&["--password-stdin=x"]), "-")
+            .unwrap_err();
+        assert!(err.contains("takes no value"), "{err}");
+        assert!(only_login_reads_stdin(s).is_err());
     }
 
     #[test]

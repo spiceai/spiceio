@@ -34,6 +34,11 @@
 #                        into the keychain. keep: leave it where it is
 #   SMB_PASS_KEYCHAIN_SERVICE  the keychain service to use when the plist names
 #                        none (ai.spice.spiceio.smb)
+#   AGENT_SMB_LOGIN      check (default): before restarting the agent, log in to
+#                        its SMB server once with its settings (`spiceio
+#                        --check-smb-login`). A refused login stops the install
+#                        after that one failed logon; an unreachable server is a
+#                        note. skip: do not (installing away from the NAS)
 #   AGENT_WAIT_SECS      how long to wait for the agent to listen, and then for
 #                        SMB to come up, before giving up on the check (30)
 #
@@ -66,6 +71,7 @@ AGENT_AUTH="${AGENT_AUTH:-enforce}"
 S3_CREDENTIALS_FILE="${S3_CREDENTIALS_FILE:-$HOME/.config/spiceio/credentials}"
 AGENT_SMB_PASS="${AGENT_SMB_PASS:-keychain}"
 SMB_PASS_KEYCHAIN_SERVICE="${SMB_PASS_KEYCHAIN_SERVICE:-ai.spice.spiceio.smb}"
+AGENT_SMB_LOGIN="${AGENT_SMB_LOGIN:-check}"
 AGENT_WAIT_SECS="${AGENT_WAIT_SECS:-30}"
 
 uid=$(id -u)
@@ -81,6 +87,11 @@ die() {
     echo "error: $*" >&2
     exit 1
 }
+
+case "$AGENT_SMB_LOGIN" in
+check | skip) ;;
+*) die "AGENT_SMB_LOGIN=$AGENT_SMB_LOGIN: expected check or skip" ;;
+esac
 
 case "$AGENT_AUTH" in
 enforce | log | off | keep) ;;
@@ -265,7 +276,7 @@ with_smb_env() {
     shift 2
     (
         for name in SPICEIO_SMB_SERVER SPICEIO_SMB_USER SPICEIO_SMB_DOMAIN SPICEIO_SMB_PORT \
-            SPICEIO_SMB_PASS_KEYCHAIN_PATH; do
+            SPICEIO_SMB_SHARE SPICEIO_SMB_PASS_KEYCHAIN_PATH; do
             unset "$name"
             if value=$(plist_get "$p" "EnvironmentVariables.$name"); then
                 export "$name=$value"
@@ -308,6 +319,38 @@ smb_pass_readable() {
 require_readable_smb_pass() {
     summary=$(smb_pass_readable "$1" "$2" "$BINDIR/spiceio") ||
         die "$LAUNCHD_LABEL could not read its SMB password, so it is not being restarted: $summary"
+}
+
+# One SMB login with the agent's settings (plist $1), before it is restarted.
+# Wrong credentials stop the install here, after a single failed logon, rather
+# than restarting an agent that cannot log in (it would not retry them either:
+# each retry would be another failed logon toward an account lockout). So does
+# a server that answers without proving it holds the session key. One that
+# cannot be reached is a note: the agent waits for it.
+check_smb_login() {
+    [ "$AGENT_SMB_LOGIN" = check ] || return 0
+    if login_service=$(keychain_service "$1"); then
+        login=$(with_smb_env "$1" "$login_service" "$BINDIR/spiceio" --check-smb-login 2>&1)
+        login_rc=$?
+    elif has_inline_pass "$1"; then
+        # Still in the plist (AGENT_SMB_PASS=keep, or an ad-hoc build): checked
+        # all the same, the password piped from plutil, as for the move.
+        login=$(plutil -extract EnvironmentVariables.SPICEIO_SMB_PASS raw -o - "$1" |
+            with_smb_env "$1" "" "$BINDIR/spiceio" --check-smb-login --password-stdin 2>&1)
+        login_rc=$?
+    else
+        echo "note: not checking $LAUNCHD_LABEL's SMB login: its plist sets no SMB password"
+        return 0
+    fi
+    summary=$(printf '%s\n' "$login" | grep '^SMB ' | tail -1)
+    case "$login_rc" in
+    0) echo "$LAUNCHD_LABEL ${summary:-SMB login: ok}" ;;
+    1) die "$LAUNCHD_LABEL is not being restarted: ${summary:-$login}" ;;
+    *)
+        echo "note: ${summary:-could not check the SMB login of $LAUNCHD_LABEL}"
+        echo "      restarting $LAUNCHD_LABEL anyway: it waits for a server it cannot reach"
+        ;;
+    esac
 }
 
 # Replace SPICEIO_SMB_PASS with SPICEIO_SMB_PASS_KEYCHAIN=$service in the
@@ -638,6 +681,8 @@ elif service=$(keychain_service "$agent_file"); then
     # binary that cannot read its password.
     require_readable_smb_pass "$agent_file" "$service"
 fi
+
+[ "$RESTART_AGENT" = 0 ] || check_smb_login "$agent_file"
 
 if loaded_env_is_stale "$agent_plist"; then
     if [ "$RESTART_AGENT" != 0 ]; then
